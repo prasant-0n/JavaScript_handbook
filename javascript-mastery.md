@@ -101230,3 +101230,35191 @@ domain object
 Finally:
 
 > Serialization is not a mirror of runtime state. It is a deliberate contract about which information crosses a boundary. The strongest engineers make that contract explicit—data shape, identity, precision, prototypes, binary representation, versioning, security, and lifecycle—rather than assuming a generic "deep clone" or `JSON.stringify()` will preserve semantics automatically.
+
+# Chapter 29 — Errors and Error Handling
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain what an error is in JavaScript as a runtime-level event and as a program-level value.
+- Distinguish syntax errors, runtime exceptions, promise rejections, logical failures, and environmental failures.
+- Explain the role of `Error` objects, `name`, `message`, `stack`, `cause`, and custom error types.
+- Explain `throw`, `try`, `catch`, and `finally` precisely.
+- Predict control flow when exceptions are thrown, caught, rethrown, transformed, or suppressed.
+- Distinguish synchronous exceptions from asynchronous failures and rejected promises.
+- Explain why `try/catch` around asynchronous work does not automatically catch later promise rejections or timer failures.
+- Design error taxonomies suitable for application, library, and infrastructure code.
+- Use `Error` subclassing, `cause`, error codes, and structured metadata without creating brittle error contracts.
+- Understand the distinction between recovering from an error, translating an error, logging an error, and terminating an operation.
+- Explain how `finally` interacts with `return`, `throw`, and abrupt completion.
+- Build robust boundaries around external systems such as files, HTTP services, databases, queues, and user input.
+- Recognize anti-patterns such as swallowing exceptions, logging and rethrowing blindly, throwing strings, overusing custom classes, and exposing internal details to clients.
+- Debug exception paths using stack traces, causal chains, source maps, and deliberate reproduction.
+- Explain the difference between expected operational failures and programmer defects.
+- Implement a small production-oriented error framework with classification, causes, serialization, and boundary handling.
+- Reason about error behavior at principal-engineer level: correctness, reliability, observability, security, compatibility, and operational cost.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+Reading the chapter is not sufficient to claim mastery.
+
+---
+
+## 2. Prerequisites
+
+The learner should already understand:
+
+- JavaScript values and types.
+- Functions and lexical scope.
+- Execution contexts and call flow.
+- Objects and prototypes.
+- Classes and constructors.
+- Iteration and control flow.
+- Promises at a foundational level.
+- Async/await basics.
+- Modules and imports/exports at a foundational level.
+- Basic browser and Node.js runtime concepts.
+- Basic debugging with stack traces.
+
+Conceptual dependencies from earlier chapters include:
+
+- Chapter 02 — Values, Types, Type System
+- Chapter 06 — Operators, Expressions
+- Chapter 08 — Control Flow, Iteration
+- Chapter 09 — Functions / First-Class Behavior
+- Chapter 10 — Scope / Lexical Environments / Identifier Resolution
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 15 — Objects / Property Semantics
+- Chapter 18 — Classes / OOP
+- Chapter 20 — Symbols / Well-Known Symbols
+- Chapter 28 — JSON / Serialization / Structured Clone
+
+Future chapters build directly on this one, especially asynchronous control flow, promises, cancellation, production reliability, observability, testing, security, and system design.
+
+---
+
+## 3. What Is It?
+
+JavaScript error handling is the set of language and application mechanisms used to represent, propagate, classify, observe, recover from, transform, or terminate in response to failures.
+
+At the language level, an error is not a mystical runtime state. JavaScript programs manipulate values, and errors are commonly represented by `Error` objects or other values that can be thrown.
+
+The language provides explicit exception-control mechanisms:
+
+```js
+throw value;
+```
+
+and:
+
+```js
+try {
+  // protected operation
+} catch (error) {
+  // handler
+} finally {
+  // cleanup
+}
+```
+
+The important distinction is:
+
+> An exception is a control-flow mechanism; an `Error` object is a value commonly used to describe the failure.
+
+JavaScript does not require a thrown value to be an `Error` instance.
+
+This is legal:
+
+```js
+throw "failure";
+```
+
+This is also legal:
+
+```js
+throw 404;
+```
+
+And this is legal:
+
+```js
+throw { code: "INVALID_STATE" };
+```
+
+But production-quality code normally throws `Error` objects because they provide standardized conventions such as `name`, `message`, and a useful stack representation.
+
+Error handling therefore has multiple layers:
+
+```text
+Failure occurs
+     ↓
+A value represents the failure
+     ↓
+Control flow becomes abrupt
+     ↓
+The value propagates outward
+     ↓
+A boundary catches / translates / recovers / terminates
+     ↓
+The system records or communicates the outcome
+```
+
+A good error architecture must answer five questions:
+
+1. What failed?
+2. Where did it fail?
+3. Why did it fail?
+4. Who can recover from it?
+5. What should happen next?
+
+---
+
+## 4. Why Does It Exist?
+
+Without explicit failure propagation, every function would need to encode failure manually in every return value.
+
+For example:
+
+```js
+function parseAge(input) {
+  if (typeof input !== "string") {
+    return ???;
+  }
+
+  // ...
+}
+```
+
+The problem becomes worse when failures travel through multiple layers:
+
+```text
+HTTP handler
+    ↓
+service
+    ↓
+repository
+    ↓
+database driver
+```
+
+A failure at the database layer may need to reach the service layer and eventually become an HTTP response.
+
+Exceptions provide a built-in non-local control-flow mechanism:
+
+```text
+deep operation
+    ↓ throws
+intermediate function
+    ↓ no catch
+higher-level boundary
+    ↓ catches
+translate / recover / report
+```
+
+This separates:
+
+- the location where a failure is detected,
+- from the location where the application knows what to do about it.
+
+That separation is one of the main reasons exceptions exist.
+
+However, exceptions are not automatically “good.” They have costs:
+
+- control flow becomes less explicit;
+- cleanup must be designed carefully;
+- broad catches can hide defects;
+- asynchronous boundaries change propagation behavior;
+- error contracts become part of API design;
+- stack traces and metadata can be expensive;
+- serialization can accidentally leak internal information.
+
+The engineering question is therefore not:
+
+> “Should we use errors?”
+
+Every serious JavaScript system already has failures.
+
+The useful question is:
+
+> “Where should failures be represented, propagated, transformed, observed, and recovered?”
+
+---
+
+## 5. Mental Model
+
+Use this model:
+
+```text
+                FAILURE
+                   │
+                   ▼
+             Represent value
+                   │
+                   ▼
+                 throw
+                   │
+                   ▼
+        ┌─────────────────────┐
+        │ abrupt completion   │
+        └─────────────────────┘
+                   │
+             propagate outward
+                   │
+        ┌──────────┴───────────┐
+        │                      │
+      catch                  no catch
+        │                      │
+        ▼                      ▼
+ handle / rethrow         caller boundary
+        │                      │
+        └──────────┬───────────┘
+                   ▼
+             finally runs
+                   │
+                   ▼
+       normal completion OR
+       another abrupt completion
+```
+
+The critical concept is **abrupt completion**.
+
+A statement can complete normally, or it can complete abruptly because of:
+
+- `throw`;
+- `return`;
+- `break`;
+- `continue`.
+
+Errors specifically use a throw completion.
+
+You should think of:
+
+```js
+throw error;
+```
+
+as:
+
+> “Stop the current normal execution path and propagate this abrupt completion until an appropriate handler is found.”
+
+The handler is not necessarily the immediate caller.
+
+Example:
+
+```js
+function c() {
+  throw new Error("boom");
+}
+
+function b() {
+  c();
+}
+
+function a() {
+  b();
+}
+
+try {
+  a();
+} catch (error) {
+  console.log(error.message);
+}
+```
+
+The throw begins in `c`, passes through `b`, passes through `a`, and is handled outside `a`.
+
+The key mental model:
+
+> Exceptions search outward through execution structure until a matching catch boundary is found.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Any value can be thrown
+
+```js
+throw 123;
+throw "bad";
+throw { code: "BAD" };
+throw new Error("bad");
+```
+
+Prefer `Error` objects in application and library code.
+
+### Rule 2 — A throw changes control flow immediately
+
+Code after a synchronous throw in the same control path does not execute.
+
+```js
+throw new Error("stop");
+
+console.log("unreachable");
+```
+
+### Rule 3 — `catch` receives the exact thrown value
+
+```js
+const value = { reason: "bad-input" };
+
+try {
+  throw value;
+} catch (error) {
+  console.log(error === value); // true
+}
+```
+
+### Rule 4 — The nearest applicable `catch` handles the exception
+
+```js
+try {
+  try {
+    throw new Error("inner");
+  } catch (error) {
+    throw new Error("outer");
+  }
+} catch (error) {
+  console.log(error.message); // outer
+}
+```
+
+The first handler transformed the failure by throwing again.
+
+### Rule 5 — `finally` runs when control leaves the protected region
+
+This includes:
+
+- normal completion;
+- exception;
+- `return`;
+- `break`;
+- `continue`.
+
+### Rule 6 — `finally` can replace the original outcome
+
+This is dangerous:
+
+```js
+function example() {
+  try {
+    throw new Error("original");
+  } finally {
+    return "replacement";
+  }
+}
+
+console.log(example()); // "replacement"
+```
+
+The `return` in `finally` suppresses the original throw.
+
+Similarly:
+
+```js
+function example() {
+  try {
+    return "value";
+  } finally {
+    throw new Error("cleanup-failed");
+  }
+}
+```
+
+The final result is the throw from `finally`, not the original return.
+
+### Rule 7 — Catch only where you can make a meaningful decision
+
+Bad:
+
+```js
+try {
+  doImportantWork();
+} catch {
+  // ignore
+}
+```
+
+This can convert a visible failure into silent corruption.
+
+### Rule 8 — Rethrowing preserves the current error identity
+
+```js
+catch (error) {
+  throw error;
+}
+```
+
+This is different from:
+
+```js
+catch (error) {
+  throw new Error("something failed");
+}
+```
+
+The second creates a new failure and may hide useful context unless the original is preserved with `cause`.
+
+### Rule 9 — Error messages are for humans, not stable machine contracts
+
+Prefer:
+
+```js
+error.code === "USER_NOT_FOUND"
+```
+
+over brittle parsing:
+
+```js
+error.message.includes("not found")
+```
+
+### Rule 10 — Promise rejection is asynchronous control flow
+
+This does not catch a later timer exception:
+
+```js
+try {
+  setTimeout(() => {
+    throw new Error("later");
+  }, 0);
+} catch (error) {
+  // does not run
+}
+```
+
+The timer callback executes in a later task after the original `try` block has already completed.
+
+### Rule 11 — `await` rethrows a rejected promise into the async function
+
+```js
+try {
+  await Promise.reject(new Error("failed"));
+} catch (error) {
+  console.log(error.message);
+}
+```
+
+This works because `await` observes the promise and resumes the async function with a throw-like failure path.
+
+### Rule 12 — Do not assume every failure is exceptional
+
+Many expected business outcomes are better represented as normal values:
+
+```js
+const result = authenticate(credentials);
+
+if (!result.ok) {
+  // expected business result
+}
+```
+
+Use exceptions for failures that are appropriately modeled as exceptional control flow, not simply because a function can fail.
+
+---
+
+## 7. Syntax
+
+### `throw`
+
+```js
+throw expression;
+```
+
+Examples:
+
+```js
+throw new Error("Invalid input");
+throw new TypeError("Expected a string");
+```
+
+### `try/catch`
+
+```js
+try {
+  operation();
+} catch (error) {
+  recover(error);
+}
+```
+
+### `try/catch/finally`
+
+```js
+try {
+  operation();
+} catch (error) {
+  handle(error);
+} finally {
+  cleanup();
+}
+```
+
+### `catch` without binding
+
+Modern JavaScript permits:
+
+```js
+try {
+  operation();
+} catch {
+  recoverWithoutInspectingTheError();
+}
+```
+
+Use this when the actual thrown value is intentionally irrelevant.
+
+### Optional catch binding
+
+The omission is significant because:
+
+```js
+catch (error)
+```
+
+and:
+
+```js
+catch
+```
+
+have different lexical semantics.
+
+### Error constructors
+
+Common built-in error classes include:
+
+```js
+Error
+EvalError
+RangeError
+ReferenceError
+SyntaxError
+TypeError
+URIError
+AggregateError
+```
+
+The practical use of subclasses is to communicate category, not to create enormous hierarchies.
+
+### `Error` options
+
+Modern code can use:
+
+```js
+new Error("Database request failed", {
+  cause: originalError
+});
+```
+
+The `cause` provides causal context without forcing developers to flatten the original error into a string.
+
+---
+
+## 8. Basic Examples
+
+### Basic throw and catch
+
+```js
+try {
+  throw new Error("Something failed");
+} catch (error) {
+  console.log(error instanceof Error); // true
+  console.log(error.message);           // "Something failed"
+}
+```
+
+### Type-specific failure
+
+```js
+function double(value) {
+  if (typeof value !== "number") {
+    throw new TypeError("value must be a number");
+  }
+
+  return value * 2;
+}
+
+try {
+  double("10");
+} catch (error) {
+  if (error instanceof TypeError) {
+    console.log("Caller supplied the wrong type");
+  }
+}
+```
+
+### Rethrowing
+
+```js
+function loadConfig() {
+  try {
+    return JSON.parse("{bad json}");
+  } catch (error) {
+    console.error("Configuration parsing failed");
+    throw error;
+  }
+}
+```
+
+### Wrapping with cause
+
+```js
+function loadConfig() {
+  try {
+    return JSON.parse("{bad json}");
+  } catch (error) {
+    throw new Error("Could not load application configuration", {
+      cause: error
+    });
+  }
+}
+```
+
+Now the outer error communicates the higher-level context while the original failure remains available.
+
+### Cleanup in `finally`
+
+```js
+let connection;
+
+try {
+  connection = openConnection();
+  return connection.query("SELECT 1");
+} finally {
+  connection?.close();
+}
+```
+
+This pattern is conceptually correct but later chapters should connect it with structured resource-management features such as `using` and `DisposableStack`.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+function parse(input) {
+  return JSON.parse(input);
+}
+
+function load() {
+  try {
+    return parse("{");
+  } catch (error) {
+    throw new Error("Configuration loading failed", {
+      cause: error
+    });
+  }
+}
+
+try {
+  load();
+} catch (error) {
+  console.log(error.message);
+  console.log(error.cause.message);
+}
+```
+
+### Step 1
+
+The top-level `try` calls `load()`.
+
+### Step 2
+
+`load()` calls `parse()`.
+
+### Step 3
+
+`parse()` calls `JSON.parse()`.
+
+### Step 4
+
+Parsing the incomplete input throws a `SyntaxError`.
+
+### Step 5
+
+The exception propagates from `parse()` to `load()`.
+
+### Step 6
+
+The `catch` in `load()` receives the exact `SyntaxError`.
+
+### Step 7
+
+`load()` creates a new `Error` whose `cause` points to the original error.
+
+### Step 8
+
+The new error is thrown.
+
+### Step 9
+
+The exception propagates out of `load()` into the outer `try`.
+
+### Step 10
+
+The outer `catch` receives the wrapping error.
+
+The error chain is conceptually:
+
+```text
+Error: Configuration loading failed
+  cause ─────► SyntaxError: unexpected end of input
+```
+
+This is preferable to reducing everything to:
+
+```text
+"something went wrong"
+```
+
+because the causal structure is preserved.
+
+---
+
+## 10. Internal Mechanics
+
+Error handling becomes easier once you separate the language-level control mechanism from implementation details.
+
+### 10.1 Abrupt completion
+
+ECMAScript describes evaluation in terms of completion records. A normal completion contains a value; an abrupt completion represents a non-normal exit.
+
+A throw produces an abrupt completion with the thrown value.
+
+Conceptually:
+
+```text
+NormalCompletion(value)
+```
+
+versus:
+
+```text
+ThrowCompletion(error)
+```
+
+The engine uses this completion model to propagate control through nested execution constructs.
+
+### 10.2 Propagation through call frames
+
+At runtime, an exception can unwind active execution state until a handler is found.
+
+Conceptually:
+
+```text
+frame C  ← throw
+   ↑
+frame B  ← no handler
+   ↑
+frame A  ← no handler
+   ↑
+caller   ← matching catch
+```
+
+JavaScript engines optimize this internally, but the semantic effect is equivalent to structured stack unwinding.
+
+Do not assume the internal implementation is literally a simplistic “pop stack frame” algorithm in every engine. The language specification defines observable semantics; the engine decides how to implement them.
+
+### 10.3 Stack traces
+
+`Error.prototype.stack` is widely implemented, but historical details and exact formatting are not equivalent to the core ECMAScript semantics of `throw`.
+
+A stack trace typically helps answer:
+
+```text
+What code path led here?
+```
+
+It does not automatically answer:
+
+```text
+Why did the business operation fail?
+```
+
+That distinction is why causal context and structured metadata matter.
+
+### 10.4 Error construction and stack capture
+
+Creating an error object can capture diagnostic information. Stack capture may therefore have non-trivial cost, especially at high volume.
+
+Do not use exception creation as a high-frequency substitute for ordinary branching when the condition is expected and routine.
+
+### 10.5 Cross-realm identity
+
+A built-in error constructor from one realm can have identity relationships different from those in another realm.
+
+For example, browser code can interact with objects originating in another realm such as an iframe.
+
+This means:
+
+```js
+value instanceof Error
+```
+
+is not universally sufficient for every cross-realm scenario.
+
+Boundary designs should rely on robust tagging/classification strategies rather than assuming one global constructor identity.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+The language specification models error behavior through evaluation rules and completion records.
+
+### 11.1 `throw`
+
+The semantics of a throw expression evaluate the operand and then produce a throw completion containing that value.
+
+Conceptually:
+
+```text
+evaluate expression
+     ↓
+value
+     ↓
+ThrowCompletion(value)
+```
+
+### 11.2 `try`
+
+A `try` statement coordinates the evaluation of:
+
+```text
+try block
+catch clause
+finally block
+```
+
+The key semantic rule is that `finally` participates in deciding the final completion of the whole statement.
+
+### 11.3 `catch`
+
+A caught throw completion makes its thrown value available to the catch parameter when a binding is present.
+
+Example:
+
+```js
+try {
+  throw 42;
+} catch (x) {
+  console.log(x);
+}
+```
+
+The catch binding receives `42`.
+
+### 11.4 Catch parameter scope
+
+The catch parameter has its own lexical binding behavior.
+
+Example:
+
+```js
+try {
+  throw "outer";
+} catch (error) {
+  const message = "inner";
+  console.log(error, message);
+}
+```
+
+The catch binding is not simply another function parameter.
+
+The catch parameter is scoped to the catch clause.
+
+### 11.5 `finally` semantics
+
+Consider:
+
+```js
+function f() {
+  try {
+    return 10;
+  } finally {
+    console.log("cleanup");
+  }
+}
+```
+
+Conceptually:
+
+1. The `try` block produces a return completion.
+2. The `finally` block runs.
+3. Because `finally` completes normally, the prior return completion continues.
+4. The function returns `10`.
+
+Now:
+
+```js
+function f() {
+  try {
+    return 10;
+  } finally {
+    return 20;
+  }
+}
+```
+
+The `finally` block produces a new return completion that replaces the previous one.
+
+Similarly:
+
+```js
+function f() {
+  try {
+    throw new Error("A");
+  } finally {
+    throw new Error("B");
+  }
+}
+```
+
+The final result is the throw of `"B"`.
+
+### 11.6 `return`, `break`, and `continue`
+
+These are also abrupt completions.
+
+Therefore:
+
+```js
+for (;;) {
+  try {
+    break;
+  } finally {
+    console.log("cleanup");
+  }
+}
+```
+
+runs `finally` before the loop exits.
+
+This common completion model is essential for understanding cleanup correctly.
+
+### 11.7 Error subclasses
+
+`Error` is an ordinary built-in constructor with subclassing behavior that participates in standard object construction and prototype mechanics.
+
+Do not confuse:
+
+```js
+error instanceof TypeError
+```
+
+with a special engine-level “type system.” The object still has JavaScript object/prototype semantics.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Error causes
+
+Error wrapping is most useful when abstraction boundaries change the meaning of the failure.
+
+Low-level:
+
+```text
+ECONNREFUSED
+```
+
+Higher-level:
+
+```text
+Failed to connect to primary database
+```
+
+The higher-level layer should preserve the original cause.
+
+```js
+throw new Error("Failed to connect to primary database", {
+  cause: error
+});
+```
+
+This supports layered diagnosis:
+
+```text
+API operation failed
+    └── service failed
+          └── database connection failed
+                └── socket refused
+```
+
+### 12.2 `AggregateError`
+
+Some operations can fail with multiple independent failures.
+
+Example:
+
+```js
+throw new AggregateError(
+  [
+    new Error("Replica A failed"),
+    new Error("Replica B failed")
+  ],
+  "All replicas failed"
+);
+```
+
+This is semantically different from a single causal chain.
+
+Use:
+
+```text
+cause
+```
+
+for one primary causal relationship.
+
+Use:
+
+```text
+AggregateError.errors
+```
+
+for multiple associated failures.
+
+### 12.3 Custom error classes
+
+Example:
+
+```js
+class ValidationError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "ValidationError";
+  }
+}
+```
+
+Usage:
+
+```js
+throw new ValidationError("Email is required");
+```
+
+For application systems, consider whether a class adds meaningful behavior.
+
+A simple structured error can sometimes be enough:
+
+```js
+const error = new Error("Email is required");
+error.code = "VALIDATION_FAILED";
+```
+
+The decision should be based on contract clarity, not style preference alone.
+
+### 12.4 Error codes
+
+Codes are often useful at boundaries:
+
+```js
+class AppError extends Error {
+  constructor(message, { code, status, cause } = {}) {
+    super(message, { cause });
+    this.name = "AppError";
+    this.code = code;
+    this.status = status;
+  }
+}
+```
+
+Then:
+
+```js
+throw new AppError("User does not exist", {
+  code: "USER_NOT_FOUND",
+  status: 404
+});
+```
+
+This avoids coupling machine logic to message text.
+
+### 12.5 Operational vs programmer errors
+
+A useful engineering distinction:
+
+#### Operational failure
+
+Often expected in production:
+
+- network timeout;
+- remote service unavailable;
+- file missing;
+- invalid user input;
+- database deadlock;
+- rate limit;
+- dependency failure.
+
+#### Programmer defect
+
+Usually indicates broken assumptions:
+
+- accessing an undefined variable due to a bug;
+- invalid internal state;
+- impossible invariant violation;
+- incorrect algorithm;
+- faulty null handling.
+
+Not every programmer defect should be “recovered from.”
+
+Sometimes the correct response is:
+
+```text
+fail fast
+record evidence
+restart / isolate
+fix root cause
+```
+
+### 12.6 Error boundaries
+
+A mature architecture catches errors at meaningful boundaries:
+
+```text
+HTTP boundary
+Worker boundary
+Queue-consumer boundary
+CLI boundary
+Process boundary
+```
+
+A controller may translate:
+
+```text
+ValidationError → HTTP 400
+AuthenticationError → HTTP 401
+NotFoundError → HTTP 404
+```
+
+But it should not convert every unknown defect into a misleading success response.
+
+### 12.7 Error translation
+
+Each abstraction layer may have its own vocabulary.
+
+Example:
+
+```text
+database error
+      ↓
+repository error
+      ↓
+domain error
+      ↓
+HTTP response
+```
+
+Translation should preserve diagnostic context.
+
+Do not indiscriminately flatten:
+
+```js
+catch {
+  throw new Error("database error");
+}
+```
+
+because that destroys information.
+
+### 12.8 Error serialization
+
+Never automatically return raw errors to clients:
+
+```js
+res.json(error);
+```
+
+An error object may contain:
+
+- stack information;
+- internal paths;
+- implementation details;
+- sensitive metadata;
+- nested causes;
+- connection details.
+
+Instead, define an explicit client-safe shape:
+
+```js
+{
+  error: {
+    code: "USER_NOT_FOUND",
+    message: "User not found"
+  }
+}
+```
+
+### 12.9 Error identity and `name`
+
+Some code uses:
+
+```js
+error.name === "TypeError"
+```
+
+Others use:
+
+```js
+error instanceof TypeError
+```
+
+Neither should be treated as a universal answer across all environments and boundaries.
+
+Machine contracts should prefer explicit stable codes or discriminators when appropriate.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 Throwing `undefined`
+
+```js
+throw undefined;
+```
+
+Then:
+
+```js
+catch (error) {
+  console.log(error); // undefined
+}
+```
+
+Never assume the catch binding is a useful object.
+
+### 13.2 Throwing strings
+
+Legal:
+
+```js
+throw "failed";
+```
+
+Problematic because conventional diagnostic properties do not exist.
+
+### 13.3 `finally` masking errors
+
+```js
+function run() {
+  try {
+    throw new Error("real problem");
+  } finally {
+    cleanup();
+  }
+}
+```
+
+If `cleanup()` throws, the cleanup error can replace the original error.
+
+This matters enormously for production reliability.
+
+### 13.4 Cleanup itself can fail
+
+A cleanup operation is not automatically harmless.
+
+Examples:
+
+- closing a network channel;
+- flushing a log;
+- committing a transaction;
+- releasing an external lock.
+
+Design the policy explicitly:
+
+```text
+primary failure
+     +
+cleanup failure
+     ↓
+Which failure is primary?
+Which should be retained?
+Should both be observable?
+```
+
+This is one reason later resource-management chapters matter.
+
+### 13.5 Catching everything
+
+```js
+try {
+  performEverything();
+} catch {
+  return null;
+}
+```
+
+This may turn:
+
+```text
+unexpected defect
+```
+
+into:
+
+```text
+apparently valid empty result
+```
+
+which is much harder to detect.
+
+### 13.6 Async callback failure
+
+This does not catch:
+
+```js
+try {
+  setTimeout(() => {
+    throw new Error("boom");
+  }, 0);
+} catch {
+  console.log("caught");
+}
+```
+
+The callback executes after the synchronous protected region finishes.
+
+### 13.7 Promise rejection
+
+This does not catch a rejection unless the promise is observed in the protected asynchronous flow:
+
+```js
+try {
+  Promise.reject(new Error("boom"));
+} catch {
+  console.log("caught");
+}
+```
+
+The rejection is not a synchronous throw from the `try` statement.
+
+By contrast:
+
+```js
+try {
+  await Promise.reject(new Error("boom"));
+} catch (error) {
+  console.log("caught");
+}
+```
+
+works inside an async function.
+
+### 13.8 Cross-realm errors
+
+A browser iframe may have a different intrinsic `Error` constructor.
+
+Therefore, simple `instanceof` checks can be insufficient across realms.
+
+### 13.9 Errors with non-enumerable properties
+
+Standard error properties do not behave like ordinary enumerable application data in every serialization scenario.
+
+This explains why:
+
+```js
+JSON.stringify(new Error("boom"))
+```
+
+does not necessarily produce the detailed structure a developer expects.
+
+Explicit serialization is usually required.
+
+### 13.10 Error messages can change
+
+Do not build stable application logic around exact engine-generated wording.
+
+This is brittle:
+
+```js
+if (error.message === "x is not defined") {
+  // ...
+}
+```
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “An error is the same thing as an exception.”
+
+Not exactly.
+
+- `Error` is a constructor / object type convention.
+- Exception throwing is a control-flow mechanism.
+- Any value can be thrown.
+
+### Misconception 2 — “try/catch catches everything.”
+
+No.
+
+It catches exceptions propagating through the protected synchronous control flow.
+
+It does not automatically capture failures that occur later in another event-loop turn.
+
+### Misconception 3 — “Promise rejection is identical to a synchronous throw.”
+
+They are related conceptually but differ in timing and propagation mechanics.
+
+### Misconception 4 — “finally is only for successful cleanup.”
+
+It runs on both normal and abrupt exits, unless termination occurs outside ordinary JavaScript completion semantics.
+
+### Misconception 5 — “finally cannot change the result.”
+
+It can. A `return` or `throw` from `finally` can override an earlier completion.
+
+### Misconception 6 — “Error messages are APIs.”
+
+Messages are primarily human-readable diagnostic text.
+
+Stable machine behavior should use structured categories or codes.
+
+### Misconception 7 — “Logging an error means handling it.”
+
+Logging is observation.
+
+Handling means making a decision about what the program should do next.
+
+### Misconception 8 — “Throwing is always better than returning an error object.”
+
+No.
+
+Expected domain outcomes can often be clearer as explicit results.
+
+### Misconception 9 — “A custom Error class automatically makes an API better.”
+
+Only if the class improves a real contract, behavior, or boundary.
+
+### Misconception 10 — “All errors should be converted to a generic error.”
+
+Over-wrapping can destroy useful identity and context unless `cause` or structured metadata preserves them.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Swallowing errors
+
+```js
+try {
+  save();
+} catch {
+}
+```
+
+### Mistake 2 — Logging and rethrowing at every layer
+
+```js
+catch (error) {
+  console.error(error);
+  throw error;
+}
+```
+
+Repeated across every layer, this creates duplicate noisy logs.
+
+Observe failures where the system has enough context to act meaningfully.
+
+### Mistake 3 — Using exceptions for ordinary branching
+
+Bad:
+
+```js
+try {
+  return map.get(key).value;
+} catch {
+  return fallback();
+}
+```
+
+This hides unrelated defects.
+
+Prefer explicit validation where appropriate.
+
+### Mistake 4 — Catching too broadly
+
+```js
+catch (error) {
+  return defaultValue;
+}
+```
+
+This can recover from failures that are not actually recoverable.
+
+### Mistake 5 — Throwing strings
+
+```js
+throw "bad";
+```
+
+### Mistake 6 — Parsing messages
+
+```js
+if (error.message.includes("duplicate")) {
+  // ...
+}
+```
+
+### Mistake 7 — Exposing internal stacks to clients
+
+```js
+res.status(500).json({
+  message: error.message,
+  stack: error.stack
+});
+```
+
+### Mistake 8 — Losing causes during wrapping
+
+```js
+catch (error) {
+  throw new Error("Request failed");
+}
+```
+
+Prefer:
+
+```js
+catch (error) {
+  throw new Error("Request failed", { cause: error });
+}
+```
+
+when the original cause is relevant.
+
+### Mistake 9 — Assuming cleanup cannot fail
+
+```js
+finally {
+  close();
+}
+```
+
+The cleanup path itself can throw.
+
+### Mistake 10 — Treating every failure as retryable
+
+A malformed request and a temporary network timeout have different retry semantics.
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Concept | Meaning | Typical use |
+|---|---|---|
+| `throw` | Changes control flow via abrupt completion | Exceptional failure propagation |
+| `Error` | Value representing a failure | Diagnostics and classification |
+| `return` | Normal function result | Expected outcomes |
+| Promise rejection | Asynchronous failure channel | Async APIs |
+| `catch` | Handles propagated exceptions | Recovery/translation |
+| `finally` | Guaranteed cleanup point for normal JS completion paths | Resource cleanup |
+| Result object | Explicit success/failure data | Predictable domain outcomes |
+| Logging | Records evidence | Observability |
+| Retry | Re-executes an operation | Transient failures |
+| Validation | Checks input/state before work | Expected invalid cases |
+
+### Exceptions vs result objects
+
+Exception-style:
+
+```js
+function divide(a, b) {
+  if (b === 0) {
+    throw new RangeError("division by zero");
+  }
+
+  return a / b;
+}
+```
+
+Result-style:
+
+```js
+function divide(a, b) {
+  if (b === 0) {
+    return {
+      ok: false,
+      code: "DIVISION_BY_ZERO"
+    };
+  }
+
+  return {
+    ok: true,
+    value: a / b
+  };
+}
+```
+
+Neither is universally superior.
+
+Ask:
+
+- Is the failure expected?
+- Does the caller routinely branch on it?
+- Is failure part of normal domain logic?
+- Would exceptions create hidden control flow?
+- Does the ecosystem already establish one style?
+
+### Error vs assertion
+
+An assertion typically says:
+
+> “This state should be impossible or this invariant must hold.”
+
+Validation says:
+
+> “The input may legitimately be invalid.”
+
+The response strategy can therefore differ:
+
+```text
+user input invalid
+    → validation result / domain error
+
+internal invariant broken
+    → diagnostic failure / fail fast
+```
+
+---
+
+## 17. Performance Considerations
+
+Error handling has performance implications, but avoid simplistic statements such as “try/catch is always slow.”
+
+Modern engines optimize many common patterns.
+
+More important considerations include:
+
+### 17.1 Throwing is usually an exceptional path
+
+Do not use exceptions as the normal loop-control mechanism.
+
+Bad:
+
+```js
+for (const item of items) {
+  try {
+    process(item);
+  } catch {
+    // use throw as branch
+  }
+}
+```
+
+### 17.2 Creating errors can be expensive
+
+An `Error` may capture stack information.
+
+Avoid constructing huge numbers of errors in hot paths unless the failures are genuinely exceptional and worth the diagnostic cost.
+
+### 17.3 Deep causal structures
+
+Long nested causes can increase memory usage and diagnostic processing cost.
+
+### 17.4 Logging costs
+
+Logging an exception can be much more expensive than creating it, especially when:
+
+- stack traces are serialized;
+- logs are transmitted remotely;
+- metadata is large;
+- logging happens at high frequency.
+
+### 17.5 Retry amplification
+
+The largest performance cost may come from policy rather than language mechanics.
+
+For example:
+
+```text
+request fails
+→ retry
+→ retry
+→ retry
+```
+
+can multiply load on an already-failing dependency.
+
+Error handling and performance must therefore be designed together.
+
+---
+
+## 18. Memory Considerations
+
+Errors are objects.
+
+They can retain references to metadata, causes, request context, or custom properties.
+
+Avoid attaching entire heavyweight object graphs:
+
+```js
+error.context = giantRequestObject;
+```
+
+This can increase retention and memory pressure.
+
+Prefer narrow metadata:
+
+```js
+error.context = {
+  requestId,
+  operation
+};
+```
+
+Be especially careful with:
+
+- cyclic structures;
+- large request bodies;
+- buffers;
+- credentials;
+- ORM entities;
+- open handles.
+
+A long-lived retry queue containing errors can unintentionally retain substantial memory through error graphs.
+
+---
+
+## 19. Security Considerations
+
+Error handling is a security boundary.
+
+### 19.1 Do not leak internal details
+
+Potentially sensitive details include:
+
+- file paths;
+- SQL fragments;
+- stack traces;
+- hostnames;
+- tokens;
+- internal IDs;
+- infrastructure names;
+- configuration values.
+
+### 19.2 Do not trust caught values
+
+Because any value can be thrown:
+
+```js
+throw maliciousObject;
+```
+
+do not assume:
+
+```js
+error.message
+error.stack
+error.code
+```
+
+exist or have the expected types.
+
+### 19.3 Avoid unsafe logging
+
+Do not log secrets merely because an error object contains them.
+
+### 19.4 Preserve diagnostic context without exposing it
+
+A good architecture separates:
+
+```text
+internal diagnostic representation
+```
+
+from:
+
+```text
+external client representation
+```
+
+### 19.5 Prevent retry storms
+
+An insecure or unreliable failure policy can become a denial-of-service amplifier.
+
+### 19.6 Error-based information disclosure
+
+Different responses can accidentally reveal:
+
+```text
+user exists / does not exist
+resource exists / missing
+credential correct / incorrect
+internal topology
+```
+
+Normalize externally visible responses where required by the threat model.
+
+---
+
+## 20. Production Usage
+
+### 20.1 HTTP API boundary
+
+A production API should usually separate:
+
+```text
+domain error
+internal error
+client error response
+```
+
+Example policy:
+
+```js
+function toHttpResponse(error) {
+  if (error?.code === "USER_NOT_FOUND") {
+    return {
+      status: 404,
+      body: {
+        error: {
+          code: "USER_NOT_FOUND",
+          message: "User not found"
+        }
+      }
+    };
+  }
+
+  return {
+    status: 500,
+    body: {
+      error: {
+        code: "INTERNAL_ERROR",
+        message: "Internal server error"
+      }
+    }
+  };
+}
+```
+
+The client does not need the internal stack.
+
+### 20.2 Worker boundary
+
+A queue worker should distinguish:
+
+```text
+retryable failure
+permanent failure
+poison message
+programmer defect
+```
+
+Catching everything and acknowledging the message can cause silent loss.
+
+### 20.3 Library boundary
+
+Libraries should:
+
+- document what they throw or reject with;
+- preserve causes where relevant;
+- avoid exposing unstable engine internals as contracts;
+- avoid swallowing errors;
+- avoid requiring consumers to parse messages.
+
+### 20.4 CLI boundary
+
+A CLI often needs:
+
+```text
+developer diagnostics
++
+user-friendly stderr
++
+non-zero process exit status
+```
+
+### 20.5 Service boundary
+
+A service should know:
+
+- which failures are retriable;
+- which failures should be surfaced;
+- which failures should trip a circuit breaker;
+- which failures require alerting;
+- which failures are expected noise.
+
+### 20.6 Observability
+
+A high-quality error event may include:
+
+```text
+error type
+stable code
+message
+cause chain
+request ID
+operation
+service/component
+timestamp
+environment
+safe context
+```
+
+Avoid including secrets.
+
+---
+
+## 21. Implementation From Scratch
+
+Build a small error framework progressively.
+
+### Stage 1 — Guided
+
+Create a base error:
+
+```js
+class AppError extends Error {
+  constructor(message, {
+    code = "INTERNAL_ERROR",
+    status = 500,
+    cause,
+    details
+  } = {}) {
+    super(message, { cause });
+
+    this.name = "AppError";
+    this.code = code;
+    this.status = status;
+    this.details = details;
+  }
+}
+```
+
+Create subclasses:
+
+```js
+class ValidationError extends AppError {
+  constructor(message, details) {
+    super(message, {
+      code: "VALIDATION_ERROR",
+      status: 400,
+      details
+    });
+
+    this.name = "ValidationError";
+  }
+}
+
+class NotFoundError extends AppError {
+  constructor(resource) {
+    super(`${resource} not found`, {
+      code: "NOT_FOUND",
+      status: 404
+    });
+
+    this.name = "NotFoundError";
+  }
+}
+```
+
+### Stage 2 — Partially Guided
+
+Add:
+
+- retryability;
+- machine-readable category;
+- safe public message;
+- internal cause;
+- operation metadata.
+
+Example target shape:
+
+```js
+{
+  name,
+  code,
+  category,
+  status,
+  retryable,
+  message,
+  details,
+  cause
+}
+```
+
+### Stage 3 — No Reference
+
+Implement a production-oriented `AppError` without looking at the chapter.
+
+Requirements:
+
+- preserves `cause`;
+- supports stable `code`;
+- supports safe public representation;
+- distinguishes operational failures from programmer defects;
+- avoids serializing stack traces by default.
+
+### Stage 4 — Edge-Case Hardened
+
+Add handling for:
+
+- thrown non-Error values;
+- nested causes;
+- circular metadata;
+- absent status;
+- invalid error codes;
+- unknown external errors;
+- cross-boundary classification;
+- duplicate logging;
+- cleanup failure.
+
+### Stage 5 — Production Grade
+
+Implement:
+
+```js
+class ErrorBoundary {
+  classify(error) {}
+  toPublic(error) {}
+  toLogRecord(error) {}
+  shouldRetry(error) {}
+}
+```
+
+Requirements:
+
+- bounded serialization;
+- safe redaction;
+- causal-chain traversal;
+- explicit retry policy;
+- stable client error codes;
+- no accidental secret leakage;
+- no duplicate logging;
+- testable classification rules.
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Basic propagation
+
+Predict:
+
+```js
+function a() {
+  throw new Error("A");
+}
+
+function b() {
+  a();
+}
+
+try {
+  b();
+} catch (error) {
+  console.log(error.message);
+}
+```
+
+Expected reasoning:
+
+```text
+A
+```
+
+### Exercise 2 — Rethrow
+
+```js
+try {
+  throw new Error("original");
+} catch (error) {
+  throw new Error("wrapped", { cause: error });
+}
+```
+
+Question:
+
+What information must the outer boundary inspect to recover the original failure?
+
+### Exercise 3 — `finally` replacement
+
+```js
+function f() {
+  try {
+    return 1;
+  } finally {
+    return 2;
+  }
+}
+```
+
+Predict the result and explain the completion flow.
+
+### Exercise 4 — Cleanup failure
+
+```js
+function f() {
+  try {
+    throw new Error("work failed");
+  } finally {
+    throw new Error("cleanup failed");
+  }
+}
+```
+
+What error reaches the caller? What diagnostic information has been lost?
+
+### Exercise 5 — Async boundary
+
+```js
+try {
+  setTimeout(() => {
+    throw new Error("timer");
+  }, 0);
+} catch {
+  console.log("caught");
+}
+```
+
+Explain precisely why the catch block does not run.
+
+### Exercise 6 — Promise boundary
+
+```js
+try {
+  Promise.reject(new Error("rejected"));
+} catch {
+  console.log("caught");
+}
+```
+
+Why is this not equivalent to:
+
+```js
+try {
+  throw new Error("rejected");
+} catch {
+  console.log("caught");
+}
+```
+
+### Exercise 7 — Throw any value
+
+```js
+try {
+  throw null;
+} catch (error) {
+  console.log(error);
+}
+```
+
+What assumptions about `error` are unsafe?
+
+---
+
+## 23. Code Review Exercise
+
+Review this production candidate:
+
+```js
+async function getUser(req, res) {
+  try {
+    const user = await database.findUser(req.params.id);
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    res.json(user);
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      message: error.message,
+      stack: error.stack
+    });
+  }
+}
+```
+
+Identify at least ten issues or design questions.
+
+Possible areas to investigate:
+
+- error classification;
+- client-safe serialization;
+- status mapping;
+- logging policy;
+- sensitive information;
+- error codes;
+- expected vs unexpected failure;
+- observability context;
+- stable API contracts;
+- duplicate or excessive logs;
+- domain/business semantics;
+- retry behavior at higher layers.
+
+Then redesign the boundary.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is the difference between an `Error` and an exception?
+2. Can JavaScript throw non-Error values?
+3. What does `throw` do to control flow?
+4. What is the purpose of `try/catch`?
+5. Why is `finally` useful?
+6. Can `finally` override a return value?
+7. Can `finally` replace a thrown error?
+8. What is `Error.cause` used for?
+9. Why are error codes useful?
+10. Why should error messages not usually be parsed?
+
+### Intermediate
+
+11. What happens when a function throws and has no local catch?
+12. How does rethrowing differ from wrapping?
+13. How would you classify operational vs programmer errors?
+14. Why doesn't a synchronous `try/catch` catch a later timer exception?
+15. Why can `await` allow `try/catch` to handle promise rejections?
+16. What is `AggregateError`?
+17. How do custom error classes help?
+18. What are the risks of broad catches?
+19. How should errors be serialized over HTTP?
+20. Why should raw stacks not be exposed to clients?
+
+### Advanced
+
+21. Explain abrupt completion.
+22. How does `finally` interact with `return`, `throw`, `break`, and `continue`?
+23. Why can cleanup errors mask primary errors?
+24. What is an error boundary?
+25. How would you design retryable error classification?
+26. What are cross-realm implications for `instanceof Error`?
+27. How would you preserve diagnostics while changing abstraction-level semantics?
+28. How can error handling create memory retention?
+29. How can error handling create security vulnerabilities?
+30. When should a function return a result instead of throwing?
+
+### Principal-Level
+
+31. Design an error contract for a multi-service platform.
+32. How would you prevent duplicate logs across layers?
+33. How would you distinguish user-caused failures from infrastructure failures?
+34. How should a queue consumer classify errors?
+35. How should error handling interact with circuit breakers and retries?
+36. How would you design safe causal-chain logging?
+37. How would you handle a failure in the cleanup path while preserving the primary error?
+38. What should an API guarantee about its error shape?
+39. Which parts of an error object should be public versus internal?
+40. How would you evolve error codes without breaking clients?
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+try {
+  throw new Error("A");
+} catch (error) {
+  console.log("B");
+}
+console.log("C");
+```
+
+Predict:
+
+```text
+B
+C
+```
+
+Then explain why the outer program continues after the catch completes normally.
+
+### Exercise B
+
+```js
+function f() {
+  try {
+    return "A";
+  } finally {
+    console.log("B");
+  }
+}
+
+console.log(f());
+```
+
+Predict the exact order.
+
+### Exercise C
+
+```js
+function f() {
+  try {
+    return "A";
+  } finally {
+    return "B";
+  }
+}
+
+console.log(f());
+```
+
+Explain which completion wins.
+
+### Exercise D
+
+```js
+function f() {
+  try {
+    throw new Error("A");
+  } finally {
+    throw new Error("B");
+  }
+}
+
+try {
+  f();
+} catch (error) {
+  console.log(error.message);
+}
+```
+
+Predict:
+
+```text
+B
+```
+
+Then explain what happened to `"A"`.
+
+### Exercise E
+
+```js
+try {
+  Promise.resolve().then(() => {
+    throw new Error("async");
+  });
+} catch {
+  console.log("caught");
+}
+```
+
+Predict the output and explain why.
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Error taxonomy
+
+Design a taxonomy for:
+
+```text
+validation
+authentication
+authorization
+not found
+conflict
+dependency timeout
+dependency unavailable
+rate limiting
+database serialization failure
+programmer defect
+unknown failure
+```
+
+For each category decide:
+
+- error code;
+- public status;
+- retryable?;
+- alertable?;
+- log severity;
+- client message.
+
+### Exercise 2 — Error boundary
+
+Build an HTTP error boundary that:
+
+- maps known application errors;
+- returns safe messages;
+- preserves request IDs;
+- logs unexpected failures once;
+- never exposes stack traces in production responses.
+
+### Exercise 3 — Worker policy
+
+Build a queue worker policy:
+
+```text
+process message
+   ↓
+success → ack
+retryable failure → retry
+permanent failure → dead-letter
+programmer defect → fail according to worker supervision policy
+```
+
+### Exercise 4 — Causal graph
+
+Create a failure chain:
+
+```text
+HTTP request
+ → service operation
+ → repository operation
+ → database driver
+ → network
+```
+
+Preserve causes at each abstraction boundary.
+
+### Exercise 5 — Cleanup correctness
+
+Write code that:
+
+1. performs an operation;
+2. attempts cleanup;
+3. preserves primary failure information;
+4. records cleanup failure;
+5. exposes deterministic behavior to the caller.
+
+Do not solve this by simply swallowing the cleanup error.
+
+### Exercise 6 — Error serializer
+
+Implement:
+
+```js
+serializeError(error)
+```
+
+Requirements:
+
+- accepts arbitrary thrown values;
+- safely identifies `Error` objects;
+- includes stable fields;
+- preserves a bounded cause chain;
+- redacts sensitive metadata;
+- does not expose internal stack traces by default.
+
+### Exercise 7 — Property-based thinking
+
+Generate arbitrary thrown values and verify that your boundary never crashes while trying to report an error.
+
+---
+
+## 27. Key Takeaways
+
+1. Exceptions are a control-flow mechanism; `Error` is a value type/convention.
+2. Any JavaScript value can be thrown, so caught values must not be blindly trusted.
+3. `throw` creates an abrupt completion that propagates outward.
+4. `catch` handles a propagated throw completion.
+5. `finally` executes during normal cleanup paths and abrupt exits.
+6. `finally` can override earlier return or throw completions.
+7. `cause` preserves lower-level context while allowing higher-level semantic wrapping.
+8. `AggregateError` represents multiple associated failures rather than a single cause.
+9. Errors should be classified at meaningful boundaries.
+10. Error messages are for humans; stable machine contracts should use structured codes or discriminators.
+11. Promise rejection and asynchronous callback failures require different propagation reasoning from synchronous throws.
+12. Cleanup can fail and can accidentally mask the primary failure.
+13. Catching broadly without a recovery strategy can hide defects.
+14. Logging is not the same as handling.
+15. Error handling is also a performance, memory, security, reliability, and API-design concern.
+16. Production systems should separate internal diagnostics from externally visible error responses.
+17. The right place to catch an error is where the system has enough context to make a meaningful decision.
+18. Error architecture should preserve information rather than flattening every failure into a generic string.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 02 — Values, Types, Type System
+- Chapter 06 — Operators, Expressions
+- Chapter 08 — Control Flow, Iteration
+- Chapter 09 — Functions / First-Class Behavior
+- Chapter 10 — Scope / Lexical Environments / Identifier Resolution
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 15 — Objects / Property Semantics
+- Chapter 18 — Classes / OOP
+- Chapter 20 — Symbols / Well-Known Symbols
+- Chapter 28 — JSON / Serialization / Structured Clone
+
+### Builds Toward
+
+- Chapter 30 — Resource Management / Cleanup (`using`, `await using`, DisposableStack)
+- Chapter 31 — Async Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 89 — Code Review / Refactoring
+- Chapter 98 — Anti-patterns / Failure Modes
+- Chapter 99 — Myths / Misconceptions
+- Chapter 100 — Cost Model / Tradeoffs
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 105 — Node REST API
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- Completion records
+- Control flow
+- Call stacks
+- Promises
+- Async/await
+- Resource cleanup
+- Cancellation
+- Retries
+- Circuit breakers
+- Logging
+- Tracing
+- Observability
+- API contracts
+- Validation
+- Assertions
+- Domain errors
+- Process supervision
+
+### Concepts Revisited
+
+This chapter intentionally revisits:
+
+- objects;
+- classes;
+- prototypes;
+- lexical scoping;
+- execution contexts;
+- abrupt control flow;
+- promises;
+- async functions;
+- JSON serialization.
+
+### Why This Chapter Matters Later
+
+Almost every production subsystem eventually crosses an error boundary.
+
+HTTP clients fail.
+
+Databases fail.
+
+Files disappear.
+
+Queues contain invalid messages.
+
+User input is malformed.
+
+Dependencies time out.
+
+Workers crash.
+
+Cleanup fails.
+
+Distributed systems partially succeed.
+
+Without a rigorous error model, later chapters on asynchronous programming, reliability, observability, testing, performance, security, and system design become collections of isolated practices.
+
+The central principle is:
+
+> Do not merely catch errors. Design failure behavior.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 29 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Explain the difference between an error value and an exception.
+- [ ] Explain abrupt completion.
+- [ ] Explain synchronous exception propagation.
+- [ ] Explain `try`, `catch`, and `finally`.
+- [ ] Explain `Error`, subclasses, `cause`, and `AggregateError`.
+- [ ] Explain why thrown values can be arbitrary.
+- [ ] Explain operational vs programmer failures.
+
+### Predictive Mastery
+
+- [ ] Predict nested throw/catch behavior.
+- [ ] Predict `finally` behavior with `return`.
+- [ ] Predict `finally` behavior with `throw`.
+- [ ] Predict cleanup masking.
+- [ ] Predict synchronous vs asynchronous catch behavior.
+- [ ] Predict promise rejection behavior.
+
+### Implementation
+
+- [ ] Build custom error classes.
+- [ ] Build structured error codes.
+- [ ] Preserve causal chains.
+- [ ] Build an error boundary.
+- [ ] Serialize errors safely.
+- [ ] Design retry classification.
+- [ ] Handle arbitrary thrown values.
+
+### Debugging
+
+- [ ] Read a stack trace.
+- [ ] Follow a causal chain.
+- [ ] Identify swallowed exceptions.
+- [ ] Identify incorrect broad catches.
+- [ ] Find async propagation mistakes.
+- [ ] Detect sensitive error leakage.
+
+### Production Engineering
+
+- [ ] Design client-safe error responses.
+- [ ] Define a stable error contract.
+- [ ] Prevent duplicate logs.
+- [ ] Distinguish retryable and non-retryable failures.
+- [ ] Design worker failure behavior.
+- [ ] Account for cleanup failures.
+- [ ] Protect diagnostics from memory and security problems.
+
+### Interview Readiness
+
+- [ ] Answer foundational questions without memorized wording.
+- [ ] Explain abrupt completion in your own model.
+- [ ] Predict `finally` precedence.
+- [ ] Explain async error propagation.
+- [ ] Defend when to throw versus return.
+- [ ] Design an error architecture for a production service.
+- [ ] Defend the design against performance, security, reliability, and compatibility concerns.
+
+### Track A — Core Theory
+
+- [ ] Understand exception semantics.
+- [ ] Understand completion-based control flow.
+- [ ] Understand error object/prototype behavior.
+- [ ] Understand causal and aggregate error representation.
+- [ ] Understand boundary-based handling.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production-oriented implementation reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed debugging scenarios.
+- [ ] Completed code review exercise.
+- [ ] Completed architecture reasoning.
+- [ ] Defended trade-offs under changing requirements.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 29 — Revision / Retrieval Record
+
+Use this section for future spaced-retrieval sessions.
+
+### Retrieval Prompts
+
+1. What exactly is thrown by `throw new Error("x")`?
+2. What is an abrupt completion?
+3. What happens if no `catch` handles a throw?
+4. Why can `finally` replace a return value?
+5. Why can cleanup mask the primary failure?
+6. Why does synchronous `try/catch` not catch a later timer exception?
+7. How does `await` change promise-rejection handling?
+8. When should `cause` be used?
+9. When is `AggregateError` more appropriate than `cause`?
+10. Why are error codes more stable than messages?
+11. How should an HTTP boundary classify errors?
+12. How should a queue worker classify failures?
+13. What information should never be exposed to clients?
+14. When is returning a result better than throwing?
+15. How would you prevent error handling from becoming a reliability problem?
+
+### Weak Areas
+
+```text
+- 
+- 
+- 
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit abrupt completion and finally
+- [ ] Revisit synchronous vs asynchronous propagation
+- [ ] Revisit error classification
+- [ ] Revisit cause and aggregate errors
+- [ ] Revisit production error boundaries
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 29 — Canonical References and Source Discipline
+
+For future detailed study of this chapter, use this source hierarchy:
+
+1. ECMAScript specification — language-level semantics such as `throw`, `try`, completion records, constructors, and built-in error objects.
+2. JavaScript engine documentation / implementation notes — implementation and diagnostic details such as stack-trace behavior and performance characteristics.
+3. Host runtime documentation — browser or Node.js behavior for event-loop boundaries, process-level handling, worker behavior, and runtime-specific diagnostics.
+4. Application architecture documentation — error taxonomy, API contracts, retry policies, observability, and operational behavior.
+
+When a claim is engine-specific, label it as engine-specific.
+
+When a claim is host-specific, label it as browser-specific, Node-specific, or otherwise runtime-specific.
+
+Do not present implementation behavior as universal ECMAScript semantics.
+
+---
+
+# Chapter 29 — Completion Snapshot
+
+```text
+Chapter: 29
+Title: Errors and Error Handling
+Part: V — Errors / Cleanup
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 30 — Resource Management and Cleanup (`using`, `await using`, DisposableStack)
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain what a resource is in JavaScript application design.
+- Distinguish memory-managed values from external resources that require deterministic cleanup.
+- Explain why garbage collection does not provide timely release of arbitrary external resources.
+- Explain the motivation behind explicit resource-management semantics.
+- Understand synchronous disposal with `using`.
+- Understand asynchronous disposal with `await using`.
+- Understand `Symbol.dispose` and `Symbol.asyncDispose`.
+- Explain how disposal is triggered on scope exit.
+- Explain why cleanup semantics must work for normal completion, `return`, and thrown failures.
+- Explain the role of `DisposableStack`.
+- Explain the difference between `DisposableStack` and `AsyncDisposableStack`.
+- Register cleanup actions safely and reason about cleanup order.
+- Explain why resource cleanup is fundamentally a control-flow and reliability problem, not merely a memory problem.
+- Compare `using` with traditional `try/finally`.
+- Design APIs that expose disposable resources correctly.
+- Implement disposable abstractions from scratch before using language/runtime facilities.
+- Debug leaks, double disposal, cleanup failures, and partially initialized resources.
+- Design production-safe resource ownership boundaries.
+- Reason about cleanup under nested scopes, asynchronous work, exceptions, cancellation, and concurrency.
+- Evaluate trade-offs among explicit disposal, pooling, ownership transfer, reference counting, and garbage collection.
+- Understand how resource-management features connect to networking, files, streams, databases, workers, locks, and transactional systems.
+- Make principal-level decisions about resource lifetime, ownership, cleanup guarantees, and failure policy.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+Reading this chapter is not sufficient to claim mastery.
+
+---
+
+## 2. Prerequisites
+
+The learner should already understand:
+
+- JavaScript values, objects, and prototypes.
+- Classes and constructors.
+- Symbols and well-known symbols.
+- Control flow and abrupt completion.
+- `throw`, `try`, `catch`, and `finally`.
+- Functions and lexical scope.
+- Promises and async/await at a foundational level.
+- Typed arrays and binary data at a foundational level.
+- Basic Node.js/browser resource concepts.
+- Error propagation and causal error handling.
+
+Primary dependencies:
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 15 — Objects / Property Semantics
+- Chapter 18 — Classes / OOP
+- Chapter 20 — Symbols / Well-Known Symbols
+- Chapter 26 — Generators / Async Generators
+- Chapter 27 — Typed Arrays / Binary Data
+- Chapter 29 — Errors / Error Handling
+
+This chapter is the bridge between language-level control flow and production-grade resource lifetime management.
+
+---
+
+## 3. What Is It?
+
+A **resource** is anything whose useful lifetime is associated with an external or finite capability that should be released when the owning operation is finished.
+
+Examples include:
+
+- file handles;
+- sockets;
+- database connections;
+- transactions;
+- locks;
+- subscriptions;
+- streams;
+- worker-related handles;
+- native resources exposed through JavaScript bindings;
+- temporary buffers or OS-backed resources;
+- application-level resources that maintain an ongoing registration.
+
+A resource has a lifetime:
+
+```text
+created
+  ↓
+acquired
+  ↓
+used
+  ↓
+released
+```
+
+The central question is:
+
+> Who owns the resource, and exactly when does that ownership end?
+
+Garbage collection answers a different question:
+
+> When is a JavaScript object unreachable?
+
+Those are not equivalent.
+
+An object can become unreachable while an external system still requires explicit release, or the object may remain reachable much longer than the desired resource lifetime.
+
+Resource management therefore requires **deterministic cleanup**.
+
+Modern JavaScript provides language-level resource-management capabilities based on:
+
+```js
+using
+await using
+Symbol.dispose
+Symbol.asyncDispose
+DisposableStack
+AsyncDisposableStack
+```
+
+The design goal is to make ownership and cleanup composable with lexical scope.
+
+Conceptually:
+
+```text
+enter scope
+   ↓
+acquire resource
+   ↓
+use resource
+   ↓
+leave scope
+   ↓
+automatic disposal
+```
+
+---
+
+## 4. Why Does It Exist?
+
+Historically, JavaScript developers used:
+
+```js
+const resource = acquire();
+
+try {
+  use(resource);
+} finally {
+  resource.close();
+}
+```
+
+This works.
+
+But once a function owns multiple resources, cleanup becomes repetitive and error-prone:
+
+```js
+const a = acquireA();
+try {
+  const b = acquireB();
+
+  try {
+    const c = acquireC();
+
+    try {
+      use(a, b, c);
+    } finally {
+      c.close();
+    }
+  } finally {
+    b.close();
+  }
+} finally {
+  a.close();
+}
+```
+
+The problem becomes harder when:
+
+- acquisition itself can fail;
+- different resources have different cleanup methods;
+- some cleanup is asynchronous;
+- resources are conditionally acquired;
+- ownership is transferred;
+- cleanup can throw;
+- multiple cleanup failures occur;
+- cancellation interrupts normal work.
+
+Resource management features aim to make the ownership structure explicit:
+
+```js
+{
+  using a = acquireA();
+  using b = acquireB();
+  await using c = acquireC();
+
+  await use(a, b, c);
+}
+```
+
+The language/runtime can then connect lexical scope exit with disposal.
+
+The deeper reason is reliability:
+
+> Cleanup is a correctness obligation, not an optional afterthought.
+
+A leaked file handle, database connection, subscription, lock, or stream can cause production failures even when the application otherwise “works.”
+
+---
+
+## 5. Mental Model
+
+Think in terms of **ownership**.
+
+```text
+scope owns resource
+      │
+      ├── use resource
+      │
+      └── scope exits
+             │
+             ▼
+        dispose resource
+```
+
+For multiple resources:
+
+```text
+scope
+ ├── resource A
+ ├── resource B
+ └── resource C
+
+exit scope
+   ↓
+C disposed
+B disposed
+A disposed
+```
+
+The cleanup order is conceptually reverse acquisition order.
+
+Why?
+
+Because dependencies often flow in the same direction as acquisition:
+
+```text
+A created
+  ↓
+B depends on A
+  ↓
+C depends on B
+```
+
+Therefore:
+
+```text
+C → B → A
+```
+
+is the natural destruction sequence.
+
+This resembles stack unwinding:
+
+```text
+acquire A
+  acquire B
+    acquire C
+    release C
+  release B
+release A
+```
+
+The core mental model:
+
+> Scope defines ownership; leaving scope triggers disposal.
+
+For asynchronous resources:
+
+```text
+async scope
+    ↓
+await work
+    ↓
+scope exits
+    ↓
+await disposal
+```
+
+The disposal operation itself becomes part of the program's control flow.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Explicit resource ownership is different from garbage collection
+
+GC tracks JavaScript object reachability.
+
+Disposal tracks a resource's lifecycle contract.
+
+### Rule 2 — A disposable value exposes a protocol
+
+Synchronous disposal uses:
+
+```js
+Symbol.dispose
+```
+
+Asynchronous disposal uses:
+
+```js
+Symbol.asyncDispose
+```
+
+### Rule 3 — `using` is scope-bound
+
+A resource declared with `using` is disposed when its containing scope exits according to the resource-management semantics.
+
+### Rule 4 — `await using` is for asynchronous disposal
+
+Its cleanup may return a promise and therefore requires asynchronous scope semantics.
+
+### Rule 5 — Cleanup occurs on abnormal exits too
+
+Resource disposal must account for:
+
+- normal completion;
+- `return`;
+- thrown exceptions;
+- other abrupt exits supported by the construct.
+
+### Rule 6 — Disposal order is important
+
+Multiple resources are generally disposed in reverse declaration/acquisition order.
+
+### Rule 7 — Cleanup itself can fail
+
+Disposal is code.
+
+Therefore:
+
+```js
+resource[Symbol.dispose]()
+```
+
+can throw.
+
+Async disposal can reject.
+
+### Rule 8 — Cleanup failure must not be treated as impossible
+
+The design must preserve meaningful failure information when both the main operation and cleanup fail.
+
+### Rule 9 — A resource should have one clear owner at a time
+
+Ambiguous ownership leads to:
+
+- double disposal;
+- leaked resources;
+- use-after-disposal;
+- premature cleanup.
+
+### Rule 10 — Scope boundaries should match ownership boundaries
+
+A resource should generally live no longer than necessary.
+
+### Rule 11 — Async cleanup is not interchangeable with sync cleanup
+
+A synchronous resource cannot magically become asynchronous just because surrounding code uses `await`.
+
+### Rule 12 — Disposal is a lifecycle operation
+
+Do not confuse:
+
+```text
+dispose
+close
+abort
+cancel
+release
+destroy
+shutdown
+```
+
+They may have different semantics.
+
+The API contract must define what actually happens.
+
+---
+
+## 7. Syntax
+
+### `using`
+
+Representative form:
+
+```js
+{
+  using resource = acquireResource();
+  use(resource);
+}
+```
+
+The resource is disposed when the scope exits.
+
+### `await using`
+
+Representative form:
+
+```js
+{
+  await using resource = acquireAsyncResource();
+  await use(resource);
+}
+```
+
+The disposal step can be asynchronous.
+
+### Resource protocols
+
+Synchronous:
+
+```js
+class Resource {
+  [Symbol.dispose]() {
+    // release
+  }
+}
+```
+
+Asynchronous:
+
+```js
+class AsyncResource {
+  async [Symbol.asyncDispose]() {
+    // asynchronous release
+  }
+}
+```
+
+### Disposable stack
+
+```js
+const stack = new DisposableStack();
+
+stack.use(resource);
+stack.defer(() => cleanupSomething());
+```
+
+At the end:
+
+```js
+stack.dispose();
+```
+
+For asynchronous lifetimes, use the async counterpart where supported:
+
+```js
+const stack = new AsyncDisposableStack();
+
+stack.use(resource);
+stack.defer(async () => {
+  await cleanup();
+});
+```
+
+The exact supported syntax/API surface depends on the current ECMAScript/runtime implementation. Distinguish language semantics from runtime availability.
+
+### Ownership transfer
+
+A resource manager may need an explicit way to move ownership:
+
+```text
+owner A
+  ↓ transfer
+owner B
+```
+
+`DisposableStack`-style APIs are designed to support composable ownership patterns, including detaching/disarming cleanup when ownership is transferred.
+
+---
+
+## 8. Basic Examples
+
+### Basic synchronous disposable object
+
+```js
+class FileHandle {
+  constructor(path) {
+    this.path = path;
+    this.closed = false;
+  }
+
+  write(data) {
+    if (this.closed) {
+      throw new Error("Handle is closed");
+    }
+
+    console.log(`Writing ${data} to ${this.path}`);
+  }
+
+  [Symbol.dispose]() {
+    if (this.closed) {
+      return;
+    }
+
+    this.closed = true;
+    console.log(`Closed ${this.path}`);
+  }
+}
+```
+
+Usage:
+
+```js
+{
+  using file = new FileHandle("data.txt");
+
+  file.write("hello");
+}
+```
+
+Conceptually:
+
+```text
+construct
+→ write
+→ scope exits
+→ dispose
+```
+
+### Traditional equivalent
+
+The same ownership idea can be expressed as:
+
+```js
+const file = new FileHandle("data.txt");
+
+try {
+  file.write("hello");
+} finally {
+  file[Symbol.dispose]();
+}
+```
+
+The language-level feature mainly reduces ceremony and makes cleanup composable.
+
+### Multiple resources
+
+```js
+{
+  using first = createResource("first");
+  using second = createResource("second");
+
+  use(first, second);
+}
+```
+
+The disposal order should be reasoned about as:
+
+```text
+second
+first
+```
+
+### Asynchronous disposal
+
+```js
+class AsyncConnection {
+  async connect() {
+    console.log("connected");
+  }
+
+  async [Symbol.asyncDispose]() {
+    console.log("closing...");
+    await new Promise(resolve => setTimeout(resolve, 10));
+    console.log("closed");
+  }
+}
+```
+
+Conceptually:
+
+```js
+{
+  await using connection = new AsyncConnection();
+  await connection.connect();
+}
+```
+
+The scope cannot be considered fully exited until asynchronous disposal semantics complete.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+class Resource {
+  constructor(name) {
+    this.name = name;
+  }
+
+  [Symbol.dispose]() {
+    console.log(`dispose ${this.name}`);
+  }
+}
+
+function work() {
+  using a = new Resource("A");
+  using b = new Resource("B");
+
+  console.log("work");
+}
+
+work();
+```
+
+### Step 1
+
+Enter `work()`.
+
+### Step 2
+
+Create resource `A`.
+
+Ownership becomes:
+
+```text
+work scope → A
+```
+
+### Step 3
+
+Create resource `B`.
+
+Ownership becomes:
+
+```text
+work scope → A, B
+```
+
+### Step 4
+
+Execute:
+
+```js
+console.log("work");
+```
+
+### Step 5
+
+The function scope exits.
+
+### Step 6
+
+The language resource-management semantics perform disposal.
+
+### Step 7
+
+`B` is disposed.
+
+### Step 8
+
+`A` is disposed.
+
+Expected output:
+
+```text
+work
+dispose B
+dispose A
+```
+
+The important point is that the cleanup is attached to scope exit rather than relying on every early-return branch being manually updated.
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 Disposal is structured cleanup
+
+The semantics conceptually maintain disposable resources associated with lexical execution state.
+
+When a `using` declaration succeeds, the resource becomes part of the scope's disposal obligations.
+
+When the scope exits, the associated disposal operations are performed according to the resource-management rules.
+
+### 10.2 Acquisition and registration are not the same event
+
+The expression:
+
+```js
+using resource = acquire();
+```
+
+has two important phases:
+
+```text
+evaluate initializer
+       ↓
+obtain value
+       ↓
+validate / register disposable behavior
+```
+
+If acquisition fails before ownership exists, there may be nothing to dispose.
+
+If acquisition succeeds but subsequent registration/use fails, cleanup semantics must still preserve the resource obligation.
+
+This distinction matters for partial initialization.
+
+### 10.3 LIFO cleanup
+
+Suppose:
+
+```js
+{
+  using A = acquireA();
+  using B = acquireB();
+  using C = acquireC();
+}
+```
+
+The resulting cleanup stack behaves conceptually like:
+
+```text
+push A
+push B
+push C
+
+pop C
+pop B
+pop A
+```
+
+This ordering minimizes dependency violations in common ownership graphs.
+
+### 10.4 Disposal and abrupt completion
+
+Suppose:
+
+```js
+{
+  using resource = acquire();
+
+  throw new Error("work failed");
+}
+```
+
+The resource must still be disposed as part of scope exit.
+
+The resulting outcome must account for both:
+
+```text
+primary failure
++
+cleanup outcome
+```
+
+This connects directly to Chapter 29.
+
+### 10.5 Async disposal
+
+With:
+
+```js
+await using resource = acquire();
+```
+
+or an equivalent asynchronous-disposal pattern, disposal may involve awaiting the result of the async disposal protocol.
+
+That means:
+
+```text
+scope exit
+   ↓
+call async disposer
+   ↓
+await completion
+   ↓
+continue propagation
+```
+
+The scope is therefore coupled to asynchronous cleanup.
+
+### 10.6 `Symbol.dispose`
+
+A disposable object can define:
+
+```js
+[Symbol.dispose]() {}
+```
+
+This avoids imposing one universal method name such as:
+
+```js
+close()
+```
+
+Different domains can continue using their preferred APIs while providing a common protocol for automatic cleanup.
+
+### 10.7 `Symbol.asyncDispose`
+
+Asynchronous cleanup uses:
+
+```js
+[Symbol.asyncDispose]()
+```
+
+The method may return a promise-like completion.
+
+This lets the language distinguish:
+
+```text
+cleanup is immediate
+```
+
+from:
+
+```text
+cleanup must complete asynchronously
+```
+
+### 10.8 Disposable stacks
+
+A disposable stack is an explicit dynamic ownership structure.
+
+A static lexical scope works well when resources are declared directly:
+
+```js
+using a = acquireA();
+using b = acquireB();
+```
+
+A dynamic stack is useful when resources are acquired conditionally or from helper functions:
+
+```js
+const stack = new DisposableStack();
+
+stack.use(a);
+
+if (condition) {
+  stack.use(b);
+}
+
+stack.defer(cleanup);
+```
+
+The stack makes the cleanup plan explicit even when acquisition is dynamic.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+This chapter requires careful source discipline because explicit resource management has a specification/proposal history and runtime support can vary by environment.
+
+The learner must distinguish:
+
+```text
+standardized language semantics
+       vs
+proposal-stage semantics
+       vs
+runtime implementation support
+```
+
+Do not assume that every JavaScript runtime supports every `using` form merely because the syntax is documented somewhere.
+
+### 11.1 Disposal protocol
+
+The core protocol is represented by well-known symbols:
+
+```js
+Symbol.dispose
+Symbol.asyncDispose
+```
+
+These symbols allow objects to opt into standardized disposal behavior.
+
+### 11.2 Lexical resource lifetime
+
+A resource declaration associates a binding with a disposal obligation for the lifetime of the surrounding scope.
+
+### 11.3 Abrupt completion
+
+Resource cleanup integrates with the broader completion model from Chapter 29.
+
+The important connection is:
+
+```text
+normal completion
+return
+throw
+```
+
+can all cause scope exit, and scope exit can trigger disposal.
+
+### 11.4 Suppressed cleanup failures
+
+When both body execution and cleanup fail, the system must preserve meaningful information about both failures rather than blindly discarding one.
+
+Resource-management semantics therefore build directly on the language's abrupt-completion model and multi-error representation ideas.
+
+### 11.5 `DisposableStack`
+
+`DisposableStack` gives dynamic code an explicit stack of cleanup records.
+
+Important conceptual operations include:
+
+- register a disposable;
+- register arbitrary cleanup behavior;
+- release/dispose the stack;
+- transfer ownership;
+- prevent accidental cleanup after ownership transfer.
+
+### 11.6 `AsyncDisposableStack`
+
+The asynchronous form extends the same ownership model to cleanup operations that must be awaited.
+
+The exact names and availability of APIs must be verified against the target ECMAScript/runtime version.
+
+### 11.7 Runtime support is part of engineering correctness
+
+A codebase cannot be considered production-ready merely because a language construct has specification-level semantics.
+
+Check:
+
+```text
+engine support
+runtime version
+transpilation requirements
+build target
+test environment
+deployment environment
+```
+
+This is especially important for language features that are relatively recent.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Partial initialization
+
+Suppose:
+
+```js
+{
+  using a = acquireA();
+  using b = acquireB();
+  using c = acquireC();
+}
+```
+
+and `acquireC()` throws.
+
+Correct reasoning:
+
+```text
+A acquired
+B acquired
+C failed
+↓
+C has no acquired resource
+B must be disposed
+A must be disposed
+```
+
+This is a major benefit of scope-based resource management.
+
+Manual cleanup is often where developers accidentally miss these partial-initialization branches.
+
+### 12.2 Conditional acquisition
+
+A dynamic resource set is common:
+
+```js
+const stack = new DisposableStack();
+
+stack.use(primary);
+
+if (useCache) {
+  stack.use(cache);
+}
+
+if (useMetrics) {
+  stack.defer(flushMetrics);
+}
+```
+
+Every successful registration contributes to the cleanup plan.
+
+### 12.3 Deferred cleanup
+
+Sometimes the cleanup behavior is not exposed as a disposable object.
+
+A stack can register:
+
+```js
+stack.defer(() => releaseLock(lockId));
+```
+
+This turns arbitrary cleanup logic into a managed lifetime.
+
+### 12.4 Ownership transfer
+
+Consider a helper that creates a resource:
+
+```js
+function createConnection() {
+  return new Connection();
+}
+```
+
+Who owns it?
+
+The creator?
+
+The caller?
+
+A manager?
+
+A transaction object?
+
+A production API should define the answer.
+
+Ownership transfer means:
+
+```text
+create → temporary owner
+return → caller becomes owner
+```
+
+A resource should not remain registered with two independent cleanup owners.
+
+### 12.5 Double disposal
+
+Good disposable abstractions often make cleanup idempotent:
+
+```js
+[Symbol.dispose]() {
+  if (this.closed) {
+    return;
+  }
+
+  this.closed = true;
+  release();
+}
+```
+
+Whether idempotency is guaranteed should be part of the contract.
+
+Do not assume every third-party resource is safe to dispose multiple times.
+
+### 12.6 Use-after-disposal
+
+A disposed resource may be logically invalid:
+
+```js
+{
+  using connection = createConnection();
+}
+
+connection.query("...");
+```
+
+In practice, lexical scoping often prevents this exact pattern, but references can escape:
+
+```js
+let connection;
+
+{
+  using local = createConnection();
+  connection = local;
+}
+
+connection.query("...");
+```
+
+The object still exists as a JavaScript value, but its resource lifetime has ended.
+
+This demonstrates:
+
+> Object reachability and resource validity are different dimensions.
+
+### 12.7 Async cleanup and cancellation
+
+Imagine:
+
+```text
+operation starts
+   ↓
+resource acquired
+   ↓
+request cancelled
+   ↓
+operation stops
+   ↓
+resource must still be cleaned
+```
+
+Cancellation should not automatically mean:
+
+```text
+cleanup skipped
+```
+
+The correct design is often:
+
+```text
+cancel work
+→ perform required cleanup
+→ report cancellation
+```
+
+### 12.8 Disposal and transactions
+
+A transaction may expose:
+
+```text
+commit
+rollback
+close
+```
+
+These are not automatically interchangeable.
+
+For example:
+
+```text
+normal success → commit
+exception → rollback
+scope exit → release connection
+```
+
+A disposable abstraction must not accidentally turn these distinct business states into one generic `dispose()` operation unless that is precisely the intended contract.
+
+### 12.9 Disposal and pooling
+
+Pooling changes ownership semantics.
+
+```text
+dispose connection
+```
+
+may actually mean:
+
+```text
+return connection to pool
+```
+
+The abstraction should make the semantics clear.
+
+### 12.10 Disposal and finalization
+
+`FinalizationRegistry` is not a replacement for deterministic disposal.
+
+Finalization is GC-related and timing is not an appropriate contract for ordinary resource release.
+
+Later chapters should connect this distinction to weak references and garbage collection.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 Initializer throws
+
+```js
+{
+  using resource = acquire();
+}
+```
+
+If `acquire()` throws, the resource was not successfully acquired.
+
+Do not assume disposal can run on a value that never existed.
+
+### 13.2 Disposer throws
+
+```js
+class BadResource {
+  [Symbol.dispose]() {
+    throw new Error("cleanup failed");
+  }
+}
+```
+
+The cleanup error becomes part of the scope's final failure behavior.
+
+### 13.3 Multiple disposers throw
+
+With:
+
+```text
+A disposer throws
+B disposer throws
+C disposer succeeds
+```
+
+the implementation must preserve the multiple-failure semantics according to the resource-management model rather than simply forgetting earlier failures.
+
+### 13.4 Body throws and cleanup throws
+
+This is the most important edge case:
+
+```text
+body → Error A
+cleanup → Error B
+```
+
+The final observable failure must preserve enough context to diagnose both.
+
+### 13.5 Async disposer rejects
+
+Equivalent concern:
+
+```text
+body → Error A
+async cleanup → rejection B
+```
+
+The cleanup failure is part of the final completion path.
+
+### 13.6 Resource returned from helper
+
+A helper may create and return a disposable value:
+
+```js
+function makeResource() {
+  return new Resource();
+}
+```
+
+The caller must clearly own the returned value.
+
+### 13.7 Resource escapes scope
+
+Escaping references create lifecycle bugs:
+
+```js
+let leaked;
+
+{
+  using resource = acquire();
+  leaked = resource;
+}
+```
+
+`leaked` may refer to an already-disposed resource.
+
+### 13.8 Async work outlives resource scope
+
+Danger:
+
+```js
+{
+  using connection = createConnection();
+
+  startBackgroundTask(() => {
+    connection.query(...);
+  });
+}
+```
+
+The background work may execute after disposal.
+
+The resource scope must cover the complete lifetime of dependent work, or the work must take ownership another way.
+
+### 13.9 Detached cleanup
+
+When ownership is transferred:
+
+```text
+manager A no longer responsible
+manager B now responsible
+```
+
+the original cleanup registration must be detached correctly.
+
+### 13.10 Disposal is not rollback
+
+Closing a transaction resource is not necessarily equivalent to rollback.
+
+Model each lifecycle operation explicitly.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “Garbage collection cleans up every resource.”
+
+No.
+
+GC manages memory reachability, not arbitrary external resource semantics.
+
+### Misconception 2 — “`using` is just syntax sugar for `finally`.”
+
+Conceptually related, but the resource protocol, disposal ordering, ownership registration, and multi-error behavior provide more than a trivial textual rewrite.
+
+### Misconception 3 — “Disposal always happens immediately when the object becomes unused.”
+
+No.
+
+Disposal is tied to resource-management semantics and scope, not ordinary reachability.
+
+### Misconception 4 — “`await using` means every resource is async.”
+
+No.
+
+It means the disposal protocol may be asynchronous.
+
+### Misconception 5 — “A disposer can never throw.”
+
+It is ordinary program code.
+
+It can fail.
+
+### Misconception 6 — “Once a resource object exists, it remains usable.”
+
+Not necessarily.
+
+The underlying capability may already have been released.
+
+### Misconception 7 — “Closing and disposing are always the same thing.”
+
+Not necessarily.
+
+The semantics are determined by the API contract.
+
+### Misconception 8 — “Disposable resources should always be classes.”
+
+No.
+
+Objects can implement the disposal symbols without using classes.
+
+### Misconception 9 — “Resource cleanup is only a Node.js concern.”
+
+No.
+
+Browsers also manage resources such as streams, subscriptions, locks, workers, and other host capabilities.
+
+### Misconception 10 — “Async cleanup can be ignored because the process will exit.”
+
+Production systems must not depend on process termination as a cleanup strategy unless the lifecycle model explicitly permits it.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Ambiguous ownership
+
+Two layers both believe they own the same resource.
+
+Result:
+
+```text
+double dispose
+```
+
+or one layer disposes a resource still needed by another.
+
+### Mistake 2 — Resource escape
+
+Returning or storing a disposed resource.
+
+### Mistake 3 — Background work outliving ownership
+
+Starting async work and exiting the resource scope before the work finishes.
+
+### Mistake 4 — Cleanup omission
+
+A manual path forgets one of several resources.
+
+### Mistake 5 — Cleanup ordering bug
+
+Releasing a dependency before a dependent resource.
+
+### Mistake 6 — Swallowing disposal errors
+
+```js
+try {
+  resource.close();
+} catch {}
+```
+
+This can hide a real reliability failure.
+
+### Mistake 7 — Treating all cleanup as synchronous
+
+Some APIs require async release.
+
+### Mistake 8 — Using finalization as normal cleanup
+
+Finalization is not deterministic resource management.
+
+### Mistake 9 — Mixing business and lifecycle semantics
+
+For example, treating:
+
+```text
+commit
+rollback
+dispose
+```
+
+as interchangeable.
+
+### Mistake 10 — Assuming language support equals production support
+
+Verify target runtimes before adopting modern resource syntax.
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Mechanism | Main purpose | Deterministic? | Typical role |
+|---|---|---:|---|
+| `using` | Scoped synchronous disposal | Yes | Lexical ownership |
+| `await using` | Scoped asynchronous disposal | Yes, with await | Async ownership |
+| `try/finally` | General cleanup/control flow | Yes | Universal fallback |
+| `DisposableStack` | Dynamic cleanup aggregation | Yes when disposed | Conditional/dynamic resources |
+| `AsyncDisposableStack` | Dynamic async cleanup | Yes when awaited/disposed | Async dynamic resources |
+| GC | Reclaim unreachable memory | No deterministic timing | Memory management |
+| `FinalizationRegistry` | Observe finalization opportunities | No | Secondary cleanup/diagnostics |
+| `close()` | Domain-specific release | Depends on caller | Resource API |
+| `abort()` | Stop/cancel an operation | Usually explicit | Cancellation |
+| Pool return | Reuse resource | Explicit | Connection/resource pooling |
+
+### `using` vs `try/finally`
+
+`try/finally` is more general:
+
+```js
+const resource = acquire();
+
+try {
+  use(resource);
+} finally {
+  cleanup(resource);
+}
+```
+
+`using` gives a protocol and ownership abstraction:
+
+```js
+{
+  using resource = acquire();
+  use(resource);
+}
+```
+
+The first is universally useful.
+
+The second is more composable when the resource itself follows the disposable protocol.
+
+### `using` vs garbage collection
+
+```text
+GC → object lifetime
+using → resource ownership lifetime
+```
+
+These lifetimes can differ.
+
+### Disposable stack vs lexical declarations
+
+Use lexical resource declarations when ownership is naturally static.
+
+Use a disposable stack when resources are:
+
+- conditional;
+- dynamically discovered;
+- registered by helper functions;
+- composed across multiple branches.
+
+---
+
+## 17. Performance Considerations
+
+Resource management improves reliability, but it is not free.
+
+### 17.1 Disposal has runtime work
+
+Cleanup can involve:
+
+- system calls;
+- network operations;
+- flushing;
+- lock release;
+- pool management;
+- asynchronous awaits.
+
+Measure resource lifecycle cost in real workloads.
+
+### 17.2 Over-scoping
+
+Holding a resource longer than needed increases:
+
+- concurrency pressure;
+- memory;
+- connection usage;
+- lock contention.
+
+Prefer the smallest scope that satisfies the actual ownership requirement.
+
+### 17.3 Under-scoping
+
+Closing too early can cause retries, reconnects, and expensive reinitialization.
+
+The goal is not:
+
+> “always make scopes as small as possible”
+
+but:
+
+> “match scope to the true dependency lifetime.”
+
+### 17.4 Cleanup storms
+
+Large-scale systems can release thousands of resources at once.
+
+A mass-disposal event can create:
+
+```text
+many close operations
+→ network pressure
+→ CPU pressure
+→ scheduler pressure
+```
+
+Consider batching and lifecycle staggering where appropriate.
+
+### 17.5 Pooling changes the cost model
+
+A pooled resource may be cheaper to retain briefly than to repeatedly create/destroy.
+
+This is an architectural trade-off, not a blanket rule.
+
+---
+
+## 18. Memory Considerations
+
+Deterministic cleanup can reduce retained external state, but it does not automatically free JavaScript memory.
+
+A disposed object may remain reachable:
+
+```js
+let reference;
+
+{
+  using resource = createResource();
+  reference = resource;
+}
+```
+
+Now:
+
+```text
+resource disposed
+resource object still reachable
+```
+
+Memory reclamation and resource release are separate.
+
+Disposable stacks can also retain:
+
+- cleanup callbacks;
+- resource references;
+- closure environments.
+
+Large stacks should therefore have bounded lifetime.
+
+Avoid accidentally registering massive object graphs:
+
+```js
+stack.defer(() => use(hugeObject));
+```
+
+because the closure can retain `hugeObject` until the stack is disposed.
+
+---
+
+## 19. Security Considerations
+
+Resource lifetime has security implications.
+
+### 19.1 Locks
+
+Failure to release locks can create:
+
+- denial of service;
+- deadlocks;
+- starvation.
+
+### 19.2 File handles
+
+Leaks can exhaust process limits.
+
+### 19.3 Sockets
+
+Leaked network resources can exhaust connection capacity.
+
+### 19.4 Credentials
+
+A resource object may retain:
+
+- access tokens;
+- TLS state;
+- database credentials;
+- sensitive buffers.
+
+Prompt disposal reduces the lifetime of sensitive capabilities.
+
+### 19.5 Temporary files
+
+Failure to clean temporary files can expose sensitive data.
+
+### 19.6 Resource exhaustion
+
+Attackers can deliberately induce paths that allocate resources but fail to release them.
+
+A robust system must test:
+
+```text
+success
+failure
+timeout
+cancellation
+partial acquisition
+```
+
+not only the happy path.
+
+### 19.7 Cleanup race conditions
+
+Concurrent code can accidentally dispose a resource while another task still uses it.
+
+Ownership must be synchronized with the actual concurrent activity.
+
+---
+
+## 20. Production Usage
+
+### 20.1 Database transactions
+
+A transaction often has semantics like:
+
+```text
+begin
+  ↓
+work
+  ↓
+success → commit
+failure → rollback
+  ↓
+release connection
+```
+
+A disposable abstraction can own the connection while explicit business logic controls commit/rollback.
+
+Do not blindly map `dispose()` to `commit()`.
+
+### 20.2 File processing
+
+Conceptually:
+
+```js
+{
+  using file = openFile(path);
+
+  process(file);
+}
+```
+
+The scope clearly communicates:
+
+```text
+file belongs to this operation
+```
+
+### 20.3 Network connections
+
+A connection may need:
+
+```text
+flush
+shutdown
+close
+```
+
+The disposal contract must define which lifecycle behavior is required.
+
+### 20.4 Subscription management
+
+A subscription often has a cleanup operation:
+
+```js
+const subscription = observable.subscribe(handler);
+
+try {
+  await work();
+} finally {
+  subscription.unsubscribe();
+}
+```
+
+A disposable protocol can make this composable.
+
+### 20.5 Locks
+
+Lock ownership should map naturally to a scope:
+
+```text
+acquire lock
+  ↓
+critical section
+  ↓
+release lock
+```
+
+This is one of the clearest examples where deterministic disposal is correctness-critical.
+
+### 20.6 Temporary resources
+
+Temporary directories, files, buffers, or registrations should have clear ownership.
+
+### 20.7 Worker/session lifecycle
+
+When an operation creates a worker/session:
+
+```text
+create
+use
+terminate
+```
+
+the owning scope must define when termination happens.
+
+### 20.8 HTTP request scopes
+
+A request may own:
+
+- transaction;
+- tracing span;
+- subscription;
+- temporary storage;
+- connection;
+- cancellation linkage.
+
+Request completion can act as an ownership boundary.
+
+### 20.9 Production architecture
+
+A mature system should make these relationships explicit:
+
+```text
+resource
+  ↓
+owner
+  ↓
+scope
+  ↓
+cleanup mechanism
+  ↓
+failure policy
+  ↓
+observability
+```
+
+---
+
+## 21. Implementation From Scratch
+
+Before relying on language/runtime resource-management features, implement the concepts manually.
+
+### Stage 1 — Guided synchronous disposable
+
+Implement:
+
+```js
+function withResource(resource, fn) {
+  try {
+    return fn(resource);
+  } finally {
+    resource[Symbol.dispose]();
+  }
+}
+```
+
+Test:
+
+- normal completion;
+- return;
+- throw.
+
+### Stage 2 — Partially Guided
+
+Support resource creation inside the helper:
+
+```js
+function withResource(create, fn) {
+  const resource = create();
+
+  try {
+    return fn(resource);
+  } finally {
+    resource[Symbol.dispose]();
+  }
+}
+```
+
+Now test acquisition failure.
+
+### Stage 3 — No Reference
+
+Build:
+
+```js
+class DisposableStack {
+  constructor() {
+    this.stack = [];
+    this.disposed = false;
+  }
+
+  use(resource) {}
+
+  defer(fn) {}
+
+  dispose() {}
+}
+```
+
+Requirements:
+
+- LIFO ordering;
+- idempotent stack disposal;
+- reject registration after disposal;
+- support resource protocol;
+- support arbitrary cleanup callbacks.
+
+### Stage 4 — Edge-Case Hardened
+
+Add:
+
+- partial initialization;
+- cleanup failures;
+- multiple cleanup failures;
+- ownership transfer;
+- nested stacks;
+- arbitrary thrown values;
+- invalid resource values.
+
+Think carefully about preserving both primary and cleanup failures.
+
+### Stage 5 — Production Grade
+
+Design:
+
+```js
+class ResourceScope {
+  register(resource) {}
+  defer(fn) {}
+  transfer() {}
+  dispose() {}
+}
+```
+
+Then build an async variant:
+
+```js
+class AsyncResourceScope {
+  register(resource) {}
+  defer(fn) {}
+  deferAsync(fn) {}
+  async dispose() {}
+}
+```
+
+Requirements:
+
+- deterministic LIFO cleanup;
+- sync and async protocol support;
+- clear ownership state;
+- idempotent disposal;
+- cleanup aggregation;
+- cancellation-aware usage;
+- observability hooks;
+- bounded retained state;
+- tests for every abrupt exit.
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Missing cleanup
+
+Find the bug:
+
+```js
+function run() {
+  const resource = acquire();
+
+  if (!isValid()) {
+    return;
+  }
+
+  use(resource);
+  resource.close();
+}
+```
+
+Question:
+
+Which control-flow path leaks the resource?
+
+### Exercise 2 — Partial acquisition
+
+```js
+const a = acquireA();
+const b = acquireB();
+const c = acquireC();
+```
+
+Suppose `acquireC()` throws.
+
+How will `a` and `b` be released?
+
+Design two solutions.
+
+### Exercise 3 — Async lifetime
+
+```js
+{
+  using resource = acquire();
+
+  queueMicrotask(() => {
+    resource.use();
+  });
+}
+```
+
+Is the callback guaranteed to run before disposal?
+
+Explain the ordering.
+
+### Exercise 4 — Background task
+
+```js
+{
+  using connection = acquireConnection();
+
+  startAsyncOperation(connection);
+}
+```
+
+What ownership bug may exist?
+
+### Exercise 5 — Cleanup masking
+
+```js
+try {
+  doWork();
+} finally {
+  cleanup();
+}
+```
+
+Both throw.
+
+Which failure reaches the caller in the ordinary completion model?
+
+How would a production design preserve both?
+
+### Exercise 6 — Escape
+
+```js
+let saved;
+
+{
+  using resource = createResource();
+  saved = resource;
+}
+
+saved.use();
+```
+
+Why is this dangerous even though `saved` still references a JavaScript object?
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+async function processOrder(order) {
+  const connection = await db.acquire();
+  const transaction = await connection.begin();
+
+  try {
+    await saveOrder(transaction, order);
+    await transaction.commit();
+
+    return { ok: true };
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  } finally {
+    connection.close();
+  }
+}
+```
+
+Identify design questions involving:
+
+- acquisition failure;
+- transaction ownership;
+- commit failure;
+- rollback failure;
+- asynchronous connection cleanup;
+- disposal order;
+- pool semantics;
+- cancellation;
+- duplicate ownership;
+- error preservation.
+
+Redesign the lifecycle using explicit ownership.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is a resource?
+2. Why is garbage collection insufficient for many resources?
+3. What problem does deterministic disposal solve?
+4. What is `Symbol.dispose`?
+5. What is `Symbol.asyncDispose`?
+6. What does `using` represent?
+7. What does `await using` represent?
+8. Why is disposal usually LIFO?
+9. Can disposal throw?
+10. What is `DisposableStack`?
+
+### Intermediate
+
+11. How does `using` compare with `try/finally`?
+12. Why can resources escape their intended scope?
+13. What is ownership transfer?
+14. Why should disposal often be idempotent?
+15. What happens if resource acquisition partially succeeds?
+16. Why is async cleanup different?
+17. What is the role of deferred cleanup callbacks?
+18. Why should disposal order reflect dependencies?
+19. How can background async work cause use-after-disposal?
+20. How does pooling affect disposal semantics?
+
+### Advanced
+
+21. Explain how resource cleanup interacts with abrupt completion.
+22. How should multiple disposal failures be represented?
+23. How should body failure and cleanup failure coexist?
+24. When is `DisposableStack` preferable to lexical `using`?
+25. What is the difference between resource validity and object reachability?
+26. Why is finalization not a substitute for deterministic cleanup?
+27. How would you design a disposable API for a database transaction?
+28. How would cancellation interact with resource cleanup?
+29. How would you test cleanup under every exit path?
+30. What runtime-compatibility concerns apply to modern resource-management features?
+
+### Principal-Level
+
+31. Design a resource ownership model for a large Node.js service.
+32. Design request-scoped resource management.
+33. How would you prevent double ownership across layers?
+34. How would you make cleanup observable without creating noisy logs?
+35. How would you preserve the primary failure when cleanup also fails?
+36. How should pooled resources expose disposal?
+37. How would you handle a resource that requires ordered shutdown?
+38. How would you prevent background tasks from outliving their resource owners?
+39. What invariants should a production `ResourceScope` maintain?
+40. When should a team avoid introducing a new disposable abstraction?
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+class R {
+  constructor(name) {
+    this.name = name;
+  }
+
+  [Symbol.dispose]() {
+    console.log(this.name);
+  }
+}
+
+{
+  using a = new R("A");
+  using b = new R("B");
+  console.log("work");
+}
+```
+
+Predict:
+
+```text
+work
+B
+A
+```
+
+### Exercise B
+
+```js
+function f() {
+  using r = new Resource();
+
+  return 42;
+}
+```
+
+Question:
+
+Does disposal happen before the function's caller receives `42`?
+
+Explain in terms of scope exit and completion.
+
+### Exercise C
+
+```js
+function f() {
+  using r = new Resource();
+
+  throw new Error("boom");
+}
+```
+
+Question:
+
+Does the resource still get disposed?
+
+Explain.
+
+### Exercise D
+
+```js
+{
+  using a = new Resource("A");
+  using b = new Resource("B");
+
+  throw new Error("work");
+}
+```
+
+Suppose `b` throws during disposal.
+
+What failure state must be represented?
+
+### Exercise E
+
+```js
+{
+  using resource = new Resource();
+
+  Promise.resolve().then(() => {
+    resource.use();
+  });
+}
+```
+
+Reason carefully about:
+
+```text
+scope exit
+microtask scheduling
+resource disposal
+callback execution
+```
+
+Do not answer by intuition; derive the ordering.
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Disposable API
+
+Implement a resource:
+
+```js
+class SocketResource {
+  [Symbol.dispose]() {}
+}
+```
+
+Requirements:
+
+- idempotent disposal;
+- reject use after disposal;
+- record lifecycle state;
+- expose no unsafe internal details.
+
+### Exercise 2 — Async resource
+
+Implement:
+
+```js
+class AsyncLock {
+  async acquire() {}
+  async release() {}
+  async [Symbol.asyncDispose]() {}
+}
+```
+
+Design the ownership rules explicitly.
+
+### Exercise 3 — Dynamic resource scope
+
+Implement:
+
+```js
+const scope = new DisposableStack();
+```
+
+and support:
+
+- `use`;
+- `defer`;
+- `move` / ownership transfer;
+- `dispose`.
+
+### Exercise 4 — Failure aggregation
+
+Construct a scope where:
+
+```text
+main work fails
+cleanup A fails
+cleanup B succeeds
+cleanup C fails
+```
+
+Design a representation that preserves the entire failure structure.
+
+### Exercise 5 — Request scope
+
+Design a request-scoped resource manager containing:
+
+```text
+database transaction
+tracing span
+temporary file
+subscription
+```
+
+Define acquisition and cleanup order.
+
+### Exercise 6 — Cancellation integration
+
+Design:
+
+```text
+AbortSignal
++
+resource scope
++
+async operation
++
+cleanup
+```
+
+Guarantee that cancellation does not leak resources.
+
+### Exercise 7 — Ownership proof
+
+For a complex API, write down:
+
+```text
+Who creates?
+Who owns?
+Who may transfer?
+Who disposes?
+When does ownership end?
+What if acquisition fails?
+What if cleanup fails?
+What if work is cancelled?
+What if work escapes?
+```
+
+Use this as a production design checklist.
+
+---
+
+## 27. Key Takeaways
+
+1. Resource lifetime is not the same as JavaScript object lifetime.
+2. Garbage collection does not provide deterministic cleanup for arbitrary external resources.
+3. `using` and `await using` connect resource ownership to lexical scope.
+4. `Symbol.dispose` defines synchronous disposal behavior.
+5. `Symbol.asyncDispose` defines asynchronous disposal behavior.
+6. `DisposableStack` supports dynamic cleanup registration and ownership composition.
+7. Resource cleanup must run on failure paths as well as success paths.
+8. Reverse-order disposal naturally respects many dependency graphs.
+9. Partial initialization is a major source of resource leaks in manual code.
+10. Cleanup itself can fail.
+11. Primary and cleanup failures must be preserved where possible.
+12. A disposed object may remain reachable as a JavaScript value.
+13. Ownership should be explicit and should normally have one clear owner at a time.
+14. Background work must not outlive the resource it depends on unless ownership is transferred.
+15. Disposal, close, abort, rollback, and shutdown are different concepts unless the API explicitly equates them.
+16. Resource management affects reliability, security, performance, memory, and architecture.
+17. `try/finally` remains fundamental and is not obsolete.
+18. Modern resource-management syntax is valuable because it makes lifecycle intent visible and composable.
+19. Runtime support must be verified before using newer syntax in production.
+20. Good resource management answers one core question clearly:
+
+> Who owns this resource, and exactly when does that ownership end?
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 15 — Objects / Property Semantics
+- Chapter 18 — Classes / OOP
+- Chapter 20 — Symbols / Well-Known Symbols
+- Chapter 26 — Generators / Async Generators
+- Chapter 27 — Typed Arrays / Binary Data
+- Chapter 29 — Errors / Error Handling
+
+### Builds Toward
+
+- Chapter 31 — Async Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 45 — Memory / GC
+- Chapter 46 — Weak Refs / Finalization
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 57 — JavaScript Security Engineering
+- Chapter 59 — Node Core APIs
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 78 — Production JS Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 89 — Code Review / Refactoring
+- Chapter 98 — Anti-patterns / Failure Modes
+- Chapter 100 — Cost Model / Tradeoffs
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- Ownership
+- Scope
+- Lifetime
+- Abrupt completion
+- Error handling
+- Cancellation
+- Transactions
+- Pooling
+- Locks
+- Streams
+- Subscriptions
+- Finalization
+- Garbage collection
+- Async control flow
+- Observability
+- Resource exhaustion
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- lexical scope;
+- objects;
+- symbols;
+- classes;
+- abrupt completion;
+- error causes;
+- asynchronous cleanup;
+- runtime compatibility.
+
+### Why This Chapter Matters Later
+
+Production applications are not made only of memory-managed values.
+
+They interact with systems that have finite and stateful lifetimes:
+
+```text
+network
+database
+filesystem
+worker
+stream
+lock
+transaction
+subscription
+pool
+```
+
+Once a program crosses those boundaries, lifecycle correctness becomes first-class architecture.
+
+The central principle is:
+
+> Acquisition without an explicit ownership and cleanup story is an incomplete design.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 30 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Define resource lifetime.
+- [ ] Explain why GC is not deterministic resource cleanup.
+- [ ] Explain `using`.
+- [ ] Explain `await using`.
+- [ ] Explain `Symbol.dispose`.
+- [ ] Explain `Symbol.asyncDispose`.
+- [ ] Explain `DisposableStack`.
+- [ ] Explain reverse-order cleanup.
+- [ ] Explain ownership transfer.
+- [ ] Explain cleanup failure behavior.
+
+### Predictive Mastery
+
+- [ ] Predict disposal on normal scope exit.
+- [ ] Predict disposal on `return`.
+- [ ] Predict disposal on `throw`.
+- [ ] Predict LIFO cleanup order.
+- [ ] Predict partial-initialization cleanup.
+- [ ] Predict body + cleanup failure behavior.
+- [ ] Predict async cleanup sequencing.
+- [ ] Predict use-after-disposal scenarios.
+
+### Implementation
+
+- [ ] Implement a disposable object.
+- [ ] Implement `withResource` using `try/finally`.
+- [ ] Implement `DisposableStack`.
+- [ ] Implement async cleanup.
+- [ ] Implement ownership transfer.
+- [ ] Implement cleanup-failure preservation.
+- [ ] Integrate cancellation with resource lifetime.
+
+### Debugging
+
+- [ ] Detect leaked resources.
+- [ ] Detect double disposal.
+- [ ] Detect use-after-disposal.
+- [ ] Detect background work escaping scope.
+- [ ] Detect cleanup masking.
+- [ ] Detect incorrect disposal ordering.
+- [ ] Detect runtime-support mismatches.
+
+### Production Engineering
+
+- [ ] Design request-scoped resources.
+- [ ] Design transaction lifetimes.
+- [ ] Design pooled resource semantics.
+- [ ] Design lock ownership.
+- [ ] Design worker/resource lifetimes.
+- [ ] Define cleanup observability.
+- [ ] Define failure and cancellation policy.
+- [ ] Verify runtime support for deployment targets.
+
+### Interview Readiness
+
+- [ ] Explain why disposal is different from GC.
+- [ ] Compare `using` and `try/finally`.
+- [ ] Defend LIFO cleanup.
+- [ ] Explain body/cleanup error interactions.
+- [ ] Design a disposable API.
+- [ ] Design a resource boundary for a production service.
+- [ ] Defend ownership and lifecycle decisions under failure and cancellation.
+
+### Track A — Core Theory
+
+- [ ] Understand ownership semantics.
+- [ ] Understand disposal protocols.
+- [ ] Understand lexical resource lifetime.
+- [ ] Understand dynamic disposal stacks.
+- [ ] Understand abrupt completion integration.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production-oriented implementation reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed debugging scenarios.
+- [ ] Completed code review exercise.
+- [ ] Completed resource-lifecycle design exercise.
+- [ ] Defended cleanup trade-offs under real production constraints.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 30 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. Why is GC insufficient for external resource management?
+2. What does `using` guarantee conceptually?
+3. What are `Symbol.dispose` and `Symbol.asyncDispose`?
+4. Why is disposal generally LIFO?
+5. What happens when resource acquisition partially fails?
+6. What happens when cleanup throws?
+7. How should primary and cleanup failures be represented?
+8. When is `DisposableStack` better than lexical `using`?
+9. What is ownership transfer?
+10. Why can an object remain reachable after its resource has been disposed?
+11. Why is finalization not deterministic resource management?
+12. How can cancellation interact with cleanup?
+13. How can async work outlive resource scope?
+14. How does pooling change disposal semantics?
+15. How would you model database transaction cleanup?
+16. What runtime compatibility checks should precede production use of newer syntax?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit ownership and lexical scope
+- [ ] Revisit disposal ordering
+- [ ] Revisit cleanup failure semantics
+- [ ] Revisit DisposableStack / dynamic cleanup
+- [ ] Revisit async resource lifetime
+- [ ] Revisit cancellation + cleanup
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 30 — Canonical References and Source Discipline
+
+For future detailed study of this chapter, use this source hierarchy:
+
+1. ECMAScript specification / standardized language documentation — syntax, disposal protocols, lexical resource semantics, completion behavior, built-in resource-management abstractions, and well-known symbols.
+2. TC39 proposal/history material where necessary — only when explaining proposal evolution or distinctions between proposal stages and standardized behavior.
+3. JavaScript engine/runtime documentation — implementation and deployment support details.
+4. Host runtime documentation — Node.js/browser availability and host-specific resource behavior.
+5. Application architecture documentation — ownership conventions, lifecycle contracts, pooling, transactions, observability, cancellation, and operational policies.
+
+Always distinguish:
+
+```text
+language semantics
+runtime support
+host behavior
+application conventions
+```
+
+Do not present proposal-stage behavior as a universal guarantee without labeling it.
+
+---
+
+# Chapter 30 — Completion Snapshot
+
+```text
+Chapter: 30
+Title: Resource Management and Cleanup (`using`, `await using`, DisposableStack)
+Part: V — Errors / Cleanup
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 31 — Asynchronous JavaScript Fundamentals
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain why asynchronous programming exists in JavaScript.
+- Distinguish synchronous execution from asynchronous coordination.
+- Explain the difference between blocking and non-blocking work.
+- Distinguish concurrency, parallelism, and asynchrony.
+- Explain why JavaScript can remain responsive while waiting on external operations.
+- Build a precise mental model for call stacks, tasks, jobs, callbacks, and future continuations.
+- Explain why asynchronous behavior is governed by both ECMAScript semantics and host-runtime scheduling.
+- Distinguish language features from browser or Node.js event-loop behavior.
+- Explain callbacks as a historical and still-valid asynchronous abstraction.
+- Explain promises as a structured representation of future completion without confusing them with the event loop itself.
+- Understand how async functions interact with promises.
+- Predict ordering in common synchronous/asynchronous examples.
+- Explain why “JavaScript is single-threaded” is an incomplete statement.
+- Distinguish CPU-bound work from I/O-bound waiting.
+- Explain how asynchronous APIs avoid blocking the main JavaScript execution path.
+- Reason about callback registration versus callback execution.
+- Explain why creating a promise does not automatically move work to another thread.
+- Understand microtasks at a conceptual level without prematurely conflating them with host tasks.
+- Design basic asynchronous workflows using callbacks, promises, and async/await.
+- Identify common async bugs such as race conditions, lost errors, unbounded concurrency, and accidental serialization.
+- Debug ordering problems using timestamps, logs, promise chains, and runtime tools.
+- Evaluate asynchronous designs using correctness, performance, resource lifetime, cancellation, observability, and maintainability.
+- Build progressively more production-grade asynchronous abstractions.
+- Defend async architecture decisions at senior/principal level.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+Reading the chapter is not sufficient.
+
+---
+
+## 2. Prerequisites
+
+The learner should understand:
+
+- JavaScript values and types.
+- Functions and lexical scope.
+- Execution contexts and call flow.
+- Objects and property semantics.
+- Control flow and loops.
+- Errors and abrupt completion.
+- Promises at a basic level.
+- Resource lifetime at a conceptual level.
+
+Primary dependencies:
+
+- Chapter 08 — Control Flow / Iteration
+- Chapter 09 — Functions / First-Class Behavior
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 25 — Iterables / Iterators
+- Chapter 26 — Generators / Async Generators
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+
+Later chapters expand the concepts introduced here:
+
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 39 — Concurrency / Parallelism
+
+---
+
+## 3. What Is It?
+
+Asynchronous JavaScript is a family of programming techniques and runtime mechanisms that allow a program to start work whose completion is not immediately available and continue doing other work instead of waiting synchronously for that result.
+
+Example:
+
+```js
+const value = computeImmediately();
+```
+
+The caller expects the result to be available as part of the current execution.
+
+Now compare:
+
+```js
+const value = await fetchSomething();
+```
+
+The operation may depend on:
+
+- a network response;
+- a filesystem operation;
+- a database query;
+- another service;
+- a timer;
+- a worker;
+- a stream;
+- user input.
+
+The result is not necessarily available at the moment the operation begins.
+
+The important conceptual distinction is:
+
+> Asynchrony is about when a result becomes available and how execution coordinates with that future completion.
+
+It does not inherently mean:
+
+```text
+another thread
+```
+
+and it does not inherently mean:
+
+```text
+parallel computation
+```
+
+A useful abstraction is:
+
+```text
+start operation
+      ↓
+operation continues elsewhere / waits on external system
+      ↓
+JavaScript can continue
+      ↓
+completion becomes available
+      ↓
+continuation is scheduled
+      ↓
+continuation executes
+```
+
+JavaScript therefore separates:
+
+```text
+current execution
+```
+
+from:
+
+```text
+future continuation
+```
+
+---
+
+## 4. Why Does It Exist?
+
+Many operations are slow relative to CPU instruction execution.
+
+Examples:
+
+```text
+network request
+database query
+file read
+timer
+user action
+DNS resolution
+socket activity
+worker result
+```
+
+If JavaScript had to synchronously block the execution thread for all such operations:
+
+```js
+const response = readNetworkSynchronously();
+console.log(response);
+```
+
+then a browser UI could become unresponsive while waiting.
+
+Instead, asynchronous APIs allow:
+
+```js
+start request
+↓
+return control
+↓
+continue other work
+↓
+request completes later
+↓
+run continuation
+```
+
+This is especially important for environments where one primary JavaScript thread is responsible for handling many interactions.
+
+The goal is not to make every operation execute faster.
+
+The goal is to avoid wasting execution capacity while waiting for work whose completion is controlled by something else.
+
+That distinction matters:
+
+> Asynchrony improves utilization and responsiveness; it does not magically reduce the intrinsic latency of the external operation.
+
+---
+
+## 5. Mental Model
+
+Use a five-part model:
+
+```text
+1. JavaScript execution
+2. Host operation
+3. Completion notification
+4. Scheduling
+5. Future continuation
+```
+
+Example:
+
+```js
+console.log("A");
+
+setTimeout(() => {
+  console.log("B");
+}, 0);
+
+console.log("C");
+```
+
+Reason conceptually:
+
+```text
+JavaScript executes "A"
+        ↓
+host timer is registered
+        ↓
+JavaScript executes "C"
+        ↓
+current call stack becomes available
+        ↓
+timer completion becomes eligible
+        ↓
+callback executes later
+        ↓
+"B"
+```
+
+So the output is:
+
+```text
+A
+C
+B
+```
+
+Do not reason:
+
+```text
+0ms → immediately execute callback
+```
+
+Instead reason:
+
+```text
+0ms → timer is eligible according to host scheduling rules
+```
+
+This distinction becomes critical in later event-loop chapters.
+
+Another mental model:
+
+```text
+Synchronous:
+do work → get result
+
+Asynchronous:
+start work → receive future completion
+```
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Starting async work and finishing async work are different events
+
+```js
+const promise = fetch(url);
+```
+
+starts/obtains a future operation representation.
+
+The result may complete later.
+
+### Rule 2 — Registering a callback does not execute it immediately
+
+```js
+setTimeout(callback, 0);
+```
+
+means:
+
+```text
+register callback with host scheduling machinery
+```
+
+not:
+
+```text
+call callback now
+```
+
+### Rule 3 — `0ms` is not “now”
+
+A zero-delay timer still participates in host scheduling.
+
+### Rule 4 — Asynchronous waiting can release the current JavaScript execution path
+
+Conceptually:
+
+```text
+await
+↓
+pause current async function
+↓
+other work can execute
+↓
+completion occurs
+↓
+function continuation resumes later
+```
+
+The exact scheduling semantics are refined in later chapters.
+
+### Rule 5 — Promises represent eventual settlement
+
+A promise may be:
+
+```text
+pending
+fulfilled
+rejected
+```
+
+The promise itself is not the worker thread.
+
+### Rule 6 — Async does not imply parallel
+
+This:
+
+```js
+await networkRequest();
+```
+
+does not mean JavaScript calculations are running simultaneously on another JavaScript thread.
+
+### Rule 7 — CPU-bound JavaScript can still block
+
+This is asynchronous-looking in API usage:
+
+```js
+setTimeout(() => {
+  // callback
+}, 0);
+```
+
+but heavy synchronous work still blocks the current JavaScript thread:
+
+```js
+while (true) {}
+```
+
+### Rule 8 — External waiting and CPU computation are different bottlenecks
+
+Waiting on a socket is usually I/O latency.
+
+Calculating a huge cryptographic loop in JavaScript is CPU work.
+
+They require different strategies.
+
+### Rule 9 — Every async operation needs a completion policy
+
+A production design should answer:
+
+```text
+success?
+failure?
+timeout?
+cancellation?
+retry?
+cleanup?
+ownership?
+```
+
+### Rule 10 — Ordering must be derived, not guessed
+
+Do not use intuition such as:
+
+```text
+"this promise was created first, so it must finish first."
+```
+
+Instead track:
+
+```text
+registration
+operation completion
+scheduling
+queue ordering
+continuation execution
+```
+
+### Rule 11 — Concurrency is an application policy
+
+Launching 10,000 async operations at once can be very different from processing them one by one.
+
+### Rule 12 — Async boundaries are debugging boundaries
+
+A stack trace may no longer look like one simple contiguous synchronous call chain.
+
+---
+
+## 7. Syntax
+
+### Callback-style API
+
+```js
+doWork((error, result) => {
+  if (error) {
+    // handle failure
+    return;
+  }
+
+  console.log(result);
+});
+```
+
+### Promise-style API
+
+```js
+doWork()
+  .then(result => {
+    console.log(result);
+  })
+  .catch(error => {
+    console.error(error);
+  });
+```
+
+### Async/await
+
+```js
+async function run() {
+  try {
+    const result = await doWork();
+    console.log(result);
+  } catch (error) {
+    console.error(error);
+  }
+}
+```
+
+### Timer
+
+```js
+setTimeout(() => {
+  console.log("later");
+}, 100);
+```
+
+### Multiple asynchronous operations
+
+Sequential:
+
+```js
+const a = await first();
+const b = await second();
+```
+
+Concurrent initiation:
+
+```js
+const aPromise = first();
+const bPromise = second();
+
+const [a, b] = await Promise.all([
+  aPromise,
+  bPromise
+]);
+```
+
+The semantic difference is important:
+
+```text
+sequential:
+start A → finish A → start B → finish B
+
+concurrent initiation:
+start A
+start B
+wait for both
+```
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Synchronous baseline
+
+```js
+console.log("A");
+console.log("B");
+console.log("C");
+```
+
+Output:
+
+```text
+A
+B
+C
+```
+
+### Example 2 — Timer callback
+
+```js
+console.log("A");
+
+setTimeout(() => {
+  console.log("B");
+}, 0);
+
+console.log("C");
+```
+
+Output:
+
+```text
+A
+C
+B
+```
+
+### Example 3 — Promise completion
+
+```js
+console.log("A");
+
+Promise.resolve().then(() => {
+  console.log("B");
+});
+
+console.log("C");
+```
+
+At the conceptual level:
+
+```text
+A
+C
+B
+```
+
+The callback is not executed as part of the current synchronous statement sequence.
+
+### Example 4 — Async function
+
+```js
+async function run() {
+  console.log("A");
+  await Promise.resolve();
+  console.log("B");
+}
+
+console.log("C");
+
+run();
+
+console.log("D");
+```
+
+Conceptual output:
+
+```text
+C
+A
+D
+B
+```
+
+The important idea is that the function starts synchronously and later continuation is deferred after the `await`.
+
+### Example 5 — Accidental serialization
+
+```js
+const a = await taskA();
+const b = await taskB();
+const c = await taskC();
+```
+
+If the tasks are independent, this may unnecessarily extend total latency.
+
+### Example 6 — Concurrent initiation
+
+```js
+const aPromise = taskA();
+const bPromise = taskB();
+const cPromise = taskC();
+
+const [a, b, c] = await Promise.all([
+  aPromise,
+  bPromise,
+  cPromise
+]);
+```
+
+Now independent operations can overlap according to the underlying runtime/host capabilities.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+console.log("A");
+
+const promise = Promise.resolve("value");
+
+promise.then(value => {
+  console.log(value);
+});
+
+console.log("B");
+```
+
+### Step 1
+
+The first log executes synchronously:
+
+```text
+A
+```
+
+### Step 2
+
+`Promise.resolve("value")` creates/obtains a fulfilled promise.
+
+### Step 3
+
+`.then(...)` registers a reaction.
+
+The reaction does not execute immediately.
+
+### Step 4
+
+The synchronous program continues.
+
+```text
+B
+```
+
+### Step 5
+
+After the current synchronous execution completes, the promise reaction becomes eligible through ECMAScript's job/microtask machinery.
+
+### Step 6
+
+The callback runs:
+
+```text
+value
+```
+
+Output:
+
+```text
+A
+B
+value
+```
+
+The key distinction:
+
+```text
+promise state = fulfilled
+```
+
+does not mean:
+
+```text
+then callback = already executed
+```
+
+The promise can already be fulfilled while its reaction still needs scheduled execution.
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 JavaScript execution is not one undifferentiated process
+
+A useful layered model is:
+
+```text
+ECMAScript language semantics
+          ↓
+job scheduling semantics
+          ↓
+host environment scheduling
+          ↓
+OS/runtime facilities
+          ↓
+external systems
+```
+
+Different layers control different parts of the experience.
+
+For example:
+
+```text
+Promise reaction
+```
+
+is tied to ECMAScript job semantics.
+
+Whereas:
+
+```text
+network socket readiness
+```
+
+is strongly influenced by the host/runtime.
+
+### 10.2 Call stack
+
+Synchronous JavaScript executes with active execution contexts.
+
+Conceptually:
+
+```text
+global
+  ↓
+function A
+  ↓
+function B
+```
+
+When `B` returns, execution resumes in `A`.
+
+For an asynchronous continuation:
+
+```text
+function A
+  ↓
+register future work
+  ↓
+A returns / pauses
+```
+
+Later:
+
+```text
+future continuation
+  ↓
+new execution activity
+```
+
+The continuation does not remain as a continuously executing stack frame while waiting.
+
+### 10.3 Callback registration
+
+When you call:
+
+```js
+setTimeout(callback, 100);
+```
+
+you are performing at least two conceptual actions:
+
+```text
+register timing request
+```
+
+and later:
+
+```text
+execute callback
+```
+
+These occur at different times.
+
+### 10.4 Promise reaction registration
+
+When you call:
+
+```js
+promise.then(callback);
+```
+
+you establish a reaction associated with the promise.
+
+Settlement and reaction execution are related but distinct.
+
+A fulfilled promise can still have reactions waiting to run.
+
+### 10.5 Await continuation
+
+For:
+
+```js
+const value = await promise;
+```
+
+an async function does not synchronously retrieve a future value if that value is not yet available.
+
+Conceptually:
+
+```text
+evaluate awaited expression
+        ↓
+obtain promise-like result
+        ↓
+arrange continuation
+        ↓
+suspend current async function progress
+        ↓
+later resume continuation
+```
+
+### 10.6 Async functions return promises
+
+```js
+async function f() {
+  return 42;
+}
+```
+
+The observable result is a promise:
+
+```js
+f().then(console.log);
+```
+
+This means:
+
+```text
+async function
+    ↓
+promise-based completion
+```
+
+### 10.7 Asynchrony does not mean no CPU work
+
+An async callback still runs JavaScript synchronously once it starts.
+
+Therefore:
+
+```js
+setTimeout(() => {
+  expensiveCalculation();
+}, 0);
+```
+
+only delays when the expensive calculation begins.
+
+It does not make that calculation non-blocking.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+This chapter is intentionally careful about where language semantics stop and host semantics begin.
+
+### 11.1 ECMAScript owns language-level asynchronous abstractions
+
+Examples include:
+
+- promises;
+- async functions;
+- async generators;
+- job scheduling associated with promise reactions;
+- `await` semantics.
+
+### 11.2 Hosts own many asynchronous sources
+
+Examples:
+
+- timers;
+- network operations;
+- filesystem access in Node.js;
+- DOM events;
+- rendering;
+- platform-specific I/O.
+
+A host supplies mechanisms that eventually cause JavaScript-relevant continuation work to become executable.
+
+### 11.3 Jobs
+
+ECMAScript defines jobs and job queues as part of asynchronous language behavior.
+
+For promise reactions, the relevant conceptual flow is:
+
+```text
+settlement
+   ↓
+enqueue reaction job
+   ↓
+job execution
+```
+
+The language model should not be casually equated with a browser or Node event-loop diagram. Those host scheduling systems have additional structures.
+
+### 11.4 Async function semantics
+
+An async function creates a promise-based completion contract.
+
+When the function reaches an `await`, continuation behavior is represented through promise-related mechanisms rather than the function remaining synchronously blocked.
+
+### 11.5 Host hooks
+
+ECMAScript specifies points where the host participates in scheduling and execution.
+
+Therefore a complete asynchronous mental model must preserve the boundary:
+
+```text
+language semantics
+vs
+host scheduling
+```
+
+### 11.6 Specification discipline
+
+Never state:
+
+> “The event loop is part of JavaScript.”
+
+More precise:
+
+> JavaScript language semantics define promises/jobs and other abstractions, while the host runtime provides the surrounding mechanisms used to schedule external asynchronous activities.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Concurrency without parallel JavaScript threads
+
+Suppose:
+
+```js
+const a = fetchA();
+const b = fetchB();
+
+await Promise.all([a, b]);
+```
+
+The operations can overlap even if there is only one primary JavaScript execution thread.
+
+Why?
+
+Because the waiting portions are not necessarily active JavaScript computation.
+
+Conceptually:
+
+```text
+JS starts A
+JS starts B
+JS waits for completions
+host/external systems progress
+JS handles completion callbacks
+```
+
+### 12.2 CPU-bound versus I/O-bound
+
+CPU-bound:
+
+```js
+while (millionsOfOperationsRemain()) {
+  calculate();
+}
+```
+
+I/O-bound:
+
+```text
+send request
+wait for response
+```
+
+Async APIs are particularly effective for I/O waiting.
+
+CPU-heavy work may require:
+
+- algorithmic optimization;
+- chunking;
+- workers;
+- native acceleration;
+- WebAssembly;
+- different architecture.
+
+### 12.3 Async does not automatically increase throughput
+
+Suppose:
+
+```js
+for (const item of items) {
+  await process(item);
+}
+```
+
+This is asynchronous but sequential.
+
+To overlap independent operations:
+
+```js
+await Promise.all(
+  items.map(item => process(item))
+);
+```
+
+However, unlimited concurrency can overload:
+
+- the database;
+- remote API;
+- CPU;
+- memory;
+- sockets.
+
+Thus:
+
+> Asynchrony creates the ability to overlap waiting; concurrency policy determines how much work is overlapped.
+
+### 12.4 Race conditions
+
+Asynchronous code can create temporal bugs:
+
+```js
+let value = 0;
+
+async function first() {
+  const data = await getA();
+  value = data;
+}
+
+async function second() {
+  const data = await getB();
+  value = data;
+}
+```
+
+Whichever continuation writes last wins.
+
+The initiation order does not guarantee completion order.
+
+### 12.5 Lost errors
+
+Danger:
+
+```js
+doAsyncWork();
+```
+
+If the returned promise rejects and nobody observes it appropriately, the failure may escape the intended application boundary.
+
+### 12.6 Detached async work
+
+Danger:
+
+```js
+async function handler() {
+  doImportantWork(); // intentionally not awaited
+  return "ok";
+}
+```
+
+Questions:
+
+- Who owns the work?
+- Who handles failure?
+- Can the process exit?
+- Can the resource scope close first?
+- Should the caller wait?
+
+### 12.7 Accidental serialization
+
+This:
+
+```js
+const user = await getUser();
+const profile = await getProfile();
+const permissions = await getPermissions();
+```
+
+may be correct if each step depends on the previous.
+
+If independent:
+
+```js
+const [user, profile, permissions] = await Promise.all([
+  getUser(),
+  getProfile(),
+  getPermissions()
+]);
+```
+
+could reduce wall-clock latency.
+
+### 12.8 Backpressure
+
+If producers create work faster than consumers can complete it:
+
+```text
+produce
+produce
+produce
+produce
+...
+consume slowly
+```
+
+the system may accumulate:
+
+- promises;
+- buffers;
+- queue entries;
+- retained objects.
+
+Async architecture must account for rate control and backpressure.
+
+### 12.9 Cancellation
+
+An async operation may need:
+
+```text
+cancel
+timeout
+abort
+```
+
+Later cancellation chapters build a formal model around this.
+
+### 12.10 Resource lifetime
+
+Async work interacts strongly with resource ownership.
+
+Example:
+
+```js
+{
+  using resource = acquire();
+
+  await doWork(resource);
+}
+```
+
+The desired invariant is:
+
+```text
+resource remains valid until dependent async work completes
+```
+
+This is why Chapter 30 precedes async depth.
+
+### 12.11 Structured versus detached concurrency
+
+Structured:
+
+```text
+parent starts child
+parent waits child
+parent owns child lifetime
+```
+
+Detached:
+
+```text
+parent starts child
+parent returns
+child continues independently
+```
+
+Detached work can be useful, but it needs an explicit lifecycle, error, and ownership model.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 Promise already fulfilled
+
+A fulfilled promise does not cause `.then()` to execute synchronously.
+
+### 13.2 Promise executor
+
+Consider:
+
+```js
+new Promise(() => {
+  console.log("executor");
+});
+```
+
+The executor function itself runs synchronously during promise construction.
+
+This is a common source of confusion.
+
+### 13.3 Async function body starts synchronously
+
+Calling:
+
+```js
+async function f() {
+  console.log("A");
+  await something();
+}
+```
+
+can execute code before the first suspension synchronously.
+
+### 13.4 `await` of a non-promise value
+
+```js
+await 42;
+```
+
+The value is treated through the await machinery and continuation still follows asynchronous function semantics rather than behaving like a plain synchronous assignment.
+
+### 13.5 `setTimeout(..., 0)`
+
+Zero delay does not mean zero scheduling boundary.
+
+### 13.6 Callback runs much later
+
+Timers do not guarantee exact execution times.
+
+System load can delay them.
+
+### 13.7 Two promises started in one order may settle in another
+
+```js
+const a = slow();
+const b = fast();
+
+await Promise.all([a, b]);
+```
+
+The result order of `Promise.all` follows input order, not completion order, while the underlying operations may complete in any order.
+
+### 13.8 Async function rejection
+
+```js
+async function fail() {
+  throw new Error("boom");
+}
+```
+
+Calling:
+
+```js
+fail();
+```
+
+produces a rejected promise.
+
+It does not synchronously throw to the direct caller in the same way as a normal function throwing before returning.
+
+### 13.9 Async callback throwing
+
+Inside promise continuations:
+
+```js
+Promise.resolve().then(() => {
+  throw new Error("boom");
+});
+```
+
+the throw contributes to promise rejection behavior.
+
+### 13.10 Closure retention
+
+An async continuation may keep references alive:
+
+```js
+async function f() {
+  const hugeObject = createHugeObject();
+  await something();
+  use(hugeObject);
+}
+```
+
+The object may remain reachable across the suspension.
+
+This matters for memory analysis.
+
+### 13.11 Event listener leaks
+
+Repeated asynchronous setup without cleanup can retain:
+
+- callbacks;
+- closures;
+- DOM nodes;
+- resources.
+
+### 13.12 Timeout race
+
+This pattern:
+
+```js
+await Promise.race([
+  operation(),
+  timeout()
+]);
+```
+
+does not necessarily cancel `operation()`.
+
+The operation may continue after the timeout wins.
+
+This connects directly to cancellation.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “JavaScript is single-threaded, so nothing is concurrent.”
+
+Incorrect.
+
+Asynchronous operations can overlap in time even if JavaScript execution on a given agent is serialized.
+
+### Misconception 2 — “Async means parallel.”
+
+Incorrect.
+
+Concurrency and parallel CPU execution are different concepts.
+
+### Misconception 3 — “Promises run on another thread.”
+
+Incorrect.
+
+A promise is a language abstraction representing eventual settlement.
+
+### Misconception 4 — “`await` blocks JavaScript.”
+
+It suspends the progress of the current async function rather than blocking the entire JavaScript execution environment.
+
+### Misconception 5 — “A zero-delay timer runs immediately.”
+
+No.
+
+It introduces scheduling behavior.
+
+### Misconception 6 — “If an async function starts, everything inside happens later.”
+
+No.
+
+Code before the first suspension point can execute synchronously.
+
+### Misconception 7 — “Creating multiple promises guarantees parallel execution.”
+
+No.
+
+Actual concurrency depends on the underlying operations and host/runtime behavior.
+
+### Misconception 8 — “`Promise.all` makes operations concurrent.”
+
+It coordinates multiple promises.
+
+It does not magically make CPU-bound work parallel.
+
+### Misconception 9 — “Async makes code faster.”
+
+Not necessarily.
+
+It can improve responsiveness and overlap waiting.
+
+### Misconception 10 — “Fire-and-forget is free.”
+
+Detached work still needs:
+
+- error handling;
+- lifecycle ownership;
+- cancellation;
+- observability;
+- resource management.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Awaiting independent operations sequentially
+
+```js
+await a();
+await b();
+await c();
+```
+
+without considering dependencies.
+
+### Mistake 2 — Launching unlimited concurrency
+
+```js
+await Promise.all(
+  hugeArray.map(process)
+);
+```
+
+### Mistake 3 — Ignoring returned promises
+
+```js
+sendEmail();
+```
+
+without defining who observes failure.
+
+### Mistake 4 — Using timers as precise schedulers
+
+```js
+setTimeout(task, 1000);
+```
+
+does not guarantee exact one-second execution timing.
+
+### Mistake 5 — Forgetting cleanup
+
+An asynchronous resource may remain open after a task finishes.
+
+### Mistake 6 — Assuming race order
+
+```js
+const a = slow();
+const b = fast();
+```
+
+does not mean `a` finishes first.
+
+### Mistake 7 — Catching at the wrong boundary
+
+Catching too early may prevent higher-level recovery; catching too late may lose useful context.
+
+### Mistake 8 — Using `Promise.race` as cancellation
+
+`Promise.race` chooses a winning settlement. It does not automatically stop the losing operation.
+
+### Mistake 9 — Blocking with CPU work inside callbacks
+
+```js
+setTimeout(() => {
+  hugeCalculation();
+}, 0);
+```
+
+still blocks while the calculation runs.
+
+### Mistake 10 — Confusing host and language behavior
+
+A browser and Node.js share ECMAScript semantics but have different host mechanisms.
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Concept | Core idea | Typical question |
+|---|---|---|
+| Synchronous | Work completes in current flow | “Can I get the result now?” |
+| Asynchronous | Completion occurs later | “How do I continue until it finishes?” |
+| Concurrency | Multiple activities overlap in time | “What can be in progress together?” |
+| Parallelism | Work executes simultaneously on multiple workers | “What executes at the same time?” |
+| Callback | Function invoked on completion/event | “What should run later?” |
+| Promise | Value-like representation of eventual completion | “What future outcome am I composing?” |
+| `async/await` | Syntax for promise-based control flow | “How can I write async flow sequentially?” |
+| Job/microtask | Language-level deferred continuation mechanism | “When does this promise reaction run?” |
+| Host task/event-loop activity | Runtime-managed scheduling unit | “When can this callback execute?” |
+| Worker | Separate execution agent/thread-like host facility | “How do I parallelize CPU work?” |
+
+### Async vs concurrency
+
+You can have asynchronous code that is sequential:
+
+```js
+await a();
+await b();
+```
+
+You can have concurrency without explicit parallel threads:
+
+```js
+const a = fetchA();
+const b = fetchB();
+
+await Promise.all([a, b]);
+```
+
+### Async vs parallelism
+
+Asynchronous waiting can avoid blocking while one thread waits.
+
+Parallelism requires multiple execution resources or another form of simultaneous computation.
+
+### Callback vs promise
+
+Callbacks can directly represent completion:
+
+```js
+readFile(path, callback);
+```
+
+Promises provide a composable object-based abstraction:
+
+```js
+readFile(path).then(...);
+```
+
+### Promise vs async/await
+
+`async/await` is primarily syntax and control-flow structure built around promises and related async semantics.
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 Wall-clock latency versus CPU time
+
+Suppose:
+
+```text
+network = 100ms
+CPU processing = 5ms
+```
+
+A well-designed async workflow can avoid blocking the CPU during the 100ms wait.
+
+### 17.2 Sequential latency
+
+If independent operations each take roughly:
+
+```text
+100ms
+100ms
+100ms
+```
+
+Sequential execution may approach:
+
+```text
+300ms
+```
+
+Concurrent initiation may approach the duration of the slowest operation, subject to real dependencies and resource limits.
+
+### 17.3 Unbounded concurrency
+
+Launching too many operations can create:
+
+- memory pressure;
+- socket exhaustion;
+- queue growth;
+- service throttling;
+- database overload.
+
+### 17.4 Promise allocation
+
+Promise-heavy code creates objects and continuations.
+
+Do not optimize abstractly.
+
+Measure actual application hotspots.
+
+### 17.5 Callback overhead
+
+Each asynchronous continuation can introduce scheduling, allocation, and context-management cost.
+
+Usually the external operation dominates, but high-frequency pipelines may make scheduling overhead relevant.
+
+### 17.6 Microtask starvation
+
+A system that continuously schedules promise reactions can delay lower-priority host activities.
+
+This becomes especially relevant when large chains or recursive microtask creation are involved.
+
+### 17.7 CPU-bound work remains blocking
+
+Asynchrony does not remove algorithmic complexity.
+
+A `10^9`-iteration loop remains expensive even when invoked from an async callback.
+
+---
+
+## 18. Memory Considerations
+
+Async programs can retain memory longer than expected.
+
+Potential retention sources:
+
+- closures;
+- pending promises;
+- queued callbacks;
+- event listeners;
+- timer handles;
+- large buffers;
+- async local state;
+- resource references.
+
+Example:
+
+```js
+async function process() {
+  const large = createLargeData();
+
+  await slowOperation();
+
+  use(large);
+}
+```
+
+The async function may retain state needed after suspension.
+
+### Pending work as retained memory
+
+If you start:
+
+```js
+const jobs = hugeArray.map(process);
+```
+
+the entire set of promise/job objects may remain reachable until settlement.
+
+### Queues
+
+An unbounded async queue can become a memory leak even when every individual operation eventually completes.
+
+### Cleanup
+
+Cancellation and disposal are not only correctness tools.
+
+They can also reduce how long resources and large objects remain live.
+
+---
+
+## 19. Security Considerations
+
+Asynchronous architecture introduces timing and lifecycle risks.
+
+### 19.1 Race conditions
+
+Security checks can race with state changes:
+
+```text
+check authorization
+↓
+await something
+↓
+use resource
+```
+
+The world may have changed during the wait.
+
+### 19.2 Time-of-check / time-of-use
+
+An asynchronous boundary can widen the gap between validation and use.
+
+### 19.3 Unbounded concurrency
+
+Attackers can exploit high-cost async endpoints to exhaust:
+
+- sockets;
+- memory;
+- database connections;
+- CPU;
+- downstream quotas.
+
+### 19.4 Cancellation bugs
+
+Failure to cancel abandoned operations can leak resources.
+
+### 19.5 Request lifecycle confusion
+
+A request may end while detached async work continues.
+
+This can cause:
+
+- unauthorized work;
+- stale writes;
+- hidden side effects;
+- audit inconsistencies.
+
+### 19.6 Timing behavior
+
+Async scheduling can create observable timing differences.
+
+Security-sensitive systems should consider whether error and response timing leaks meaningful state.
+
+---
+
+## 20. Production Usage
+
+### 20.1 HTTP service
+
+A typical production request:
+
+```text
+receive request
+    ↓
+validate
+    ↓
+start dependency requests
+    ↓
+await results
+    ↓
+compose response
+    ↓
+cleanup
+    ↓
+respond
+```
+
+Important questions:
+
+- Which operations can run concurrently?
+- What is the timeout?
+- What is cancellable?
+- What is retryable?
+- What happens if one dependency fails?
+- Which resources remain open?
+
+### 20.2 Database service
+
+Avoid unnecessary serialization:
+
+```js
+const user = await getUser();
+const settings = await getSettings();
+```
+
+if they are independent.
+
+But never parallelize operations whose semantics require ordering.
+
+### 20.3 Batch processing
+
+Use bounded concurrency:
+
+```text
+items
+  ↓
+queue
+  ↓
+N workers
+  ↓
+results
+```
+
+rather than unlimited promise creation.
+
+### 20.4 Web server
+
+The request handler should define ownership:
+
+```text
+request
+ → operation
+ → dependencies
+ → completion
+ → cleanup
+```
+
+Detached work should be deliberate.
+
+### 20.5 Background jobs
+
+A worker often needs:
+
+```text
+receive
+→ execute
+→ success/failure classification
+→ retry/dead-letter
+→ acknowledge
+→ cleanup
+```
+
+### 20.6 Streaming
+
+Streams represent long-lived asynchronous flows.
+
+Later chapters should connect:
+
+```text
+async iteration
++
+backpressure
++
+resource lifetime
+```
+
+### 20.7 Observability
+
+Measure:
+
+- operation latency;
+- queue delay;
+- active concurrency;
+- success/failure rates;
+- timeout rate;
+- cancellation rate;
+- retry count;
+- resource usage.
+
+Without these metrics, async performance problems can be difficult to explain.
+
+---
+
+## 21. Implementation From Scratch
+
+### Stage 1 — Guided
+
+Build a callback-based delay:
+
+```js
+function delay(ms, callback) {
+  setTimeout(callback, ms);
+}
+```
+
+Then build a promise version:
+
+```js
+function delay(ms) {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+```
+
+Explain why the timer belongs to the host while the promise is an ECMAScript abstraction.
+
+### Stage 2 — Partially Guided
+
+Implement:
+
+```js
+function parallelMap(items, worker, limit) {}
+```
+
+Requirements:
+
+- preserve input order;
+- bound active work;
+- propagate failures;
+- stop launching new work after fatal failure policy;
+- resolve when all work completes.
+
+### Stage 3 — No Reference
+
+Implement a small task queue:
+
+```js
+class AsyncQueue {
+  add(task) {}
+  start() {}
+  close() {}
+}
+```
+
+Requirements:
+
+- bounded concurrency;
+- task failure handling;
+- graceful shutdown;
+- queue length visibility.
+
+### Stage 4 — Edge-Case Hardened
+
+Add:
+
+- cancellation;
+- timeout;
+- retry;
+- backpressure;
+- task ownership;
+- partial shutdown;
+- rejection handling;
+- cleanup.
+
+### Stage 5 — Production Grade
+
+Build:
+
+```js
+class ConcurrencyController {
+  constructor({ limit }) {}
+
+  submit(task, options) {}
+
+  shutdown(options) {}
+
+  metrics() {}
+}
+```
+
+Required properties:
+
+```text
+bounded concurrency
+observable state
+deterministic shutdown
+failure isolation
+cancellation
+timeout support
+backpressure
+resource cleanup
+```
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Ordering
+
+Predict:
+
+```js
+console.log("A");
+
+setTimeout(() => console.log("B"), 0);
+
+Promise.resolve().then(() => console.log("C"));
+
+console.log("D");
+```
+
+Do not guess. Identify:
+
+```text
+synchronous work
+promise reaction
+timer callback
+```
+
+### Exercise 2 — Async function
+
+Predict:
+
+```js
+async function f() {
+  console.log("1");
+  await Promise.resolve();
+  console.log("2");
+}
+
+console.log("3");
+f();
+console.log("4");
+```
+
+### Exercise 3 — Accidental serialization
+
+Given:
+
+```js
+const a = await fetchA();
+const b = await fetchB();
+const c = await fetchC();
+```
+
+Determine whether the operations are independent.
+
+If yes, redesign.
+
+### Exercise 4 — Concurrency explosion
+
+```js
+await Promise.all(
+  millionItems.map(processItem)
+);
+```
+
+Identify memory and downstream-resource risks.
+
+### Exercise 5 — Detached work
+
+```js
+async function handler() {
+  sendAnalytics();
+  return "ok";
+}
+```
+
+List all questions needed before declaring this safe.
+
+### Exercise 6 — Timeout illusion
+
+```js
+await Promise.race([
+  slowOperation(),
+  timeout(1000)
+]);
+```
+
+What happens to `slowOperation()` if timeout wins?
+
+### Exercise 7 — Race condition
+
+Two async functions update shared state after different awaits.
+
+Construct an example where completion order differs from start order and explain the bug.
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+async function processUsers(users) {
+  const results = [];
+
+  for (const user of users) {
+    try {
+      const profile = await fetchProfile(user.id);
+      const permissions = await fetchPermissions(user.id);
+
+      results.push({
+        user,
+        profile,
+        permissions
+      });
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  return results;
+}
+```
+
+Analyze:
+
+- serialization;
+- concurrency;
+- partial failures;
+- error handling;
+- result completeness;
+- downstream load;
+- cancellation;
+- observability;
+- ordering;
+- user count scalability.
+
+Redesign it with explicit concurrency policy.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is asynchronous programming?
+2. Why does JavaScript need asynchronous APIs?
+3. What is the difference between blocking and non-blocking?
+4. Does async mean parallel?
+5. Does async mean another thread?
+6. What is a callback?
+7. What is a promise?
+8. What does `await` do conceptually?
+9. Why does `setTimeout(..., 0)` not execute immediately?
+10. Why can code before the first `await` execute synchronously?
+
+### Intermediate
+
+11. What is concurrency?
+12. What is parallelism?
+13. Why can JavaScript perform concurrent I/O without parallel JavaScript execution?
+14. Why can two async operations complete out of order?
+15. What is accidental serialization?
+16. When would `Promise.all` improve latency?
+17. Why can unbounded `Promise.all` be dangerous?
+18. Why does `Promise.race` not automatically cancel losers?
+19. What is detached async work?
+20. Why do async boundaries complicate debugging?
+
+### Advanced
+
+21. Explain the relationship among call stack, promise reactions, and host scheduling.
+22. Distinguish ECMAScript job semantics from the browser event loop.
+23. Explain how CPU-bound work defeats the benefits of basic async APIs.
+24. How can async code create race conditions?
+25. How can async code create memory retention?
+26. How does resource ownership interact with async suspension?
+27. How would you implement bounded concurrency?
+28. How would you design cancellation for a long-running async operation?
+29. How would you instrument asynchronous latency?
+30. How would you prevent detached tasks from silently failing?
+
+### Principal-Level
+
+31. Design an async execution model for a production API server.
+32. How would you choose concurrency limits?
+33. How would you prevent downstream overload?
+34. How should cancellation propagate through nested async operations?
+35. How should async errors be mapped across service boundaries?
+36. How would you balance latency against resource utilization?
+37. How would you detect hidden serialization in production?
+38. How would you design graceful shutdown for in-flight async work?
+39. How would you prove that no resource outlives its owner?
+40. When should asynchronous work be moved to worker threads or external queues?
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+console.log("A");
+
+setTimeout(() => console.log("B"), 0);
+
+console.log("C");
+```
+
+Expected:
+
+```text
+A
+C
+B
+```
+
+Explain every scheduling boundary.
+
+### Exercise B
+
+```js
+console.log("A");
+
+Promise.resolve().then(() => console.log("B"));
+
+console.log("C");
+```
+
+Expected:
+
+```text
+A
+C
+B
+```
+
+### Exercise C
+
+```js
+async function f() {
+  console.log("A");
+  await Promise.resolve();
+  console.log("B");
+}
+
+console.log("C");
+f();
+console.log("D");
+```
+
+Expected:
+
+```text
+C
+A
+D
+B
+```
+
+### Exercise D
+
+```js
+const p = Promise.resolve();
+
+p.then(() => console.log("A"));
+p.then(() => console.log("B"));
+
+console.log("C");
+```
+
+Reason about:
+
+- registration order;
+- current synchronous code;
+- reaction ordering.
+
+### Exercise E
+
+```js
+const a = new Promise(resolve => {
+  setTimeout(() => resolve("A"), 20);
+});
+
+const b = new Promise(resolve => {
+  setTimeout(() => resolve("B"), 0);
+});
+
+Promise.all([a, b]).then(console.log);
+```
+
+What is printed?
+
+Why does completion order differ from output ordering?
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Async timeline
+
+For a given program, draw:
+
+```text
+time
+↓
+call stack
+host operation
+job queue
+task queue
+resource state
+```
+
+Use actual timestamps where useful.
+
+### Exercise 2 — Sequential to concurrent refactor
+
+Take a pipeline of five independent remote requests.
+
+Implement:
+
+```text
+sequential
+concurrent
+bounded concurrency
+```
+
+Compare:
+
+- latency;
+- memory;
+- downstream load;
+- failure behavior.
+
+### Exercise 3 — Async queue
+
+Implement a queue with:
+
+```text
+submit
+concurrency limit
+pause
+resume
+close
+waitForIdle
+```
+
+### Exercise 4 — Cancellation
+
+Implement:
+
+```js
+runTask(task, { signal })
+```
+
+Guarantee:
+
+- cancellation observation;
+- cleanup;
+- deterministic completion.
+
+### Exercise 5 — Timeout
+
+Implement:
+
+```js
+withTimeout(promise, ms)
+```
+
+Then extend it so the underlying operation can actually be cancelled.
+
+### Exercise 6 — Structured async ownership
+
+Design:
+
+```text
+request
+  ├── dependency A
+  ├── dependency B
+  └── background child task
+```
+
+Decide which child tasks are structured under the request and which are deliberately detached.
+
+### Exercise 7 — Principal reasoning
+
+Given a service whose latency has increased from 200ms to 900ms:
+
+- inspect dependency timing;
+- determine whether operations are serialized;
+- inspect concurrency;
+- inspect queueing;
+- inspect CPU blocking;
+- inspect retries;
+- inspect resource saturation.
+
+Produce a causal explanation rather than simply adding more parallelism.
+
+---
+
+## 27. Key Takeaways
+
+1. Asynchrony separates initiating work from receiving its future completion.
+2. Asynchronous programming is not synonymous with parallelism.
+3. Promises are representations of eventual settlement, not worker threads.
+4. `await` suspends the progress of an async function rather than blocking the whole JavaScript environment.
+5. Code before an async function's first suspension point can run synchronously.
+6. `setTimeout(..., 0)` schedules work; it does not execute it immediately.
+7. ECMAScript defines important language-level async semantics, while hosts define additional scheduling behavior.
+8. CPU-bound JavaScript can still block despite using async APIs.
+9. Concurrent initiation can reduce wall-clock latency for independent I/O.
+10. Unlimited concurrency can harm both the application and its dependencies.
+11. Async operations can complete out of order.
+12. Async code therefore requires explicit reasoning about races and shared state.
+13. Detached async work requires explicit ownership, error, cancellation, and lifecycle policies.
+14. `Promise.race` chooses a settlement winner; it does not automatically cancel losers.
+15. Async continuations can retain memory across suspension points.
+16. Resource scopes must remain alive for the full lifetime of dependent asynchronous work.
+17. Observability is essential for understanding latency, concurrency, queueing, retries, and failures.
+18. The correct async design depends on workload characteristics, dependency constraints, and resource limits.
+19. The central question is not “How do I make this async?” but:
+
+> What work can overlap safely, what must remain ordered, and who owns the lifetime of each operation?
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 08 — Control Flow / Iteration
+- Chapter 09 — Functions / First-Class Behavior
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 25 — Iterables / Iterators
+- Chapter 26 — Generators / Async Generators
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+
+### Builds Toward
+
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 40 — Observables / Reactive
+- Chapter 45 — Memory / GC
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 58 — Node Architecture
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 78 — Production JS Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- Call stack
+- Execution contexts
+- Jobs
+- Microtasks
+- Tasks
+- Event loops
+- Promises
+- Async functions
+- Backpressure
+- Cancellation
+- Concurrency limits
+- Worker threads
+- Queues
+- Resource ownership
+- Timeouts
+- Retries
+- Observability
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- control flow;
+- functions;
+- execution contexts;
+- errors;
+- resource lifetime;
+- promises.
+
+### Why This Chapter Matters Later
+
+Everything in the asynchronous portion of the curriculum depends on one core distinction:
+
+```text
+current execution
+vs
+future completion
+```
+
+Without that distinction, developers routinely confuse:
+
+- promise state with callback execution;
+- async with parallel;
+- scheduling with completion;
+- timeout with cancellation;
+- concurrency with unlimited fan-out;
+- waiting with blocking.
+
+This chapter establishes the foundation. The next chapters formalize the language-level job model and then connect it to browser and Node.js host event loops.
+
+The central principle is:
+
+> Asynchronous programming is the engineering of time, dependencies, and ownership.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 31 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Explain synchronous vs asynchronous execution.
+- [ ] Explain blocking vs non-blocking.
+- [ ] Explain concurrency vs parallelism.
+- [ ] Explain what a promise represents.
+- [ ] Explain async function suspension.
+- [ ] Explain callback registration vs callback execution.
+- [ ] Explain ECMAScript vs host responsibilities.
+- [ ] Explain why CPU work still blocks.
+
+### Predictive Mastery
+
+- [ ] Predict synchronous/timer ordering.
+- [ ] Predict promise reaction ordering.
+- [ ] Predict async function ordering.
+- [ ] Predict independent-operation concurrency.
+- [ ] Predict completion-order races.
+- [ ] Predict the limitations of `Promise.race`.
+- [ ] Predict memory retention across async suspension.
+
+### Implementation
+
+- [ ] Implement callback-based async flow.
+- [ ] Implement promise-based delay.
+- [ ] Implement bounded concurrency.
+- [ ] Implement an async task queue.
+- [ ] Implement timeout behavior.
+- [ ] Implement cancellation-aware work.
+- [ ] Implement graceful shutdown.
+
+### Debugging
+
+- [ ] Reconstruct an asynchronous timeline.
+- [ ] Detect accidental serialization.
+- [ ] Detect race conditions.
+- [ ] Detect unbounded concurrency.
+- [ ] Detect detached task failures.
+- [ ] Detect resource lifetime violations.
+- [ ] Identify CPU blocking inside async code.
+
+### Production Engineering
+
+- [ ] Design request-level async ownership.
+- [ ] Choose concurrency limits.
+- [ ] Design backpressure.
+- [ ] Design timeout and cancellation behavior.
+- [ ] Design failure propagation.
+- [ ] Instrument async latency and concurrency.
+- [ ] Design graceful shutdown for in-flight work.
+
+### Interview Readiness
+
+- [ ] Explain why async does not mean parallel.
+- [ ] Explain why JavaScript can overlap I/O.
+- [ ] Explain promise/await semantics.
+- [ ] Compare callbacks, promises, and async/await.
+- [ ] Defend bounded concurrency.
+- [ ] Design a production async workflow.
+- [ ] Reason about race conditions and resource lifetime.
+
+### Track A — Core Theory
+
+- [ ] Understand async execution model.
+- [ ] Understand promise-based continuation.
+- [ ] Understand language/host boundaries.
+- [ ] Understand concurrency and scheduling.
+- [ ] Understand lifecycle implications.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production-oriented implementation reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed timeline debugging.
+- [ ] Completed async code review.
+- [ ] Completed bounded-concurrency design.
+- [ ] Defended async architecture under latency and resource constraints.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 31 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What exactly makes an operation asynchronous?
+2. Why does async not imply parallelism?
+3. Why can JavaScript overlap I/O while using a single primary execution agent?
+4. What is the difference between registering a callback and executing it?
+5. Why does a zero-delay timer not run immediately?
+6. Why can an async function execute synchronously before its first await?
+7. What does a promise represent?
+8. Why can two promises complete out of order?
+9. What is accidental serialization?
+10. When is unbounded concurrency dangerous?
+11. Why does `Promise.race` not cancel losers?
+12. How can async suspension retain memory?
+13. How can async work outlive its owning resource?
+14. What belongs to ECMAScript and what belongs to the host?
+15. How would you choose a concurrency limit?
+16. How would you design graceful async shutdown?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit sync vs async
+- [ ] Revisit concurrency vs parallelism
+- [ ] Revisit promise and await timing
+- [ ] Revisit language vs host boundary
+- [ ] Revisit bounded concurrency
+- [ ] Revisit cancellation and ownership
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 31 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. ECMAScript specification — promises, async functions, jobs, await semantics, and language-level completion behavior.
+2. JavaScript engine documentation / implementation notes — runtime implementation details and performance behavior.
+3. Browser runtime documentation — timers, networking, events, rendering, workers, and browser scheduling behavior.
+4. Node.js/runtime documentation — timers, I/O, libuv, worker threads, process lifecycle, and runtime-specific scheduling.
+5. Application architecture documentation — concurrency limits, retries, timeouts, cancellation, ownership, backpressure, and operational policies.
+
+Always distinguish:
+
+```text
+standardized language behavior
+vs
+engine implementation
+vs
+host runtime behavior
+vs
+application policy
+```
+
+Do not use a browser event-loop diagram as if it were the complete ECMAScript specification.
+
+---
+
+# Chapter 31 — Completion Snapshot
+
+```text
+Chapter: 31
+Title: Asynchronous JavaScript Fundamentals
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 32 — ECMAScript Jobs and Promise Reactions
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain what an ECMAScript Job is at a conceptual and specification level.
+- Explain why JavaScript needs deferred execution mechanisms even before considering browser or Node event loops.
+- Distinguish synchronous evaluation from job-based continuation.
+- Explain promise reactions and how they are scheduled.
+- Distinguish promise state from execution of its reactions.
+- Explain why `.then()`, `.catch()`, and `.finally()` callbacks do not normally run synchronously.
+- Explain how a promise settlement causes relevant reactions to become scheduled.
+- Understand the relationship among promises, reactions, jobs, and host scheduling.
+- Explain thenable assimilation and why promise resolution is not identical to simply assigning a value.
+- Explain how chained promises create additional reaction jobs.
+- Predict ordering in nested promise/reaction examples.
+- Explain why callback registration order can affect reaction ordering.
+- Distinguish job creation, queueing, and execution.
+- Explain the role of the host in determining when the execution of jobs is allowed to proceed.
+- Understand why “microtask” is useful host/runtime terminology but is not a complete substitute for the ECMAScript Job model.
+- Explain how recursive promise scheduling can create starvation-like behavior.
+- Explain why a fulfilled promise does not imply that all registered reactions have already executed.
+- Distinguish promise propagation from ordinary synchronous exception propagation.
+- Explain how errors thrown inside promise reactions become downstream rejections.
+- Reason about promise chain flattening and returned thenables.
+- Debug ordering and rejection behavior using precise timelines.
+- Implement a minimal promise-reaction scheduler as a learning exercise.
+- Design production async flows with correct error, ordering, cancellation, and resource-lifetime boundaries.
+- Defend job scheduling behavior at specification, runtime, and application architecture levels.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+Reading the chapter is not sufficient.
+
+---
+
+## 2. Prerequisites
+
+The learner should understand:
+
+- JavaScript values and types.
+- Functions and lexical scope.
+- Execution contexts.
+- Control flow and abrupt completion.
+- Objects and prototypes.
+- Iterables and iterators.
+- Promises at a foundational level.
+- Async/await at a conceptual level.
+- Basic host-runtime scheduling.
+- Error propagation.
+
+Primary dependencies:
+
+- Chapter 09 — Functions / First-Class Behavior
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 25 — Iterables / Iterators
+- Chapter 29 — Errors / Error Handling
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+
+The next chapters build outward from this specification-level foundation:
+
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+
+---
+
+## 3. What Is It?
+
+An **ECMAScript Job** is a specification-level unit of work that is scheduled to execute later rather than as part of the current synchronous evaluation.
+
+Jobs are especially important for promise behavior.
+
+When you write:
+
+```js
+Promise.resolve("value").then(value => {
+  console.log(value);
+});
+```
+
+the reaction callback is not simply called as an immediate consequence of `.then()`.
+
+Instead, conceptually:
+
+```text
+promise reaction registered
+        ↓
+promise settles / is already settled
+        ↓
+reaction becomes eligible
+        ↓
+a job is queued
+        ↓
+job executes later
+        ↓
+callback runs
+```
+
+This mechanism lets the ECMAScript language define consistent asynchronous behavior without making the language itself depend on one specific browser or server event loop.
+
+The key distinction is:
+
+> A Job is a specification-level scheduling abstraction; a browser or Node.js event loop is a host-level scheduling system with additional responsibilities.
+
+Promise reactions are one of the most important users of the Job model.
+
+---
+
+## 4. Why Does It Exist?
+
+Consider:
+
+```js
+const p = Promise.resolve(42);
+
+p.then(value => {
+  console.log(value);
+});
+
+console.log("after");
+```
+
+If the reaction executed synchronously, behavior would be:
+
+```text
+42
+after
+```
+
+Instead, promise reactions are deferred:
+
+```text
+after
+42
+```
+
+This gives promise-based APIs a predictable asynchronous contract.
+
+It also prevents code from behaving differently merely because a promise happened to be already fulfilled versus fulfilling later.
+
+For example:
+
+```js
+function getValue() {
+  return Promise.resolve(42);
+}
+```
+
+A caller can consistently attach:
+
+```js
+getValue().then(handle);
+```
+
+without needing one code path for:
+
+```text
+already available
+```
+
+and another for:
+
+```text
+available later
+```
+
+The Job model therefore helps create a uniform abstraction:
+
+```text
+future completion
+→ scheduled reaction
+```
+
+rather than:
+
+```text
+sometimes synchronous
+sometimes asynchronous
+```
+
+That uniformity is critical for composability.
+
+---
+
+## 5. Mental Model
+
+Use this model:
+
+```text
+Synchronous JavaScript
+        │
+        ▼
+Promise operation
+        │
+        ├── pending
+        │
+        └── settled
+               │
+               ▼
+        Promise reactions
+               │
+               ▼
+            Jobs
+               │
+               ▼
+      host-permitted execution
+               │
+               ▼
+        callback execution
+               │
+               ▼
+      next promise settlement
+               │
+               ▼
+        more reaction jobs
+```
+
+A second mental model is:
+
+```text
+Promise = state + reactions + eventual result propagation
+
+Job = a scheduled unit that performs one piece of deferred work
+```
+
+Do not collapse these into one object.
+
+A promise may be fulfilled now.
+
+A reaction may still be waiting to execute.
+
+A new promise produced by the reaction may still be pending.
+
+A useful timeline:
+
+```text
+T0  current code runs
+T1  `.then()` registers reaction
+T2  promise is settled
+T3  reaction job is enqueued
+T4  current synchronous execution finishes
+T5  job executes
+T6  callback runs
+T7  returned value settles next promise
+T8  next reaction job is enqueued
+```
+
+The exact observable behavior depends on the specific program and host scheduling boundary, but this model is extremely useful.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Promise reactions are not ordinary immediate calls
+
+```js
+Promise.resolve().then(fn);
+```
+
+does not execute `fn` as part of the current synchronous statement sequence.
+
+### Rule 2 — A settled promise can still have pending reactions
+
+Settlement and reaction execution are distinct events.
+
+### Rule 3 — `.then()` creates promise-reaction state
+
+Calling:
+
+```js
+p.then(onFulfilled, onRejected);
+```
+
+does more than “register a callback.”
+
+It creates a reaction associated with a resulting promise.
+
+### Rule 4 — Reaction callbacks execute through scheduled work
+
+They are not simply called inline by the `.then()` operation.
+
+### Rule 5 — Reaction return values settle downstream promises
+
+If:
+
+```js
+const q = p.then(() => 42);
+```
+
+then `q` fulfills with `42` after the reaction executes.
+
+### Rule 6 — Throwing inside a reaction rejects the downstream promise
+
+```js
+const q = p.then(() => {
+  throw new Error("boom");
+});
+```
+
+Now `q` becomes rejected.
+
+### Rule 7 — Returning a promise or thenable causes adoption
+
+```js
+const q = p.then(() => anotherPromise);
+```
+
+The resulting promise does not simply fulfill with the promise object. It follows the resolution/adoption semantics.
+
+### Rule 8 — Multiple reactions preserve registration ordering for the same promise
+
+```js
+p.then(() => console.log("A"));
+p.then(() => console.log("B"));
+```
+
+For the same settlement, their reactions are processed according to the language's ordering rules.
+
+### Rule 9 — Chained reactions can create additional jobs
+
+```js
+p.then(a).then(b);
+```
+
+The execution of `b` depends on the outcome of `a`, so its reaction cannot simply run at the same time as `a`.
+
+### Rule 10 — A job queue is not the same thing as the entire event loop
+
+The host may have other scheduling queues and responsibilities.
+
+### Rule 11 — Job execution is not parallel execution
+
+Jobs execute according to the runtime's execution model; scheduling work for later does not itself create a second JavaScript execution thread.
+
+### Rule 12 — Infinite or recursive job creation can prevent other work from progressing
+
+For example:
+
+```js
+function loop() {
+  queueMicrotask(loop);
+}
+
+loop();
+```
+
+can continuously schedule more work.
+
+The exact starvation consequences are host-dependent, but the general danger is real.
+
+---
+
+## 7. Syntax
+
+The primary syntax relevant to this chapter includes promise reaction APIs:
+
+### `then`
+
+```js
+promise.then(onFulfilled, onRejected);
+```
+
+### `catch`
+
+```js
+promise.catch(onRejected);
+```
+
+Conceptually equivalent to:
+
+```js
+promise.then(undefined, onRejected);
+```
+
+### `finally`
+
+```js
+promise.finally(onFinally);
+```
+
+It establishes cleanup-like behavior that preserves the original fulfillment/rejection outcome unless the `finally` callback itself changes the completion.
+
+### Explicit job-like host API
+
+Many environments provide:
+
+```js
+queueMicrotask(callback);
+```
+
+This is useful for experimenting with deferred execution, but it should not be treated as a complete synonym for every specification-level Job concept.
+
+### Promise construction
+
+```js
+new Promise((resolve, reject) => {
+  // executor
+});
+```
+
+A critical distinction:
+
+```text
+executor function → called synchronously during construction
+reaction callback → scheduled for later execution
+```
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Basic reaction ordering
+
+```js
+console.log("A");
+
+Promise.resolve().then(() => {
+  console.log("B");
+});
+
+console.log("C");
+```
+
+Output:
+
+```text
+A
+C
+B
+```
+
+### Example 2 — Multiple reactions
+
+```js
+const p = Promise.resolve();
+
+p.then(() => console.log("A"));
+p.then(() => console.log("B"));
+
+console.log("C");
+```
+
+Output:
+
+```text
+C
+A
+B
+```
+
+### Example 3 — Chaining
+
+```js
+Promise.resolve()
+  .then(() => {
+    console.log("A");
+    return "B";
+  })
+  .then(value => {
+    console.log(value);
+  });
+```
+
+Output:
+
+```text
+A
+B
+```
+
+The second callback depends on the first reaction's completion.
+
+### Example 4 — Reaction throw
+
+```js
+Promise.resolve()
+  .then(() => {
+    throw new Error("failed");
+  })
+  .catch(error => {
+    console.log(error.message);
+  });
+```
+
+Output:
+
+```text
+failed
+```
+
+### Example 5 — Return a promise
+
+```js
+Promise.resolve()
+  .then(() => {
+    return Promise.resolve("done");
+  })
+  .then(value => {
+    console.log(value);
+  });
+```
+
+Output:
+
+```text
+done
+```
+
+The downstream promise adopts the returned promise's eventual state.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+console.log("1");
+
+const p = Promise.resolve("A");
+
+p.then(value => {
+  console.log(value);
+  return "B";
+}).then(value => {
+  console.log(value);
+});
+
+console.log("2");
+```
+
+### Step 1
+
+`"1"` prints.
+
+### Step 2
+
+`Promise.resolve("A")` produces an already-fulfilled promise.
+
+### Step 3
+
+The first `.then()` registers a fulfillment reaction.
+
+Because the promise is already fulfilled, the reaction becomes ready for scheduled execution.
+
+### Step 4
+
+The second `.then()` is attached to the promise returned by the first `.then()`.
+
+At this point, the first reaction has not run, so the second promise has not yet acquired its eventual fulfillment from the callback.
+
+### Step 5
+
+The synchronous code continues:
+
+```text
+2
+```
+
+### Step 6
+
+The first reaction job executes.
+
+It logs:
+
+```text
+A
+```
+
+and returns:
+
+```text
+B
+```
+
+### Step 7
+
+The first downstream promise fulfills with `"B"`.
+
+### Step 8
+
+The second reaction becomes schedulable.
+
+### Step 9
+
+The second reaction job executes and prints:
+
+```text
+B
+```
+
+Final output:
+
+```text
+1
+2
+A
+B
+```
+
+The crucial rule:
+
+> Each stage of a promise chain depends on the settlement created by the previous stage.
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 Promise reaction records
+
+Conceptually, a `.then()` call creates reaction information containing things such as:
+
+```text
+handler
+capability/result promise
+fulfillment vs rejection behavior
+```
+
+You can imagine:
+
+```text
+Promise P
+  ├── Reaction R1 → downstream Promise Q1
+  └── Reaction R2 → downstream Promise Q2
+```
+
+When `P` settles, the relevant reactions become schedulable.
+
+### 10.2 Promise capabilities
+
+A promise reaction needs a resulting promise.
+
+Therefore:
+
+```js
+const q = p.then(handler);
+```
+
+does not return `p`.
+
+It creates a new promise `q`.
+
+### 10.3 Reaction job
+
+A reaction job performs approximately:
+
+```text
+retrieve settled promise outcome
+      ↓
+select fulfillment/rejection handler
+      ↓
+call handler if appropriate
+      ↓
+capture returned value or thrown error
+      ↓
+resolve/reject downstream promise
+```
+
+This is a central bridge between promise state and actual callback execution.
+
+### 10.4 Handler selection
+
+For:
+
+```js
+p.then(onFulfilled, onRejected);
+```
+
+- fulfilled source → fulfillment handler;
+- rejected source → rejection handler.
+
+If the relevant handler is missing, the result is propagated to the downstream promise according to promise resolution semantics.
+
+### 10.5 Returned values
+
+If:
+
+```js
+p.then(() => 42);
+```
+
+the downstream promise fulfills with `42`.
+
+If:
+
+```js
+p.then(() => {
+  throw error;
+});
+```
+
+the downstream promise rejects with `error`.
+
+### 10.6 Returned thenables
+
+Suppose:
+
+```js
+p.then(() => ({
+  then(resolve) {
+    resolve("value");
+  }
+}));
+```
+
+The result is not simply the object itself.
+
+The promise resolution process assimilates thenable behavior.
+
+This is why promise resolution is a protocol rather than a simple assignment.
+
+### 10.7 Thenable hazards
+
+A foreign object can define:
+
+```js
+then(resolve, reject) {
+  // arbitrary behavior
+}
+```
+
+Therefore assimilation can involve:
+
+- getter access;
+- reentrancy;
+- exceptions;
+- multiple calls;
+- hostile behavior.
+
+The promise resolution procedure must defend its invariants.
+
+### 10.8 Fulfillment versus reaction execution
+
+Consider:
+
+```js
+const p = Promise.resolve("A");
+
+console.log(p);
+
+p.then(console.log);
+```
+
+The promise can already be fulfilled when the logging reaction has not run.
+
+This distinction is essential.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+### 11.1 Jobs are specification-level execution units
+
+The ECMAScript specification uses Jobs to model deferred execution that cannot occur during the current synchronous evaluation.
+
+Promise behavior is specified in terms of promise reactions and associated jobs.
+
+### 11.2 Promise reaction jobs
+
+A reaction is associated with a promise and a handler.
+
+When the source promise settles, the appropriate reactions are enqueued for later execution.
+
+Conceptually:
+
+```text
+settled promise
+      ↓
+trigger relevant reactions
+      ↓
+HostEnqueuePromiseJob / equivalent scheduling point
+      ↓
+reaction job eventually executes
+```
+
+The exact specification names and abstract operations should be learned from the relevant ECMAScript edition, but the conceptual architecture is stable:
+
+```text
+promise state
+→ reaction record
+→ job
+→ handler execution
+→ downstream promise settlement
+```
+
+### 11.3 `PerformPromiseThen`
+
+The specification's promise-then machinery establishes reactions and a downstream promise capability.
+
+The important mental model is:
+
+```text
+source promise
+  +
+handlers
+  +
+result promise
+  =
+registered reaction relationship
+```
+
+### 11.4 `NewPromiseReactionJob`
+
+The specification models the eventual callback execution as a promise reaction job.
+
+Its responsibilities include:
+
+- selecting the correct handler;
+- invoking it with the settlement value/reason;
+- resolving or rejecting the downstream promise.
+
+### 11.5 Promise resolution
+
+The resolution procedure is not:
+
+```js
+promise.value = result;
+```
+
+It handles:
+
+- ordinary values;
+- promises;
+- thenables;
+- self-resolution;
+- getter errors;
+- first-call-wins behavior for resolving functions.
+
+### 11.6 Self-resolution
+
+This is invalid:
+
+```js
+let resolvePromise;
+
+const p = new Promise(resolve => {
+  resolvePromise = resolve;
+});
+
+resolvePromise(p);
+```
+
+A promise must not resolve to itself because that would create an impossible recursive dependency.
+
+The specification rejects self-resolution.
+
+### 11.7 First call wins
+
+For promise resolving functions:
+
+```js
+resolve(value);
+reject(error);
+```
+
+the first effective settlement controls the promise.
+
+Subsequent settlement attempts do not change the promise's already-settled state.
+
+### 11.8 Exception handling inside reactions
+
+If a handler throws:
+
+```js
+p.then(() => {
+  throw error;
+});
+```
+
+the exception is converted into rejection of the downstream promise.
+
+This is one of the central reasons promise chains can model failure without requiring a synchronous `try/catch` around every callback.
+
+### 11.9 Host interaction
+
+The language defines how promise jobs are created and requests their scheduling through host integration.
+
+The host determines the broader scheduling environment.
+
+Therefore:
+
+```text
+ECMAScript controls:
+  promise state + reaction semantics + job concept
+
+Host controls:
+  when/where jobs are integrated with the runtime's broader event system
+```
+
+### 11.10 Not every deferred callback is a promise job
+
+Timers, DOM events, filesystem callbacks, and other host operations may have distinct scheduling behavior.
+
+A reliable architecture never assumes that all asynchronous callbacks share one universal queue.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Already-settled promises still defer reactions
+
+This design prevents promise APIs from becoming timing-dependent.
+
+Bad API behavior would be:
+
+```text
+sometimes callback now
+sometimes callback later
+```
+
+Promise reactions provide a consistent deferred mechanism.
+
+### 12.2 Reaction order
+
+For one promise:
+
+```js
+p.then(A);
+p.then(B);
+p.then(C);
+```
+
+the fulfillment reactions are associated in registration order and run correspondingly under the promise reaction scheduling model.
+
+This gives deterministic local ordering.
+
+### 12.3 Chaining creates causal scheduling
+
+Consider:
+
+```js
+p.then(A).then(B);
+p.then(C);
+```
+
+The likely conceptual sequence after `p` fulfills is:
+
+```text
+A
+C
+B
+```
+
+Why?
+
+- `A` and `C` are reactions directly attached to `p`;
+- `B` is attached to the promise produced by `A`;
+- `B` cannot execute until `A` has completed and the intermediate promise has settled.
+
+This is a foundational prediction exercise.
+
+### 12.4 `catch` propagation
+
+Given:
+
+```js
+Promise.reject(error)
+  .then(null, handle)
+  .then(next);
+```
+
+If `handle` returns normally, the downstream promise fulfills.
+
+If `handle` throws, the downstream promise rejects again.
+
+Each reaction transforms the promise state.
+
+### 12.5 `finally`
+
+`finally` is designed for cleanup-like behavior.
+
+Conceptually:
+
+```js
+p.finally(cleanup)
+```
+
+behaves like a transparent continuation that:
+
+- runs cleanup regardless of fulfillment/rejection;
+- preserves the original outcome if cleanup completes normally;
+- replaces the outcome if cleanup itself fails.
+
+This connects directly to Chapters 29 and 30.
+
+### 12.6 Returning a pending promise
+
+```js
+p.then(() => pendingPromise);
+```
+
+The downstream promise remains pending until the returned promise settles.
+
+Therefore one reaction job can trigger a much longer asynchronous dependency chain.
+
+### 12.7 Multiple `.then()` calls on the same promise
+
+```js
+const p = Promise.resolve();
+
+p.then(() => console.log("A"));
+p.then(() => console.log("B"));
+
+```
+
+This creates independent reactions.
+
+One callback does not “consume” the promise result.
+
+### 12.8 Promise sharing
+
+A single promise can have many consumers:
+
+```js
+const result = fetchSomething();
+
+componentA(result);
+componentB(result);
+componentC(result);
+```
+
+Each consumer can attach its own reaction chain.
+
+### 12.9 Promise adoption
+
+A promise returned by a callback can be adopted:
+
+```js
+p.then(() => asyncOperation());
+```
+
+This creates a natural flattening behavior:
+
+```text
+outer promise
+  ↓
+reaction executes
+  ↓
+inner promise returned
+  ↓
+outer downstream promise follows inner outcome
+```
+
+### 12.10 Thenable interop
+
+Libraries do not have to use native `Promise` objects to be interoperable in every case.
+
+Objects with a callable `then` can participate in promise resolution.
+
+This flexibility also creates complexity.
+
+### 12.11 Thenable getter side effects
+
+Even retrieving a `then` property can execute arbitrary code:
+
+```js
+const value = {
+  get then() {
+    console.log("side effect");
+    return resolve => resolve(1);
+  }
+};
+```
+
+Promise resolution must therefore treat thenable assimilation as potentially effectful.
+
+### 12.12 Microtask queue terminology
+
+Browsers and Node.js commonly expose or document a “microtask queue.”
+
+It is useful practical terminology.
+
+But when reasoning from the specification, start with:
+
+```text
+Jobs
+PromiseReactionJobs
+host scheduling
+```
+
+Then map that model onto the runtime.
+
+### 12.13 Job starvation
+
+Consider:
+
+```js
+function loop() {
+  queueMicrotask(loop);
+}
+
+loop();
+```
+
+This continually adds more deferred work.
+
+A runtime that repeatedly drains such work can delay other categories of work.
+
+This is a design hazard for:
+
+- recursive promise chains;
+- reactive systems;
+- task schedulers;
+- queue processors.
+
+### 12.14 Fairness is not automatic
+
+A local chain can be logically correct but globally unfair.
+
+A production scheduler may need:
+
+- batching;
+- yielding;
+- bounded work;
+- explicit task queues.
+
+### 12.15 Error boundaries in reaction chains
+
+Example:
+
+```js
+p
+  .then(stepA)
+  .then(stepB)
+  .catch(handle);
+```
+
+A rejection can skip fulfillment handlers until a rejection handler is encountered.
+
+This creates a structured error-propagation path.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 Promise already fulfilled before `.then()`
+
+The callback still runs through the asynchronous reaction mechanism.
+
+### 13.2 Promise already rejected before `.catch()`
+
+The rejection handler is attached and scheduled according to promise reaction semantics.
+
+### 13.3 Handler returns `undefined`
+
+The downstream promise fulfills with `undefined` when the handler completes normally.
+
+### 13.4 Handler throws
+
+The downstream promise rejects with the thrown value.
+
+### 13.5 Handler returns a rejected promise
+
+The downstream promise becomes rejected according to promise resolution/adoption.
+
+### 13.6 Handler returns itself indirectly
+
+Self-referential promise chains can create cycles.
+
+The promise resolution model prevents direct self-resolution.
+
+More complicated logical cycles may remain pending rather than producing a useful value.
+
+### 13.7 Thenable calls resolve twice
+
+Example:
+
+```js
+const thenable = {
+  then(resolve, reject) {
+    resolve("A");
+    resolve("B");
+    reject(new Error("C"));
+  }
+};
+```
+
+Only the first effective resolution wins.
+
+### 13.8 Thenable throws after resolving
+
+```js
+const thenable = {
+  then(resolve) {
+    resolve("A");
+    throw new Error("later");
+  }
+};
+```
+
+The promise resolution machinery prevents the later exception from replacing the already-effective resolution.
+
+### 13.9 `.finally()` changes the outcome
+
+```js
+Promise.resolve("A")
+  .finally(() => {
+    throw new Error("cleanup");
+  });
+```
+
+The resulting promise rejects with the cleanup failure.
+
+### 13.10 Multiple reaction callbacks
+
+If several reactions are registered before settlement, they are associated with the same promise and processed according to the defined ordering.
+
+### 13.11 Nested jobs
+
+A reaction can queue another microtask/job:
+
+```js
+Promise.resolve().then(() => {
+  console.log("A");
+  queueMicrotask(() => console.log("B"));
+});
+```
+
+The new scheduled work belongs to a later point in the scheduling sequence, not the current callback body.
+
+### 13.12 Recursive scheduling
+
+A callback that always schedules another callback can create effectively unbounded deferred work.
+
+### 13.13 Unhandled rejection timing
+
+Whether and when an environment reports an unhandled rejection is partly host/runtime policy.
+
+Do not treat unhandled-rejection reporting as pure ECMAScript semantics.
+
+### 13.14 Cross-runtime differences
+
+Browser and Node behavior around unhandled rejections, additional queues, and lifecycle can differ.
+
+The language-level promise semantics remain the foundation.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “A fulfilled promise executes its callbacks immediately.”
+
+No.
+
+Settlement and callback execution are separate.
+
+### Misconception 2 — “`.then()` is basically a function call.”
+
+No.
+
+It registers a reaction and creates a downstream promise.
+
+### Misconception 3 — “A promise is a queue.”
+
+A promise has state and reactions; job scheduling is the mechanism through which reactions execute.
+
+### Misconception 4 — “The event loop is the promise job queue.”
+
+Not exactly.
+
+The host event loop contains broader scheduling machinery.
+
+### Misconception 5 — “Every async callback is a microtask.”
+
+No.
+
+Timers, I/O, events, and other host facilities may use different scheduling paths.
+
+### Misconception 6 — “Returning a promise from `.then()` creates a nested promise.”
+
+Promise resolution adopts the returned promise/thenable outcome.
+
+The downstream result is flattened conceptually.
+
+### Misconception 7 — “`catch()` changes the original promise.”
+
+No.
+
+It creates a new downstream promise.
+
+### Misconception 8 — “Throwing in a `.then()` callback escapes directly to the outer `try/catch`.”
+
+Not generally.
+
+The throw becomes rejection of the callback's resulting promise.
+
+### Misconception 9 — “`finally()` always preserves the original outcome.”
+
+Only when its callback completes normally.
+
+### Misconception 10 — “Jobs mean another thread.”
+
+No.
+
+A job is a scheduling abstraction, not a thread.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Assuming immediate execution
+
+```js
+Promise.resolve().then(fn);
+doSomething();
+```
+
+Expecting `fn` to run before `doSomething()`.
+
+### Mistake 2 — Ignoring downstream promises
+
+```js
+p.then(step);
+```
+
+without determining who observes rejection from `step`.
+
+### Mistake 3 — Returning the wrong value
+
+```js
+p.then(() => {
+  doAsyncWork();
+});
+```
+
+If the intention was to wait for `doAsyncWork()`, failing to return/await it can create detached work.
+
+Prefer:
+
+```js
+p.then(() => {
+  return doAsyncWork();
+});
+```
+
+or:
+
+```js
+p.then(async () => {
+  await doAsyncWork();
+});
+```
+
+### Mistake 4 — Confusing registration order with completion order across different promises
+
+Registration ordering is local to a given reaction relationship.
+
+Different asynchronous sources can complete at different times.
+
+### Mistake 5 — Creating unbounded reaction chains
+
+### Mistake 6 — Assuming one queue explains the entire runtime
+
+### Mistake 7 — Using `finally` for state mutation without understanding outcome replacement
+
+### Mistake 8 — Ignoring thenable assimilation
+
+Interop objects can execute arbitrary code.
+
+### Mistake 9 — Relying on unhandled-rejection reporting for correctness
+
+Application code should explicitly observe important promises.
+
+### Mistake 10 — Treating microtask scheduling as a performance freebie
+
+Excessive deferred work can create latency and fairness problems.
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Concept | Meaning | Layer |
+|---|---|---|
+| Promise | Eventual completion state + reactions | ECMAScript |
+| Promise reaction | Registered fulfillment/rejection behavior | ECMAScript |
+| Promise Reaction Job | Scheduled execution of a reaction | ECMAScript |
+| Job | General specification-level deferred execution unit | ECMAScript |
+| Microtask | Common host/runtime term for a high-priority deferred queue | Host/runtime terminology |
+| Task/macrotask | Host scheduling category | Browser/runtime |
+| Timer callback | Host-scheduled callback | Host |
+| Event callback | Host-scheduled callback | Host |
+| `queueMicrotask` callback | Host-visible microtask scheduling API | Host |
+| Call stack | Active synchronous execution | Engine/runtime |
+| Worker thread | Separate execution agent | Host/runtime |
+
+### Promise reaction vs callback
+
+A callback is simply a function value used by some API.
+
+A promise reaction is a structured record connecting:
+
+```text
+source promise
++
+handler
++
+result promise
+```
+
+### Job vs microtask
+
+A Job is the specification-level concept.
+
+“Microtask” is a widely used runtime term describing one class of deferred execution behavior.
+
+Keep the terminology layered rather than treating them as exact synonyms in every context.
+
+### Promise job vs timer task
+
+A promise reaction can be processed through the promise/job mechanism.
+
+A timer callback belongs to host timer scheduling.
+
+The runtime may order these categories differently from naive “FIFO of everything” reasoning.
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 Each chain stage creates scheduling work
+
+Long chains:
+
+```js
+p
+  .then(a)
+  .then(b)
+  .then(c)
+  .then(d);
+```
+
+can create multiple promise objects and reaction jobs.
+
+Usually this is acceptable, but high-frequency paths may make allocation and scheduling overhead relevant.
+
+### 17.2 Excessive microtask work
+
+A large quantity of promise callbacks can delay other runtime work.
+
+### 17.3 Job batching
+
+A producer that schedules work one item at a time may create substantial scheduling overhead.
+
+Batching can reduce:
+
+```text
+queue operations
+allocations
+context switching
+```
+
+### 17.4 Promise allocation
+
+Each `.then()` creates a downstream promise.
+
+Deep pipelines can therefore increase:
+
+- allocations;
+- GC pressure;
+- bookkeeping.
+
+### 17.5 Thenable assimilation
+
+Assimilating foreign thenables can involve dynamic property access and arbitrary user code.
+
+### 17.6 Error stacks
+
+Rejected promises involving many created errors can increase diagnostic cost.
+
+### 17.7 Concurrency versus queue depth
+
+A fast producer creating jobs faster than consumers can process them can generate memory pressure even when individual callbacks are small.
+
+### 17.8 Scheduling latency
+
+A correct promise chain can still suffer latency because its reaction jobs depend on other work ahead of them.
+
+Measure:
+
+```text
+operation latency
++
+queue delay
++
+handler CPU time
++
+downstream latency
+```
+
+rather than looking only at promise creation time.
+
+---
+
+## 18. Memory Considerations
+
+Promises and reaction records can retain references.
+
+For example:
+
+```js
+const huge = createHugeObject();
+
+somePromise.then(() => {
+  use(huge);
+});
+```
+
+The closure can keep `huge` alive until the reaction no longer needs it.
+
+### Promise chains
+
+Long-lived pending promises may retain:
+
+- reaction handlers;
+- closures;
+- intermediate promises;
+- captured resources.
+
+### Detached promises
+
+A forgotten promise may retain data and resources longer than intended.
+
+### Cycles
+
+Promise graphs can form complex object/reference structures.
+
+GC handles memory reachability, but logical lifecycle bugs can still retain objects unnecessarily.
+
+### Queue growth
+
+Repeated scheduling:
+
+```js
+queueMicrotask(produceMoreWork);
+```
+
+can retain an increasing amount of state.
+
+### Diagnostic metadata
+
+Errors and causes attached to rejected promises can also retain objects.
+
+---
+
+## 19. Security Considerations
+
+### 19.1 Thenable execution
+
+Thenable assimilation can invoke attacker-controlled code.
+
+Never assume:
+
+```js
+value.then
+```
+
+is a harmless property lookup.
+
+### 19.2 Promise rejection data
+
+Rejected values may contain:
+
+- credentials;
+- tokens;
+- database details;
+- internal paths.
+
+Do not log or expose them automatically.
+
+### 19.3 Job flooding
+
+An attacker may trigger code paths that create huge numbers of promises or microtasks.
+
+Potential effects:
+
+- CPU exhaustion;
+- event-loop delay;
+- memory pressure;
+- downstream overload.
+
+### 19.4 Async race vulnerabilities
+
+Promise scheduling can widen the time between:
+
+```text
+validate
+```
+
+and:
+
+```text
+use
+```
+
+### 19.5 Cleanup failures
+
+A rejected cleanup promise can create secondary failure paths.
+
+### 19.6 Unhandled rejection behavior
+
+Different runtimes may react differently to unhandled rejections.
+
+Production systems should not depend on a particular default.
+
+### 19.7 Supply-chain thenables
+
+Third-party libraries may return thenables or promise-like objects.
+
+Normalize and validate boundaries carefully when security is important.
+
+---
+
+## 20. Production Usage
+
+### 20.1 API service pipeline
+
+```text
+request
+  ↓
+validation
+  ↓
+async dependency
+  ↓
+promise reaction
+  ↓
+business transformation
+  ↓
+response
+```
+
+Each stage should define:
+
+- success;
+- failure;
+- timeout;
+- cancellation;
+- cleanup.
+
+### 20.2 Error boundary
+
+Promise chains should terminate at explicit error boundaries:
+
+```js
+runOperation()
+  .then(handleResult)
+  .catch(handleFailure);
+```
+
+A production boundary should not merely log and discard failure.
+
+### 20.3 Concurrency management
+
+Promises make it easy to write:
+
+```js
+Promise.all(items.map(process));
+```
+
+But an application may need a bounded scheduler instead.
+
+### 20.4 Resource ownership
+
+A reaction must not outlive its resource owner:
+
+```text
+resource scope
+   ↓
+async operation
+   ↓
+promise reactions
+   ↓
+cleanup
+```
+
+This connects directly to Chapter 30.
+
+### 20.5 Observability
+
+Track:
+
+- promise operation latency;
+- queue delay where measurable;
+- rejection rates;
+- retry counts;
+- active concurrency;
+- timeout rates;
+- cancellation.
+
+### 20.6 Background work
+
+Do not accidentally create:
+
+```js
+doSomething().then(report);
+return response;
+```
+
+without deciding:
+
+- who owns the continuation;
+- what happens if it fails;
+- whether it must finish before response;
+- whether it should be cancelled.
+
+### 20.7 Graceful shutdown
+
+A production service should know whether pending asynchronous work is:
+
+```text
+required before shutdown
+safe to abandon
+safe to retry elsewhere
+required to be cancelled
+```
+
+### 20.8 Libraries
+
+Libraries should document:
+
+- returned promise semantics;
+- rejection behavior;
+- whether callbacks are always deferred;
+- cancellation behavior;
+- cleanup expectations.
+
+---
+
+## 21. Implementation From Scratch
+
+The goal is not to recreate every promise specification detail immediately. The goal is to understand the relationship between:
+
+```text
+promise state
+reaction registration
+job scheduling
+handler execution
+downstream settlement
+```
+
+### Stage 1 — Guided reaction queue
+
+Implement a tiny scheduler:
+
+```js
+class JobQueue {
+  constructor() {
+    this.queue = [];
+  }
+
+  enqueue(job) {
+    this.queue.push(job);
+  }
+
+  runNext() {
+    const job = this.queue.shift();
+
+    if (job) {
+      job();
+    }
+  }
+}
+```
+
+Then simulate:
+
+```text
+current code
+↓
+enqueue reaction
+↓
+finish synchronous work
+↓
+run reaction
+```
+
+### Stage 2 — Partially Guided
+
+Build a minimal promise-like object:
+
+```js
+class MiniPromise {
+  constructor(executor) {}
+  then(onFulfilled, onRejected) {}
+}
+```
+
+Support:
+
+- pending;
+- fulfilled;
+- rejected;
+- reaction registration;
+- deferred reaction execution.
+
+### Stage 3 — No Reference
+
+Implement:
+
+```js
+MiniPromise.resolve(value)
+MiniPromise.reject(error)
+```
+
+and chaining:
+
+```js
+new MiniPromise(resolve => resolve(1))
+  .then(x => x + 1)
+  .then(console.log);
+```
+
+### Stage 4 — Edge-Case Hardened
+
+Add:
+
+- thrown executor errors;
+- handler throws;
+- returned promises;
+- thenables;
+- self-resolution protection;
+- first-call-wins;
+- multiple reactions;
+- rejection propagation.
+
+### Stage 5 — Production-Oriented Learning Implementation
+
+Build a documented miniature promise engine containing:
+
+```text
+state machine
+reaction records
+job queue
+resolution procedure
+thenable assimilation
+error propagation
+debug instrumentation
+```
+
+Do not deploy this as a production Promise replacement.
+
+The purpose is semantic understanding.
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Fulfilled does not mean callback already ran
+
+```js
+const p = Promise.resolve("A");
+
+console.log("before");
+
+p.then(value => console.log(value));
+
+console.log("after");
+```
+
+Explain:
+
+```text
+promise state
+vs
+reaction execution
+```
+
+### Exercise 2 — Chain ordering
+
+Predict:
+
+```js
+const p = Promise.resolve();
+
+p.then(() => console.log("A"));
+p.then(() => console.log("B"));
+p.then(() => console.log("C"));
+
+console.log("D");
+```
+
+### Exercise 3 — Chain dependency
+
+Predict:
+
+```js
+Promise.resolve()
+  .then(() => console.log("A"))
+  .then(() => console.log("B"));
+
+Promise.resolve().then(() => console.log("C"));
+```
+
+Explain why the result is not based on simple source-code indentation.
+
+### Exercise 4 — Error propagation
+
+```js
+Promise.resolve()
+  .then(() => {
+    throw new Error("A");
+  })
+  .then(
+    () => console.log("success"),
+    error => console.log(error.message)
+  );
+```
+
+Identify which handler executes and why.
+
+### Exercise 5 — Returned promise
+
+```js
+Promise.resolve()
+  .then(() => new Promise(resolve => {
+    setTimeout(() => resolve("A"), 10);
+  }))
+  .then(console.log);
+```
+
+Which callback waits for the inner promise?
+
+### Exercise 6 — Thenable
+
+```js
+Promise.resolve()
+  .then(() => ({
+    then(resolve) {
+      resolve("A");
+    }
+  }))
+  .then(console.log);
+```
+
+Explain the assimilation step.
+
+### Exercise 7 — Starvation
+
+```js
+let count = 0;
+
+function loop() {
+  count++;
+
+  if (count < 100000) {
+    queueMicrotask(loop);
+  }
+}
+
+loop();
+```
+
+What categories of work might be delayed while this executes?
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+function process(items) {
+  items.forEach(item => {
+    fetchItem(item)
+      .then(result => saveResult(result))
+      .catch(error => console.error(error));
+  });
+}
+```
+
+Analyze:
+
+- concurrency;
+- ordering;
+- error ownership;
+- promise observation;
+- completion signaling;
+- backpressure;
+- cancellation;
+- graceful shutdown;
+- whether `process()` should return a promise;
+- whether errors are being swallowed at the wrong layer.
+
+Redesign the function with an explicit completion contract.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is an ECMAScript Job?
+2. Why are promise callbacks deferred?
+3. What is a promise reaction?
+4. What happens when `.then()` is called?
+5. Why does `.then()` return a new promise?
+6. What happens when a reaction returns a value?
+7. What happens when it throws?
+8. What happens when it returns another promise?
+9. What is thenable assimilation?
+10. Why does a fulfilled promise still defer its reactions?
+
+### Intermediate
+
+11. What is the difference between a promise and a promise reaction job?
+12. What is the difference between a Job and a browser task?
+13. What does `catch()` do conceptually?
+14. How does `finally()` affect settlement?
+15. Why can chain stages execute at different times?
+16. How is rejection propagated?
+17. What does first-call-wins mean for promise resolution?
+18. Why is self-resolution invalid?
+19. Why can recursive microtasks create starvation?
+20. Why is `Promise.all` not itself a scheduler?
+
+### Advanced
+
+21. Explain the lifecycle of a promise reaction.
+22. Explain the role of the downstream promise capability.
+23. Explain promise resolution versus fulfillment.
+24. Explain thenable assimilation and its security implications.
+25. Predict reaction ordering for multiple chains.
+26. Explain how a thrown reaction callback becomes a rejection.
+27. Explain why host event loops cannot be reduced to “the promise queue.”
+28. Explain how promise chains retain memory.
+29. Explain how job flooding can affect latency.
+30. Explain the difference between specification scheduling and runtime scheduling.
+
+### Principal-Level
+
+31. Design an async abstraction with deterministic completion semantics.
+32. How would you prevent microtask starvation?
+33. How would you design bounded promise concurrency?
+34. How would you debug hidden scheduling latency?
+35. How would you classify detached promise chains in a production system?
+36. How would you instrument promise failures without duplicate logging?
+37. How would you model cancellation across chained promises?
+38. How would you preserve resource ownership across promise boundaries?
+39. When should a library expose a promise versus a callback?
+40. How would you explain promise scheduling to engineers without collapsing specification and host concepts?
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+console.log("A");
+
+Promise.resolve().then(() => console.log("B"));
+
+console.log("C");
+```
+
+Expected:
+
+```text
+A
+C
+B
+```
+
+### Exercise B
+
+```js
+const p = Promise.resolve();
+
+p.then(() => console.log("A"));
+p.then(() => console.log("B"));
+
+console.log("C");
+```
+
+Expected:
+
+```text
+C
+A
+B
+```
+
+### Exercise C
+
+```js
+Promise.resolve()
+  .then(() => console.log("A"))
+  .then(() => console.log("B"));
+
+Promise.resolve().then(() => console.log("C"));
+```
+
+Predict the ordering and explain why `C` can run before `B`.
+
+### Exercise D
+
+```js
+Promise.resolve()
+  .then(() => {
+    console.log("A");
+    return Promise.resolve("B");
+  })
+  .then(console.log);
+```
+
+Explain why the second callback does not receive the promise object itself.
+
+### Exercise E
+
+```js
+Promise.resolve()
+  .then(() => {
+    throw new Error("A");
+  })
+  .catch(error => {
+    console.log(error.message);
+    return "B";
+  })
+  .then(value => {
+    console.log(value);
+  });
+```
+
+Predict:
+
+```text
+A
+B
+```
+
+### Exercise F
+
+```js
+Promise.resolve()
+  .then(() => console.log("A"))
+  .finally(() => console.log("B"))
+  .then(() => console.log("C"));
+```
+
+Explain the sequence and outcome.
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Draw the job graph
+
+For:
+
+```js
+p
+  .then(a)
+  .then(b);
+
+p.then(c);
+```
+
+Draw:
+
+```text
+promise
+reactions
+jobs
+downstream promises
+```
+
+Then predict execution ordering.
+
+### Exercise 2 — Mini reaction engine
+
+Implement:
+
+```js
+class ReactionQueue {
+  enqueue(reaction) {}
+  drain() {}
+}
+```
+
+Then connect it to a miniature promise abstraction.
+
+### Exercise 3 — Thenable assimilation
+
+Implement:
+
+```js
+resolvePromise(value)
+```
+
+handling:
+
+```text
+ordinary value
+native-like promise
+thenable
+throwing then getter
+double resolve
+self-resolution
+```
+
+### Exercise 4 — Promise scheduler instrumentation
+
+Create a debugging representation:
+
+```text
+job #1
+  source promise: P1
+  reaction: onFulfilled
+  created downstream: P2
+```
+
+Trace a chain through completion.
+
+### Exercise 5 — Starvation detector
+
+Build a scheduler that detects excessive recursive deferred work.
+
+### Exercise 6 — Concurrency controller
+
+Implement:
+
+```js
+mapWithConcurrency(items, limit, worker)
+```
+
+using promises.
+
+Compare:
+
+```text
+unbounded
+bounded
+sequential
+```
+
+### Exercise 7 — Production review
+
+Analyze a real async service and identify:
+
+- reaction chains;
+- error boundaries;
+- detached promises;
+- resource scope;
+- cancellation;
+- concurrency;
+- queueing;
+- observability.
+
+Produce a failure and latency model, not just code changes.
+
+---
+
+## 27. Key Takeaways
+
+1. ECMAScript Jobs are a specification-level model for deferred execution.
+2. Promise reactions are executed through scheduled reaction jobs rather than immediate callback calls.
+3. Promise settlement and reaction execution are distinct events.
+4. `.then()` establishes a reaction and creates a downstream promise.
+5. Returning a value fulfills the downstream promise.
+6. Throwing from a reaction rejects the downstream promise.
+7. Returning a promise or thenable causes promise-resolution/adoption behavior.
+8. Multiple reactions attached to the same promise follow deterministic registration ordering.
+9. Chained reactions depend on intermediate promise settlement.
+10. Promise resolution is more sophisticated than assigning a value.
+11. Thenables can execute arbitrary code during assimilation.
+12. Self-resolution is invalid.
+13. Promise resolving functions use first-effective-settlement behavior.
+14. `catch()` creates another promise in the chain.
+15. `finally()` can preserve or replace the original outcome depending on its completion.
+16. “Microtask” is useful runtime terminology but should not replace precise ECMAScript Job reasoning.
+17. A promise job is not a thread.
+18. Excessive job creation can harm fairness, latency, CPU, and memory.
+19. Host event loops contain scheduling behavior beyond the ECMAScript promise job model.
+20. The central mental model is:
+
+> Promise state determines which reactions become eligible; Jobs provide the deferred execution mechanism that runs those reactions; the host determines how that work is integrated into the broader runtime.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 09 — Functions / First-Class Behavior
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 25 — Iterables / Iterators
+- Chapter 29 — Errors / Error Handling
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+
+### Builds Toward
+
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 40 — Observables / Reactive
+- Chapter 45 — Memory / GC
+- Chapter 46 — Weak Refs / Finalization
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 98 — Anti-patterns / Failure Modes
+- Chapter 100 — Cost Model / Tradeoffs
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- Promises
+- Promise reactions
+- Jobs
+- Microtasks
+- Tasks
+- Event loops
+- Thenables
+- Promise resolution
+- Async functions
+- Error propagation
+- Cancellation
+- Backpressure
+- Concurrency limits
+- Resource ownership
+- Observability
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- functions;
+- execution contexts;
+- abrupt completion;
+- errors;
+- asynchronous control flow;
+- resource lifetime.
+
+### Why This Chapter Matters Later
+
+The most common async explanations skip directly to:
+
+```text
+event loop
+microtask queue
+macrotask queue
+```
+
+without first establishing what the JavaScript language itself specifies.
+
+That produces fragile mental models.
+
+This chapter establishes the lower-level foundation:
+
+```text
+Promise
+→ reaction
+→ job
+→ handler
+→ downstream settlement
+```
+
+Only after this model is clear should the learner study browser and Node-specific scheduling systems.
+
+The central principle is:
+
+> First understand what the language schedules; then understand how the host schedules everything around it.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 32 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Define an ECMAScript Job.
+- [ ] Define a promise reaction.
+- [ ] Explain why promise callbacks are deferred.
+- [ ] Distinguish settlement from reaction execution.
+- [ ] Explain downstream promise creation.
+- [ ] Explain promise resolution/adoption.
+- [ ] Explain thenables.
+- [ ] Explain self-resolution.
+- [ ] Explain first-effective-settlement behavior.
+- [ ] Explain specification vs host scheduling.
+
+### Predictive Mastery
+
+- [ ] Predict multiple reaction ordering.
+- [ ] Predict chained reaction ordering.
+- [ ] Predict thrown reaction behavior.
+- [ ] Predict returned-promise behavior.
+- [ ] Predict `catch()` propagation.
+- [ ] Predict `finally()` behavior.
+- [ ] Predict thenable assimilation outcomes.
+- [ ] Predict nested job scheduling.
+
+### Implementation
+
+- [ ] Implement a basic job queue.
+- [ ] Implement a miniature reaction mechanism.
+- [ ] Implement promise chaining.
+- [ ] Implement basic thenable assimilation.
+- [ ] Implement first-call-wins behavior.
+- [ ] Implement self-resolution protection.
+- [ ] Instrument reaction/job execution.
+
+### Debugging
+
+- [ ] Trace a promise chain step by step.
+- [ ] Distinguish settlement from callback execution.
+- [ ] Identify missing promise returns.
+- [ ] Identify detached promise chains.
+- [ ] Identify job starvation risks.
+- [ ] Identify memory retention through closures/reactions.
+- [ ] Identify host-vs-language scheduling confusion.
+
+### Production Engineering
+
+- [ ] Design explicit promise completion boundaries.
+- [ ] Define error propagation.
+- [ ] Define concurrency limits.
+- [ ] Define cancellation behavior.
+- [ ] Preserve resource ownership across reactions.
+- [ ] Instrument asynchronous failures.
+- [ ] Avoid unbounded scheduling.
+
+### Interview Readiness
+
+- [ ] Explain Jobs without conflating them with event loops.
+- [ ] Explain promise reaction jobs precisely.
+- [ ] Explain thenable assimilation.
+- [ ] Predict chained reaction ordering.
+- [ ] Defend bounded async scheduling.
+- [ ] Explain promise error propagation.
+- [ ] Distinguish specification semantics from runtime behavior.
+
+### Track A — Core Theory
+
+- [ ] Understand Jobs.
+- [ ] Understand reaction records.
+- [ ] Understand promise resolution.
+- [ ] Understand thenables.
+- [ ] Understand host integration.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production-oriented learning implementation reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed reaction graph exercise.
+- [ ] Completed debugging scenarios.
+- [ ] Completed code review exercise.
+- [ ] Defended scheduling behavior at specification and production levels.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 32 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What is an ECMAScript Job?
+2. What is a Promise Reaction Job?
+3. Why does a fulfilled promise still defer its reactions?
+4. What does `.then()` create?
+5. Why does `.then()` return a new promise?
+6. What happens when a reaction returns a value?
+7. What happens when a reaction throws?
+8. What happens when a reaction returns a promise?
+9. What is thenable assimilation?
+10. Why is self-resolution invalid?
+11. What is first-effective-settlement behavior?
+12. How does `catch()` transform the chain?
+13. How does `finally()` affect the result?
+14. Why should Jobs not be confused with the event loop?
+15. Why can recursive microtask/job scheduling cause starvation?
+16. How can promise chains retain memory?
+17. How do specification-level jobs interact with host scheduling?
+18. How would you debug a complex reaction-ordering problem?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit Job vs host scheduling
+- [ ] Revisit Promise Reaction Jobs
+- [ ] Revisit promise resolution
+- [ ] Revisit thenable assimilation
+- [ ] Revisit chain ordering
+- [ ] Revisit job starvation
+- [ ] Revisit promise memory retention
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 32 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. ECMAScript specification — Jobs, Promise reaction semantics, promise resolution, `then`, `catch`, `finally`, async-related scheduling primitives, and completion behavior.
+2. TC39 proposal/history material where required for historical evolution or terminology changes.
+3. JavaScript engine documentation / implementation notes — optimization, diagnostics, and implementation details.
+4. Browser runtime documentation — microtask processing, tasks, timers, rendering, and host scheduling behavior.
+5. Node.js/runtime documentation — microtask handling, `process.nextTick`, timers, libuv phases, lifecycle, and runtime-specific behavior.
+6. Application architecture documentation — queueing, concurrency limits, observability, retries, cancellation, and ownership.
+
+When comparing Jobs with microtasks, explicitly identify which statement is:
+
+```text
+ECMAScript semantic
+runtime terminology
+host implementation detail
+application policy
+```
+
+Do not use a browser or Node event-loop diagram as a substitute for ECMAScript promise semantics.
+
+---
+
+# Chapter 32 — Completion Snapshot
+
+```text
+Chapter: 32
+Title: ECMAScript Jobs and Promise Reactions
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 33 — Browser Event Loop
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain the browser event loop as a host/runtime scheduling model.
+- Distinguish ECMAScript Jobs from browser tasks and other host scheduling categories.
+- Explain the relationship among the JavaScript execution stack, tasks, microtasks, rendering opportunities, and browser APIs.
+- Predict common ordering involving synchronous code, promise reactions, timers, DOM events, and `queueMicrotask`.
+- Explain why a timer does not execute exactly when its delay expires.
+- Explain why long-running JavaScript blocks rendering and user interaction.
+- Distinguish JavaScript execution from browser rendering and other browser subsystems.
+- Explain why the browser may perform work outside the JavaScript thread while JavaScript execution remains serialized for a given agent.
+- Understand task sources at a practical level without assuming every browser uses one simplistic universal FIFO queue.
+- Explain microtask checkpoints and why promise callbacks typically run before the browser proceeds to another task.
+- Explain how excessive microtasks can delay rendering and other event-loop work.
+- Understand the relationship among timers, network events, DOM events, user input, and promise reactions.
+- Explain why `setTimeout(fn, 0)` is a minimum-delay scheduling request rather than an immediate execution guarantee.
+- Analyze frame-rate and responsiveness problems caused by long tasks.
+- Explain how `requestAnimationFrame` differs from timers and microtasks.
+- Explain how `requestIdleCallback` differs from normal task scheduling.
+- Reason about browser scheduling under user interaction, rendering pressure, and long-running scripts.
+- Diagnose event-loop starvation and long-task problems.
+- Understand browser-specific scheduling behavior without falsely presenting it as universal ECMAScript semantics.
+- Design responsive browser applications using yielding, batching, workers, and appropriate scheduling primitives.
+- Understand how asynchronous error propagation behaves across browser event-loop boundaries.
+- Build event-loop experiments that reveal execution ordering rather than relying on memorized diagrams.
+- Evaluate browser scheduling designs in terms of latency, fairness, responsiveness, energy, memory, and correctness.
+- Defend event-loop decisions at senior/principal engineering level.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+## 2. Prerequisites
+
+The learner should understand:
+
+- JavaScript execution contexts and call stacks.
+- Functions and control flow.
+- Promises and promise reactions.
+- ECMAScript Jobs.
+- Async/await at a conceptual level.
+- Errors and abrupt completion.
+- Basic DOM and browser concepts.
+
+Primary dependencies:
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 29 — Errors / Error Handling
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+
+Later chapters build on this chapter:
+
+- Chapter 49 — DOM Architecture
+- Chapter 50 — Browser Events
+- Chapter 51 — Browser APIs
+- Chapter 52 — Web Workers / Concurrency
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 56 — Browser Security
+- Chapter 70 — Source Maps / Production Debugging
+- Chapter 85 — Performance
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+
+---
+
+## 3. What Is It?
+
+The **browser event loop** is the host/runtime mechanism that coordinates JavaScript execution with browser-managed asynchronous activities such as:
+
+- timers;
+- user input;
+- DOM events;
+- network activity;
+- rendering;
+- post-task microtask processing;
+- other browser callbacks and scheduling primitives.
+
+A common simplified picture is:
+
+```text
+browser host
+    │
+    ├── external/browser activity
+    │
+    ├── tasks
+    │
+    ├── microtasks
+    │
+    └── rendering opportunities
+             │
+             ▼
+       JavaScript execution
+```
+
+But this picture must be used carefully.
+
+There is no single universal rule that says:
+
+```text
+one queue contains every callback
+```
+
+or:
+
+```text
+every callback waits in exactly one FIFO queue
+```
+
+Browsers have multiple task sources and browser-specific scheduling behavior.
+
+A better mental model is:
+
+```text
+host has work
+   ↓
+a runnable task is selected
+   ↓
+JavaScript runs the task
+   ↓
+microtask checkpoint occurs according to host/runtime rules
+   ↓
+browser may perform rendering/update work
+   ↓
+another task may be selected
+```
+
+The browser event loop exists because a browser must coordinate many competing forms of work while maintaining a responsive user experience.
+
+---
+
+## 4. Why Does It Exist?
+
+A browser is not just a JavaScript interpreter.
+
+It must simultaneously coordinate:
+
+```text
+JavaScript
+DOM
+user input
+networking
+timers
+rendering
+layout
+painting
+media
+workers
+storage
+other platform services
+```
+
+Suppose the browser executed JavaScript continuously without a scheduling model.
+
+A long-running script could monopolize execution:
+
+```js
+while (true) {}
+```
+
+The page would stop responding.
+
+Even finite but expensive work can create:
+
+```text
+input delay
+animation jank
+missed frames
+slow clicks
+stalled rendering
+```
+
+The event-loop architecture lets browsers schedule JavaScript work in units while integrating it with other browser activities.
+
+The engineering objective is not merely:
+
+> “run callbacks later.”
+
+It is:
+
+> Coordinate independent sources of work while preserving correctness and maintaining responsiveness.
+
+---
+
+## 5. Mental Model
+
+Use this practical browser model:
+
+```text
+                 Browser Host
+                      │
+          ┌───────────┼────────────┐
+          │            │            │
+       timers       network      user input
+          │            │            │
+          └───────┬────┴────┬───────┘
+                  ▼         ▼
+                 runnable browser work
+                        │
+                        ▼
+                 JavaScript task
+                        │
+                        ▼
+                 synchronous code
+                        │
+                        ▼
+               microtask checkpoint
+                        │
+                        ▼
+               browser scheduling
+                 / rendering
+                        │
+                        ▼
+                 next opportunity
+```
+
+A critical rule:
+
+> Once JavaScript begins executing a particular synchronous callback, that callback runs synchronously until it returns, throws, or otherwise exits.
+
+The browser does not normally interrupt arbitrary JavaScript halfway through a synchronous statement sequence simply because a click arrives.
+
+Therefore:
+
+```text
+long JavaScript task
+      ↓
+input waits
+      ↓
+rendering waits
+      ↓
+other work waits
+```
+
+This is why performance engineering in the browser is heavily concerned with **long tasks** and yielding.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — JavaScript execution on a given browser agent is serialized
+
+Two ordinary JavaScript callbacks do not execute simultaneously on the same execution agent.
+
+### Rule 2 — The browser can perform other work outside JavaScript
+
+Networking, rendering-related work, timers, OS operations, and other subsystems may progress independently, subject to browser architecture.
+
+### Rule 3 — A task runs synchronously once JavaScript starts it
+
+A callback does not become interruptible merely because it came from an asynchronous API.
+
+### Rule 4 — Promise reactions use the microtask/job mechanism
+
+They are not equivalent to timer tasks.
+
+### Rule 5 — Microtasks are generally processed before moving on to later task work
+
+This is why:
+
+```js
+Promise.resolve().then(...)
+```
+
+usually runs before a separately scheduled timer callback that is waiting in a later task.
+
+### Rule 6 — Microtasks can starve later work
+
+Repeatedly scheduling microtasks can delay:
+
+- rendering opportunities;
+- timers;
+- user interaction handling;
+- other host work.
+
+### Rule 7 — Timer delay is a minimum scheduling threshold, not a hard execution deadline
+
+```js
+setTimeout(fn, 0);
+```
+
+means the callback becomes eligible only after the applicable timer conditions are satisfied and the browser gets to schedule it.
+
+### Rule 8 — Rendering does not occur after every JavaScript statement
+
+The browser decides when rendering opportunities occur.
+
+### Rule 9 — `requestAnimationFrame` is rendering-oriented
+
+It is intended for work that should run in coordination with a rendering update.
+
+### Rule 10 — `requestIdleCallback` is opportunistic
+
+It is suitable for lower-priority work when the browser has idle time, subject to browser support and scheduling policy.
+
+### Rule 11 — User input does not automatically preempt running JavaScript
+
+A long synchronous task may delay handling of a user action.
+
+### Rule 12 — Microtask completion is not the same as rendering
+
+A microtask may run before rendering proceeds, but rendering is a separate browser concern.
+
+### Rule 13 — Different asynchronous sources can have different scheduling semantics
+
+Do not flatten:
+
+```text
+timer
+network
+DOM event
+microtask
+animation callback
+idle callback
+```
+
+into one generic queue.
+
+### Rule 14 — Yielding is an application design responsibility
+
+If a computation is too large for one task, break it up or move it to another execution agent.
+
+---
+
+## 7. Syntax
+
+### Timer
+
+```js
+setTimeout(() => {
+  console.log("timer");
+}, 0);
+```
+
+### Repeating timer
+
+```js
+const id = setInterval(() => {
+  console.log("tick");
+}, 1000);
+
+clearInterval(id);
+```
+
+### Microtask
+
+```js
+queueMicrotask(() => {
+  console.log("microtask");
+});
+```
+
+### Promise reaction
+
+```js
+Promise.resolve().then(() => {
+  console.log("promise reaction");
+});
+```
+
+### Animation scheduling
+
+```js
+requestAnimationFrame(timestamp => {
+  updateAnimation(timestamp);
+});
+```
+
+### Idle scheduling
+
+```js
+requestIdleCallback(deadline => {
+  if (deadline.timeRemaining() > 0) {
+    performBackgroundWork();
+  }
+});
+```
+
+### Event listener
+
+```js
+button.addEventListener("click", () => {
+  console.log("clicked");
+});
+```
+
+These APIs do not all use identical browser scheduling paths.
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Synchronous versus timer
+
+```js
+console.log("A");
+
+setTimeout(() => {
+  console.log("B");
+}, 0);
+
+console.log("C");
+```
+
+Typical output:
+
+```text
+A
+C
+B
+```
+
+Reason:
+
+```text
+current task
+  → A
+  → register timer
+  → C
+task ends
+  → timer callback becomes eligible
+```
+
+### Example 2 — Promise reaction versus timer
+
+```js
+console.log("A");
+
+setTimeout(() => {
+  console.log("B");
+}, 0);
+
+Promise.resolve().then(() => {
+  console.log("C");
+});
+
+console.log("D");
+```
+
+Typical output:
+
+```text
+A
+D
+C
+B
+```
+
+The promise reaction is processed as deferred job/microtask work before the later timer task in this common scenario.
+
+### Example 3 — Multiple microtasks
+
+```js
+queueMicrotask(() => console.log("A"));
+
+queueMicrotask(() => console.log("B"));
+
+console.log("C");
+```
+
+Output:
+
+```text
+C
+A
+B
+```
+
+### Example 4 — Microtask scheduling another microtask
+
+```js
+queueMicrotask(() => {
+  console.log("A");
+
+  queueMicrotask(() => {
+    console.log("B");
+  });
+});
+
+queueMicrotask(() => {
+  console.log("C");
+});
+```
+
+Output in the usual microtask-draining model:
+
+```text
+A
+C
+B
+```
+
+Why?
+
+```text
+initial queue: A, C
+
+run A
+  → enqueue B
+
+queue: C, B
+
+run C
+queue: B
+
+run B
+```
+
+### Example 5 — Long task
+
+```js
+console.log("start");
+
+const begin = performance.now();
+
+while (performance.now() - begin < 2000) {
+  // block for roughly two seconds
+}
+
+console.log("end");
+```
+
+During this time:
+
+```text
+JavaScript remains busy
+```
+
+The page may become visibly unresponsive.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+console.log("1");
+
+setTimeout(() => {
+  console.log("2");
+}, 0);
+
+Promise.resolve().then(() => {
+  console.log("3");
+});
+
+queueMicrotask(() => {
+  console.log("4");
+});
+
+console.log("5");
+```
+
+### Step 1
+
+The browser is executing a task.
+
+Print:
+
+```text
+1
+```
+
+### Step 2
+
+The timer is registered.
+
+No timer callback executes synchronously.
+
+### Step 3
+
+A promise reaction is established.
+
+### Step 4
+
+A microtask is explicitly queued.
+
+### Step 5
+
+Print:
+
+```text
+5
+```
+
+The current JavaScript task is now complete.
+
+### Step 6
+
+The browser performs the applicable microtask checkpoint.
+
+The promise reaction and explicit microtask are both pending.
+
+Their registration order results in:
+
+```text
+3
+4
+```
+
+### Step 7
+
+The browser then proceeds to later host scheduling work.
+
+The timer callback becomes runnable according to timer/task rules.
+
+### Step 8
+
+The timer callback runs:
+
+```text
+2
+```
+
+Typical output:
+
+```text
+1
+5
+3
+4
+2
+```
+
+The crucial distinction is:
+
+```text
+microtask checkpoint
+vs
+next timer task
+```
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 Event-loop cycles are not simply “run queue once”
+
+A browser continuously coordinates work.
+
+A practical high-level cycle is:
+
+```text
+select/run eligible task
+       ↓
+run JavaScript
+       ↓
+perform required microtask checkpoint
+       ↓
+browser may perform rendering/update work
+       ↓
+select subsequent work
+```
+
+The actual browser scheduling algorithm is more nuanced than a single universal pseudocode loop.
+
+### 10.2 Task sources
+
+Browsers may have different task sources or scheduling categories.
+
+Examples include:
+
+- timer-related work;
+- DOM event dispatch;
+- networking callbacks;
+- posted messages;
+- user interaction;
+- other browser-specific sources.
+
+Do not assume that source ordering is globally identical across every browser API.
+
+### 10.3 Microtask checkpoint
+
+A microtask checkpoint processes eligible microtasks, including promise reactions and callbacks scheduled through `queueMicrotask`.
+
+A microtask can enqueue more microtasks.
+
+Therefore a checkpoint can conceptually behave like:
+
+```text
+while microtasks remain:
+    execute next microtask
+```
+
+This is why recursive microtasks can delay other browser work.
+
+### 10.4 Rendering opportunity
+
+Rendering is not merely another JavaScript callback.
+
+The browser owns:
+
+- style calculation;
+- layout;
+- paint;
+- compositing;
+- presentation.
+
+A JavaScript task may delay when these activities can proceed.
+
+### 10.5 The main thread
+
+Common browser pages have a primary execution context associated with a UI-responsive execution agent.
+
+Long JavaScript tasks on this agent can block:
+
+```text
+input handling
+DOM-related work
+animation callbacks
+rendering opportunities
+```
+
+The exact internal architecture varies by browser, but the practical effect is important.
+
+### 10.6 Browser workers
+
+A worker executes JavaScript in another agent.
+
+This changes the execution architecture:
+
+```text
+main page agent
+      ↕ message
+worker agent
+```
+
+The worker does not directly share the page's JavaScript execution context.
+
+Later Chapter 52 covers this deeply.
+
+### 10.7 Network operations
+
+A browser can perform networking outside the immediate JavaScript execution path.
+
+When relevant completion information becomes available, the browser schedules JavaScript-visible work.
+
+Therefore:
+
+```text
+network waiting
+```
+
+does not mean:
+
+```text
+JavaScript thread continuously waits
+```
+
+### 10.8 Timers
+
+A timer is a scheduling request.
+
+The timer's delay does not mean:
+
+```text
+execute exactly at N milliseconds
+```
+
+It means the callback is not eligible before the applicable delay and browser scheduling conditions.
+
+### 10.9 Animation frame callbacks
+
+`requestAnimationFrame` aligns callback opportunity with the browser's rendering lifecycle.
+
+This makes it preferable to timers for many visual updates.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+This chapter is explicitly host-focused.
+
+### 11.1 What ECMAScript specifies
+
+ECMAScript specifies language-level behavior for:
+
+- promise reactions;
+- Jobs;
+- async functions;
+- microtask/job concepts and host integration hooks.
+
+### 11.2 What the browser specifies
+
+The browser platform controls additional concepts such as:
+
+- event dispatch;
+- timers;
+- rendering;
+- user-input scheduling;
+- networking integration;
+- task sources;
+- animation scheduling;
+- idle callbacks;
+- worker integration.
+
+Therefore:
+
+```text
+ECMAScript ≠ browser event loop
+```
+
+The browser event loop is a host environment built around ECMAScript execution.
+
+### 11.3 Microtasks and Jobs
+
+A practical browser developer often says:
+
+```text
+microtask queue
+```
+
+while ECMAScript reasoning may use:
+
+```text
+Job
+PromiseReactionJob
+```
+
+The terms are related but should be kept at the appropriate abstraction layer.
+
+### 11.4 Event-loop details are not all language semantics
+
+Statements such as:
+
+> “After every callback, the browser renders.”
+
+are too strong.
+
+Rendering depends on browser scheduling and whether a rendering opportunity occurs.
+
+### 11.5 Scheduling fairness
+
+The host controls how it chooses among available work.
+
+Application code should not depend on undocumented assumptions about every task-source priority.
+
+### 11.6 Browser compatibility
+
+Different browser engines may implement optimizations or scheduling policies differently while preserving web-platform contracts.
+
+Test critical timing assumptions on actual target browsers.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Microtasks versus tasks
+
+A useful practical distinction:
+
+```text
+microtask:
+  promise reaction
+  queueMicrotask
+
+task:
+  timer callback
+  user event callback
+  other host work
+```
+
+But task sourcing and browser scheduling are more complex than the two-column diagram suggests.
+
+### 12.2 Why microtasks usually run before the next task
+
+Suppose:
+
+```js
+setTimeout(() => console.log("timer"), 0);
+
+Promise.resolve().then(() => console.log("promise"));
+```
+
+The promise reaction normally runs before the timer task once the current task completes and the browser reaches the relevant microtask checkpoint.
+
+This is why microtasks are useful for:
+
+- short continuation work;
+- batching state changes;
+- promise chains.
+
+They are dangerous for:
+
+- long computations;
+- unbounded loops;
+- massive queues.
+
+### 12.3 Microtask starvation
+
+Example:
+
+```js
+function spin() {
+  queueMicrotask(spin);
+}
+
+spin();
+```
+
+The application continually creates microtasks.
+
+Potential result:
+
+```text
+microtasks keep running
+↓
+rendering opportunities delayed
+↓
+timers delayed
+↓
+input handling delayed
+```
+
+The exact browser behavior can vary, but the architectural risk is fundamental.
+
+### 12.4 Long tasks
+
+Any substantial synchronous task can create:
+
+```text
+input latency
+visual jank
+delayed timers
+```
+
+A common performance strategy is:
+
+```text
+large computation
+→ split into chunks
+→ yield between chunks
+```
+
+### 12.5 Yielding
+
+A computation can periodically yield control.
+
+One simple strategy:
+
+```js
+function yieldToHost() {
+  return new Promise(resolve => {
+    setTimeout(resolve, 0);
+  });
+}
+```
+
+But this is not always the ideal browser primitive.
+
+Modern applications may choose scheduling APIs appropriate to priority and rendering needs.
+
+The principle matters more than a single API:
+
+> Return control to the browser before the work becomes perceptibly blocking.
+
+### 12.6 Chunking
+
+Instead of:
+
+```js
+for (const item of millionItems) {
+  process(item);
+}
+```
+
+use bounded chunks:
+
+```js
+async function processInChunks(items, chunkSize) {
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const end = Math.min(i + chunkSize, items.length);
+
+    for (let j = i; j < end; j++) {
+      process(items[j]);
+    }
+
+    await yieldToHost();
+  }
+}
+```
+
+The actual yielding strategy should be chosen based on the workload.
+
+### 12.7 `requestAnimationFrame`
+
+Visual update logic often belongs in:
+
+```js
+requestAnimationFrame(update);
+```
+
+This tells the browser that the callback is associated with a rendering update opportunity.
+
+Do not use it as a generic replacement for promises or timers.
+
+### 12.8 `requestIdleCallback`
+
+Idle callbacks target lower-priority work.
+
+Use cases:
+
+- non-critical analytics preparation;
+- low-priority preprocessing;
+- background housekeeping.
+
+Avoid placing user-visible latency-sensitive work there.
+
+### 12.9 Timer clamping and throttling
+
+Browsers may delay or throttle timers due to:
+
+- nested timers;
+- inactive/background tabs;
+- resource conservation;
+- power policies;
+- browser-specific throttling.
+
+Therefore timers are poor substitutes for exact real-time scheduling.
+
+### 12.10 Background-tab behavior
+
+An application may behave differently when hidden.
+
+Timer frequency and rendering opportunities may be reduced.
+
+Never assume foreground scheduling behavior remains identical in all lifecycle states.
+
+### 12.11 Input latency
+
+A click that occurs while a 500ms task is running may wait until the main JavaScript execution becomes available.
+
+This is a direct consequence of serialized synchronous execution on the relevant agent.
+
+### 12.12 Debouncing and throttling
+
+Event-loop behavior matters for UI event streams.
+
+Example:
+
+```js
+input.addEventListener("input", handler);
+```
+
+If the handler does expensive work on every event:
+
+```text
+typing
+→ task
+→ expensive work
+→ next input delayed
+```
+
+Debouncing, throttling, batching, and workers can improve responsiveness.
+
+### 12.13 Layout thrashing
+
+A script can repeatedly alternate DOM writes and layout reads, creating expensive browser work.
+
+The event loop is not the only performance concern.
+
+The browser may need to perform rendering-related calculations around JavaScript activity.
+
+### 12.14 Main-thread ownership
+
+The biggest browser responsiveness question often becomes:
+
+> What work is allowed to remain on the UI-facing execution agent?
+
+### 12.15 Abort and stale work
+
+A search box can create:
+
+```text
+request A
+request B
+request C
+```
+
+where A becomes stale before it completes.
+
+Event-loop correctness alone does not solve this.
+
+The application must use cancellation or result-versioning policies.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 Promise reaction queues more microtasks
+
+```js
+Promise.resolve().then(() => {
+  queueMicrotask(() => console.log("B"));
+  console.log("A");
+});
+```
+
+The newly queued microtask participates in the same broader microtask-draining behavior.
+
+### 13.2 Timer fires while JavaScript is busy
+
+The timer cannot interrupt currently executing JavaScript.
+
+It waits until the runtime can run the callback.
+
+### 13.3 Event arrives during a long task
+
+The event can wait for JavaScript availability.
+
+### 13.4 Multiple timers become eligible
+
+Their eventual execution order depends on host scheduling and timer/task rules; do not derive behavior solely from creation timestamp.
+
+### 13.5 Nested zero-delay timers
+
+Repeated:
+
+```js
+setTimeout(fn, 0);
+```
+
+can experience scheduling delays and browser-specific timer constraints.
+
+### 13.6 Microtask creates an infinite loop
+
+```js
+function loop() {
+  queueMicrotask(loop);
+}
+
+loop();
+```
+
+This can effectively prevent normal progress.
+
+### 13.7 `requestAnimationFrame` callback schedules microtask
+
+```js
+requestAnimationFrame(() => {
+  queueMicrotask(() => {
+    console.log("microtask");
+  });
+});
+```
+
+The callback's synchronous work and subsequent microtasks interact with the browser's update cycle. The exact rendering boundary should not be oversimplified.
+
+### 13.8 Animation frame missed
+
+If the main thread is blocked:
+
+```text
+frame opportunity arrives
+↓
+JavaScript still busy
+↓
+frame work delayed or skipped
+```
+
+### 13.9 Background tab throttling
+
+A hidden document may not receive scheduling behavior identical to a visible document.
+
+### 13.10 Modal/blocking browser APIs
+
+Some legacy browser APIs can have special behavior and should not be modeled purely with the ordinary non-blocking event-loop model.
+
+### 13.11 Event handler throws
+
+A thrown exception in a DOM event handler is not automatically equivalent to a promise rejection.
+
+Host error reporting and exception dispatch rules apply.
+
+### 13.12 Promise rejection
+
+A rejection belongs to the promise chain and has different propagation semantics from an uncaught exception in an ordinary event callback.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “There is one browser callback queue.”
+
+Too simplistic.
+
+Browsers have multiple sources and scheduling categories.
+
+### Misconception 2 — “The event loop is entirely part of ECMAScript.”
+
+No.
+
+It is a host environment mechanism.
+
+### Misconception 3 — “Promises execute before all browser work.”
+
+Not universally.
+
+Promise reactions have specific scheduling semantics, but browser work includes many other categories.
+
+### Misconception 4 — “`setTimeout(fn, 0)` means run immediately.”
+
+No.
+
+It means the callback is not eligible before the relevant timer delay and still depends on scheduling availability.
+
+### Misconception 5 — “Microtasks are always harmless because they are small.”
+
+A microtask can itself perform arbitrarily large work.
+
+### Misconception 6 — “The browser renders after every task.”
+
+Not as a universal guarantee.
+
+### Misconception 7 — “`requestAnimationFrame` is just `setTimeout` with better timing.”
+
+No.
+
+It is integrated with the rendering lifecycle.
+
+### Misconception 8 — “More async APIs automatically make a UI responsive.”
+
+No.
+
+Heavy work can still execute synchronously when a callback starts.
+
+### Misconception 9 — “The network request is running on the JavaScript thread while it waits.”
+
+The browser can perform network operations outside the immediate JS execution path.
+
+### Misconception 10 — “A worker just makes the same JavaScript thread faster.”
+
+A worker provides another execution agent; communication and data-transfer semantics also matter.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Long synchronous loops on the main thread
+
+### Mistake 2 — Recursive microtask scheduling
+
+### Mistake 3 — Using timers for animation
+
+### Mistake 4 — Doing heavy computation in input handlers
+
+### Mistake 5 — Assuming task-source ordering not guaranteed by the platform contract
+
+### Mistake 6 — Treating zero-delay timers as synchronization primitives
+
+### Mistake 7 — Using `requestIdleCallback` for user-visible critical work
+
+### Mistake 8 — Ignoring background-tab throttling
+
+### Mistake 9 — Assuming promise cancellation exists automatically
+
+### Mistake 10 — Starting stale asynchronous requests without cancellation/result validation
+
+### Mistake 11 — Doing huge synchronous DOM updates
+
+### Mistake 12 — Creating too many microtasks for trivial work
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Mechanism | Scheduling role | Best mental model |
+|---|---|---|
+| Synchronous JavaScript | Current task execution | Runs now |
+| Promise reaction | Microtask/job-style continuation | Run after current synchronous work |
+| `queueMicrotask` | Explicit microtask scheduling | Short deferred continuation |
+| `setTimeout` | Timer/task scheduling | Earliest eligible timer task |
+| `requestAnimationFrame` | Rendering-oriented callback | Work near a frame update |
+| `requestIdleCallback` | Low-priority opportunistic work | Work when browser is idle |
+| DOM event listener | Host event handling | Respond to browser event |
+| Worker | Separate execution agent | Move work off main agent |
+| `await` | Promise-based suspension | Resume later |
+| `MessageChannel` / posted message | Host task scheduling | Cross-context/task signaling |
+
+### Microtask vs task
+
+```text
+microtask:
+  short, high-priority continuation
+
+task:
+  broader unit of host work
+```
+
+Long microtasks are still bad.
+
+### Timer vs animation frame
+
+Use timers for:
+
+- delayed work;
+- polling where appropriate;
+- non-frame-aligned scheduling.
+
+Use animation frames for:
+
+- visual updates;
+- animation state changes;
+- work tied to rendering cadence.
+
+### Animation frame vs idle callback
+
+Animation frame:
+
+```text
+“this work belongs near the next visual update”
+```
+
+Idle callback:
+
+```text
+“this work can wait for spare capacity”
+```
+
+### Main-thread task vs worker work
+
+Main-thread:
+
+```text
+UI responsiveness directly affected
+```
+
+Worker:
+
+```text
+separate execution agent
++
+message/data transfer costs
+```
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 Long tasks
+
+The most direct browser event-loop performance problem is excessive synchronous work per task.
+
+Costs include:
+
+- input delay;
+- rendering delay;
+- animation jank;
+- timer delay;
+- poor responsiveness.
+
+### 17.2 Microtask overhead
+
+Thousands of tiny microtasks may be cheaper individually than one large synchronous task, but the aggregate scheduling overhead and starvation risk can still be significant.
+
+### 17.3 Yielding strategy
+
+Different workloads benefit from different strategies:
+
+```text
+timer yield
+animation-frame yield
+scheduler-priority APIs
+worker offload
+```
+
+Choose based on latency requirements.
+
+### 17.4 Batching
+
+Batching reduces:
+
+- callback overhead;
+- DOM update churn;
+- scheduling overhead;
+- repeated layout work.
+
+### 17.5 DOM interaction
+
+Browser rendering cost can dominate JavaScript cost.
+
+Measure:
+
+```text
+JS
++
+style
++
+layout
++
+paint
++
+compositing
+```
+
+when diagnosing UI performance.
+
+### 17.6 Worker overhead
+
+Moving work to a worker is not free.
+
+Consider:
+
+- startup;
+- serialization;
+- structured cloning;
+- transferable objects;
+- synchronization;
+- messaging latency.
+
+### 17.7 Timer throttling
+
+Timer-driven polling may become inefficient or inaccurate in hidden tabs.
+
+Prefer event-driven APIs where available.
+
+### 17.8 Energy efficiency
+
+Excessive wakeups and scheduling can consume battery on mobile devices.
+
+Good scheduling minimizes unnecessary work.
+
+---
+
+## 18. Memory Considerations
+
+### 18.1 Event listeners retain callbacks
+
+A listener can keep a closure and captured data alive.
+
+### 18.2 Timers retain closures
+
+A pending timer may retain:
+
+```text
+callback
+captured variables
+associated objects
+```
+
+until it is cleared or fires.
+
+### 18.3 Pending promises
+
+Promise reactions can retain application state across asynchronous boundaries.
+
+### 18.4 Microtask bursts
+
+Large queues can temporarily retain many closures and objects.
+
+### 18.5 Worker messages
+
+Large cloned payloads can increase memory pressure.
+
+Transferable objects can change the ownership/copying cost.
+
+### 18.6 Detached DOM state
+
+A listener or pending async operation can accidentally retain references to DOM-related objects longer than intended.
+
+### 18.7 Caching stale async work
+
+Old requests may retain:
+
+- response data;
+- request metadata;
+- UI closures.
+
+Cancellation or explicit invalidation helps.
+
+---
+
+## 19. Security Considerations
+
+### 19.1 Event-loop denial of service
+
+An attacker who can trigger expensive synchronous work can block a browser UI.
+
+### 19.2 Microtask flooding
+
+Unbounded scheduling can create availability and responsiveness problems.
+
+### 19.3 Input event abuse
+
+High-frequency handlers can become CPU-amplification vectors.
+
+### 19.4 Timer-based assumptions
+
+Security logic should not rely on exact timer timing.
+
+### 19.5 Race conditions
+
+Asynchronous operations may complete in an order different from initiation, creating stale-state vulnerabilities.
+
+### 19.6 Stale UI writes
+
+A slow request can return after a newer request and overwrite current state.
+
+### 19.7 Cross-context messaging
+
+Workers, iframes, and windows exchange data asynchronously.
+
+Validate message origin and payloads.
+
+### 19.8 Resource exhaustion
+
+Large async queues can consume memory and browser resources.
+
+---
+
+## 20. Production Usage
+
+### 20.1 Search/autocomplete
+
+Naive:
+
+```text
+keypress
+→ request
+→ response
+→ update UI
+```
+
+Better:
+
+```text
+keypress
+→ debounce
+→ request with AbortSignal
+→ ignore/cancel stale work
+→ update current state
+```
+
+### 20.2 Rendering loops
+
+Prefer:
+
+```js
+function render(timestamp) {
+  update(timestamp);
+  requestAnimationFrame(render);
+}
+
+requestAnimationFrame(render);
+```
+
+for frame-driven updates.
+
+### 20.3 Large data processing
+
+Use:
+
+```text
+chunking
++
+yielding
+```
+
+for moderate CPU work, or:
+
+```text
+worker
+```
+
+for substantial CPU-intensive computation.
+
+### 20.4 Background analytics
+
+Use lower-priority scheduling where appropriate.
+
+Do not let analytics block critical input or rendering.
+
+### 20.5 Infinite scrolling
+
+Combine:
+
+```text
+intersection/event
++
+network
++
+bounded concurrency
++
+cancellation
++
+render batching
+```
+
+### 20.6 File uploads
+
+Network activity is asynchronous, but progress UI still executes on the browser's JavaScript execution agent.
+
+Keep progress handlers lightweight.
+
+### 20.7 Data visualization
+
+Avoid drawing massive datasets in one synchronous task.
+
+Use:
+
+```text
+sampling
+chunking
+virtualization
+workers
+```
+
+where appropriate.
+
+### 20.8 Production observability
+
+Measure:
+
+- long-task duration;
+- input delay;
+- event-handler duration;
+- rendering/frame timing;
+- promise/rejection rates;
+- request latency;
+- concurrency;
+- task queue pressure where measurable.
+
+---
+
+## 21. Implementation From Scratch
+
+### Stage 1 — Guided event-loop simulator
+
+Create a simplified scheduler with:
+
+```js
+class BrowserLoopModel {
+  constructor() {
+    this.tasks = [];
+    this.microtasks = [];
+  }
+
+  queueTask(fn) {}
+  queueMicrotask(fn) {}
+  runOneTurn() {}
+}
+```
+
+Model:
+
+```text
+task
+→ synchronous execution
+→ microtask drain
+→ next scheduling decision
+```
+
+### Stage 2 — Partially Guided
+
+Add:
+
+- timer-like tasks;
+- promise-like reactions;
+- task labels;
+- execution timestamps;
+- long-task simulation.
+
+### Stage 3 — No Reference
+
+Build an experimental browser-scheduling simulator supporting:
+
+```text
+task queue
+microtask queue
+animation frame queue
+idle queue
+yielding
+```
+
+Do not claim it exactly models any real browser.
+
+Its purpose is mental-model validation.
+
+### Stage 4 — Edge-Case Hardened
+
+Simulate:
+
+- recursive microtasks;
+- multiple timers;
+- long tasks;
+- task bursts;
+- rendering opportunities;
+- worker messages;
+- cancellation.
+
+### Stage 5 — Production-Oriented Experiment Harness
+
+Build a browser page that records:
+
+```text
+timestamp
+source
+event
+duration
+queueing delay
+```
+
+Run controlled experiments using:
+
+- `Promise.then`;
+- `queueMicrotask`;
+- `setTimeout`;
+- `requestAnimationFrame`;
+- DOM events.
+
+Visualize timelines rather than relying on printed output alone.
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Ordering
+
+Predict:
+
+```js
+console.log("A");
+
+setTimeout(() => console.log("B"), 0);
+
+queueMicrotask(() => console.log("C"));
+
+Promise.resolve().then(() => console.log("D"));
+
+console.log("E");
+```
+
+Then verify in a browser.
+
+### Exercise 2 — Microtask starvation
+
+```js
+let count = 0;
+
+function loop() {
+  count++;
+
+  if (count < 100000) {
+    queueMicrotask(loop);
+  }
+}
+
+loop();
+
+setTimeout(() => {
+  console.log("timer");
+}, 0);
+```
+
+Measure how long the timer waits.
+
+### Exercise 3 — Long task
+
+Run a 500ms synchronous loop.
+
+Observe:
+
+- button responsiveness;
+- timer delay;
+- animation;
+- input latency.
+
+### Exercise 4 — Animation jank
+
+Create:
+
+```js
+requestAnimationFrame(render);
+```
+
+and introduce an expensive loop.
+
+Observe missed frames.
+
+### Exercise 5 — Stale request
+
+Create two searches:
+
+```text
+query A → slow
+query B → fast
+```
+
+Ensure B finishes first.
+
+Observe what happens if A updates the UI afterward.
+
+### Exercise 6 — Idle work
+
+Schedule a heavy background operation with `requestIdleCallback`.
+
+Observe behavior under:
+
+```text
+idle page
+busy page
+background tab
+```
+
+### Exercise 7 — Worker comparison
+
+Perform the same CPU-heavy calculation:
+
+```text
+main thread
+worker
+```
+
+Compare responsiveness.
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+searchInput.addEventListener("input", async event => {
+  const response = await fetch(
+    `/api/search?q=${encodeURIComponent(event.target.value)}`
+  );
+
+  const results = await response.json();
+
+  renderResults(results);
+});
+```
+
+Identify issues involving:
+
+- request frequency;
+- stale responses;
+- cancellation;
+- event-loop responsiveness;
+- error handling;
+- concurrency;
+- rendering cost;
+- race conditions;
+- accessibility;
+- memory;
+- lifecycle cleanup.
+
+Redesign for a production UI.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is the browser event loop?
+2. What is a task?
+3. What is a microtask?
+4. How do promise reactions relate to microtasks?
+5. Why does `setTimeout(..., 0)` not run immediately?
+6. Why does a long JavaScript task block user interaction?
+7. What is `requestAnimationFrame`?
+8. What is `requestIdleCallback`?
+9. Why is the browser event loop not part of ECMAScript itself?
+10. What happens after a JavaScript task completes?
+
+### Intermediate
+
+11. Compare task and microtask scheduling.
+12. Why can microtasks starve rendering?
+13. Why can timers be delayed?
+14. Why can two asynchronous operations finish in the opposite order from initiation?
+15. How does rendering interact with JavaScript execution?
+16. When should work move to a worker?
+17. Why are timers not suitable for exact real-time scheduling?
+18. How would you chunk heavy computation?
+19. How would you prevent stale async UI updates?
+20. What does `requestAnimationFrame` solve?
+
+### Advanced
+
+21. Explain task sources without reducing the browser to one FIFO queue.
+22. Explain the relationship between Jobs and browser microtasks.
+23. Explain why long microtask chains are harmful.
+24. Explain why a timer cannot interrupt running JavaScript.
+25. Explain the browser's responsibility for rendering.
+26. Explain background timer throttling at a conceptual level.
+27. Explain how workers alter the execution model.
+28. How would you diagnose input latency?
+29. How would you instrument long tasks?
+30. How would you design a responsive CPU-heavy UI?
+
+### Principal-Level
+
+31. Design a scheduling architecture for a data-heavy browser application.
+32. How would you balance responsiveness against throughput?
+33. When should work use microtasks, tasks, animation frames, idle callbacks, or workers?
+34. How would you prevent event-loop starvation in a large frontend?
+35. How would you design cancellation for stale UI requests?
+36. How would you identify whether a performance problem is JS, rendering, network, or scheduling?
+37. How would you design a browser task budget?
+38. How would you prevent background work from degrading foreground interaction?
+39. How would you reason about battery/energy impact?
+40. How would you defend a scheduling design when browser implementations differ?
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+console.log("1");
+
+setTimeout(() => console.log("2"), 0);
+
+Promise.resolve().then(() => console.log("3"));
+
+queueMicrotask(() => console.log("4"));
+
+console.log("5");
+```
+
+Typical result:
+
+```text
+1
+5
+3
+4
+2
+```
+
+### Exercise B
+
+```js
+setTimeout(() => console.log("A"), 0);
+
+Promise.resolve().then(() => {
+  console.log("B");
+  queueMicrotask(() => console.log("C"));
+});
+
+console.log("D");
+```
+
+Predict:
+
+```text
+D
+B
+C
+A
+```
+
+### Exercise C
+
+```js
+queueMicrotask(() => {
+  console.log("A");
+  queueMicrotask(() => console.log("B"));
+});
+
+queueMicrotask(() => {
+  console.log("C");
+});
+```
+
+Predict:
+
+```text
+A
+C
+B
+```
+
+### Exercise D
+
+```js
+setTimeout(() => console.log("A"), 0);
+
+setTimeout(() => console.log("B"), 0);
+
+Promise.resolve().then(() => console.log("C"));
+```
+
+What ordering can be relied upon, and which details depend on browser scheduling behavior?
+
+### Exercise E
+
+```js
+requestAnimationFrame(() => {
+  console.log("frame");
+
+  Promise.resolve().then(() => {
+    console.log("promise");
+  });
+});
+```
+
+Explain why the exact placement relative to rendering phases should not be reduced to a simplistic “promise always means before paint” rule.
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Browser timeline
+
+Build a timeline containing:
+
+```text
+task
+microtask
+timer
+rendering opportunity
+user input
+network completion
+```
+
+Annotate every transition.
+
+### Exercise 2 — Long-task refactor
+
+Take:
+
+```js
+for (const item of millionItems) {
+  expensive(item);
+}
+```
+
+Implement:
+
+```text
+synchronous
+chunked
+yielding
+worker-based
+```
+
+Compare responsiveness and throughput.
+
+### Exercise 3 — Search cancellation
+
+Implement a search box supporting:
+
+- debounce;
+- `AbortController`;
+- stale-result protection;
+- error handling;
+- cleanup.
+
+### Exercise 4 — Frame scheduler
+
+Build a simple scheduler that:
+
+```text
+batches visual updates
+runs once per frame
+coalesces redundant state
+```
+
+### Exercise 5 — Idle scheduler
+
+Build:
+
+```js
+scheduleIdleWork(task)
+```
+
+with fallback behavior when idle callbacks are unavailable.
+
+### Exercise 6 — Event-loop experiment harness
+
+Record:
+
+```text
+event
+timestamp
+source
+duration
+```
+
+for multiple browser scheduling primitives.
+
+Generate a timeline.
+
+### Exercise 7 — Principal diagnosis
+
+A dashboard feels slow.
+
+Evidence:
+
+```text
+network = 80ms
+API = 60ms
+render = 12ms
+main-thread task = 400ms
+```
+
+Explain why reducing network latency may not improve perceived responsiveness much.
+
+---
+
+## 27. Key Takeaways
+
+1. The browser event loop is a host/runtime scheduling model around JavaScript execution.
+2. ECMAScript Jobs are not the entire browser event loop.
+3. Browsers coordinate timers, events, networking, rendering, and JavaScript through richer scheduling machinery.
+4. A synchronous JavaScript task runs without arbitrary interruption.
+5. Long tasks block responsiveness on the affected execution agent.
+6. Promise reactions and `queueMicrotask` use the microtask/job-style deferred execution mechanism.
+7. Microtasks normally run before later task work proceeds, but microtasks can themselves become a starvation source.
+8. `setTimeout(..., 0)` is not immediate execution.
+9. Timer expiration and callback execution are different events.
+10. Rendering is a separate browser concern and does not happen after every JavaScript statement.
+11. `requestAnimationFrame` is oriented toward rendering updates.
+12. `requestIdleCallback` is intended for lower-priority opportunistic work.
+13. Workers provide separate execution agents for moving suitable CPU-heavy work away from the page's primary agent.
+14. Browser task-source behavior should not be reduced to one simplistic FIFO queue.
+15. Background tabs and browser policies can change scheduling behavior.
+16. Event-loop correctness must be combined with cancellation, resource ownership, and performance engineering.
+17. Responsive UI requires control over synchronous task duration.
+18. The central performance principle is:
+
+> Keep critical browser execution opportunities available by limiting long synchronous work, controlling microtask volume, yielding intentionally, and moving suitable CPU-heavy work to other execution agents.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 29 — Errors / Error Handling
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+
+### Builds Toward
+
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 40 — Observables / Reactive
+- Chapter 49 — DOM Architecture
+- Chapter 50 — Browser Events
+- Chapter 51 — Browser APIs
+- Chapter 52 — Web Workers / Concurrency
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 56 — Browser Security
+- Chapter 70 — Source Maps / Production Debugging
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 103 — Vanilla Browser App
+- Chapter 104 — Production HTTP Client
+- Chapter 106 — Real-time WebSocket
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- ECMAScript Jobs
+- Promise reactions
+- Microtasks
+- Tasks
+- Task sources
+- Event loop
+- Rendering
+- Long tasks
+- Input latency
+- Timers
+- `requestAnimationFrame`
+- `requestIdleCallback`
+- Workers
+- Cancellation
+- Debouncing
+- Throttling
+- Batching
+- Backpressure
+- Scheduling fairness
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- execution contexts;
+- promise reactions;
+- async functions;
+- error propagation;
+- resource lifetime;
+- concurrency.
+
+### Why This Chapter Matters Later
+
+The browser is where abstract JavaScript scheduling becomes user-visible.
+
+A misunderstanding here becomes:
+
+```text
+slow input
+janky animation
+stale UI
+request races
+battery drain
+memory growth
+poor Core Web Vitals
+```
+
+The key transition is:
+
+```text
+Chapter 31:
+“Asynchronous JavaScript can continue later.”
+
+Chapter 32:
+“Promise reactions become Jobs.”
+
+Chapter 33:
+“The browser must integrate those semantics with timers,
+events, rendering, networking, and user interaction.”
+```
+
+The central principle is:
+
+> The browser event loop is a coordination system for time, work, and responsiveness.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 33 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Explain the browser event loop.
+- [ ] Distinguish ECMAScript Jobs from browser tasks.
+- [ ] Explain microtasks.
+- [ ] Explain task sources.
+- [ ] Explain rendering opportunities.
+- [ ] Explain timer eligibility.
+- [ ] Explain `requestAnimationFrame`.
+- [ ] Explain `requestIdleCallback`.
+- [ ] Explain long tasks.
+- [ ] Explain worker execution agents.
+
+### Predictive Mastery
+
+- [ ] Predict synchronous/timer/promise ordering.
+- [ ] Predict multiple microtask ordering.
+- [ ] Predict recursively scheduled microtask behavior.
+- [ ] Predict timer delay under a long task.
+- [ ] Reason about input delay.
+- [ ] Reason about rendering delay.
+- [ ] Reason about worker/main-thread boundaries.
+
+### Implementation
+
+- [ ] Build a simplified event-loop simulator.
+- [ ] Build a long-task experiment.
+- [ ] Build a yielding/chunking strategy.
+- [ ] Build a request-cancellation UI workflow.
+- [ ] Build a frame-oriented scheduler.
+- [ ] Build a browser scheduling experiment harness.
+
+### Debugging
+
+- [ ] Diagnose long tasks.
+- [ ] Diagnose microtask starvation.
+- [ ] Diagnose timer delays.
+- [ ] Diagnose stale asynchronous UI updates.
+- [ ] Diagnose event-handler bottlenecks.
+- [ ] Diagnose rendering versus JavaScript bottlenecks.
+- [ ] Diagnose scheduling assumptions that do not hold.
+
+### Production Engineering
+
+- [ ] Design responsive event handlers.
+- [ ] Design bounded background work.
+- [ ] Design cancellation for stale operations.
+- [ ] Choose suitable scheduling primitives.
+- [ ] Choose when to use workers.
+- [ ] Instrument main-thread responsiveness.
+- [ ] Account for background-tab behavior.
+- [ ] Account for energy and memory costs.
+
+### Interview Readiness
+
+- [ ] Explain browser event-loop scheduling without oversimplification.
+- [ ] Distinguish Jobs from browser tasks.
+- [ ] Explain why microtasks can starve rendering.
+- [ ] Explain long-task impact.
+- [ ] Explain timer semantics.
+- [ ] Explain animation-frame scheduling.
+- [ ] Design a responsive browser application.
+- [ ] Defend scheduling choices under real workload constraints.
+
+### Track A — Core Theory
+
+- [ ] Understand browser host scheduling.
+- [ ] Understand microtask checkpoints.
+- [ ] Understand task sources.
+- [ ] Understand rendering coordination.
+- [ ] Understand main-thread responsiveness.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production experiment harness reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed browser timeline exercises.
+- [ ] Completed performance debugging.
+- [ ] Completed code review.
+- [ ] Defended scheduling architecture decisions.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 33 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What is the browser event loop?
+2. How is it different from ECMAScript Jobs?
+3. What is a task?
+4. What is a microtask?
+5. Why do promise reactions generally run before a later timer task?
+6. Why can microtasks starve rendering?
+7. Why can timers be delayed?
+8. Why does a long JavaScript task block user interaction?
+9. What is a rendering opportunity?
+10. What is `requestAnimationFrame` for?
+11. What is `requestIdleCallback` for?
+12. Why are workers useful for CPU-heavy work?
+13. Why are timers poor real-time scheduling primitives?
+14. How does a background tab change scheduling assumptions?
+15. How would you diagnose a 400ms input delay?
+16. How would you redesign a UI that performs expensive work on every input event?
+17. How would you prevent stale network responses from overwriting current UI state?
+18. How would you choose among microtask, task, animation frame, idle callback, and worker?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit ECMAScript Job vs browser task
+- [ ] Revisit microtask checkpoints
+- [ ] Revisit long-task diagnosis
+- [ ] Revisit rendering coordination
+- [ ] Revisit worker boundaries
+- [ ] Revisit stale async request handling
+- [ ] Revisit scheduling-priority trade-offs
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 33 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. ECMAScript specification — Jobs, promise reaction behavior, async functions, and language-level scheduling hooks.
+2. WHATWG HTML Standard / browser platform standards — event-loop processing models, tasks, microtasks, rendering integration, timers, event dispatch, and browser scheduling semantics.
+3. MDN/browser documentation — developer-facing behavior and practical API guidance.
+4. Browser engine documentation / performance tooling — implementation details, diagnostics, throttling, and engine-specific observations.
+5. Application architecture documentation — scheduling policy, yielding, worker usage, cancellation, responsiveness, and performance budgets.
+
+Always label claims as:
+
+```text
+ECMAScript semantic
+browser/web-platform requirement
+browser implementation detail
+application scheduling policy
+```
+
+Do not claim that a browser event-loop diagram is the complete ECMAScript model.
+
+Do not assume that all browsers expose identical internal queues or priorities when the web-platform contract does not require such identity.
+
+---
+
+# Chapter 33 — Completion Snapshot
+
+```text
+Chapter: 33
+Title: Browser Event Loop
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 34 — Node.js Event Loop and libuv
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain the Node.js event loop as a host/runtime mechanism.
+- Distinguish ECMAScript Jobs and promise reactions from Node.js scheduling mechanisms.
+- Explain the role of libuv in Node.js asynchronous I/O.
+- Describe the major conceptual Node.js event-loop phases.
+- Explain how timers, pending callbacks, poll, check, and close-callback work fit into the Node runtime model.
+- Distinguish `process.nextTick()` from promise microtasks and from ordinary event-loop phases.
+- Explain why `process.nextTick()` can starve I/O when recursively abused.
+- Explain the relationship between Node's JavaScript execution environment and libuv's operating-system integration.
+- Explain why some operations use the OS/kernel directly while others may use libuv's worker pool.
+- Distinguish I/O concurrency from CPU parallelism.
+- Explain why filesystem and some other APIs can consume libuv worker-pool capacity.
+- Explain the role of the libuv thread pool without claiming that every asynchronous Node API uses it.
+- Predict ordering among synchronous code, `process.nextTick`, promise reactions, timers, `setImmediate`, I/O callbacks, and close callbacks in controlled examples.
+- Explain why exact ordering can depend on the surrounding runtime state and should not be inferred from a simplistic universal queue diagram.
+- Understand the importance of the phase context surrounding a timer or `setImmediate`.
+- Explain why `setImmediate()` can be especially useful for yielding from I/O-oriented callbacks.
+- Understand how Node scheduling changed across runtime versions and why precise claims should be tied to the supported Node version.
+- Diagnose event-loop lag and blocking caused by CPU-heavy JavaScript.
+- Distinguish event-loop lag from downstream latency, worker-pool saturation, and external-service delay.
+- Understand the monitoring concepts used to diagnose event-loop health.
+- Explain graceful shutdown and how pending async work interacts with process lifecycle.
+- Design bounded concurrency in a Node.js service.
+- Recognize common Node-specific async anti-patterns.
+- Debug event-loop ordering and performance using Node diagnostic tools.
+- Build simplified educational models of the event loop and a bounded worker pool.
+- Evaluate architecture using latency, throughput, memory, CPU, resource ownership, observability, shutdown behavior, and reliability.
+- Defend Node.js asynchronous architecture at senior/principal level.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+## 2. Prerequisites
+
+The learner should understand:
+
+- JavaScript execution contexts and call stacks.
+- Functions and control flow.
+- Promises and promise reactions.
+- ECMAScript Jobs.
+- Browser event-loop fundamentals.
+- Async/await.
+- Errors and resource cleanup.
+- Basic Node.js concepts.
+
+Primary dependencies:
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+
+Later chapters build on this chapter:
+
+- Chapter 58 — Node Architecture
+- Chapter 59 — Node Core APIs
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+
+---
+
+## 3. What Is It?
+
+The Node.js event loop is the runtime scheduling mechanism that allows Node applications to coordinate JavaScript execution with asynchronous operations without blocking the main JavaScript execution path for every I/O wait.
+
+A simplified model is:
+
+```text
+Node.js process
+      │
+      ├── JavaScript execution
+      │
+      ├── ECMAScript promise/job machinery
+      │
+      ├── Node-specific scheduling
+      │
+      └── libuv / OS facilities
+               │
+               ├── network
+               ├── timers
+               ├── filesystem
+               ├── DNS-related work
+               └── worker pool where applicable
+```
+
+Node uses V8 for JavaScript execution and libuv for a major part of its cross-platform asynchronous I/O and event-loop infrastructure.
+
+The Node event loop is therefore not simply:
+
+```text
+“JavaScript event loop”
+```
+
+and it is not simply:
+
+```text
+“libuv”
+```
+
+It is a layered runtime:
+
+```text
+ECMAScript
+   +
+V8
+   +
+Node.js runtime
+   +
+libuv
+   +
+operating system
+   +
+external resources
+```
+
+The key question is:
+
+> How does Node keep one JavaScript execution path productive while external operations continue elsewhere?
+
+---
+
+## 4. Why Does It Exist?
+
+Node was designed around asynchronous I/O.
+
+A server may handle:
+
+```text
+thousands of sockets
+many network requests
+filesystem activity
+timers
+child processes
+DNS
+streaming
+```
+
+If JavaScript synchronously waited for every external operation:
+
+```text
+request
+  ↓
+wait for network
+  ↓
+resume
+```
+
+the process would waste the JavaScript execution path during I/O waits.
+
+Instead:
+
+```text
+start operation
+      ↓
+continue JavaScript
+      ↓
+external system progresses
+      ↓
+completion becomes available
+      ↓
+Node schedules callback/continuation
+      ↓
+JavaScript handles completion
+```
+
+Node's architecture therefore makes asynchronous I/O a central design pattern.
+
+However:
+
+> Node's event loop does not make CPU-heavy JavaScript non-blocking.
+
+This remains one of the most important Node performance truths.
+
+---
+
+## 5. Mental Model
+
+Start with a layered model:
+
+```text
+                 Node.js
+                    │
+         ┌──────────┴──────────┐
+         │                     │
+    JavaScript              libuv/OS
+      execution                │
+         │                async resources
+         │                     │
+         └──────────┬──────────┘
+                    ▼
+             completion/event
+                    │
+                    ▼
+             Node scheduling
+                    │
+                    ▼
+             JavaScript callback
+```
+
+Then introduce the conceptual phases:
+
+```text
+timers
+  ↓
+pending callbacks
+  ↓
+idle / prepare
+  ↓
+poll
+  ↓
+check
+  ↓
+close callbacks
+  ↓
+next iteration
+```
+
+This is a useful model, not a license to assume every callback always runs exactly where the diagram suggests.
+
+Another important layer is:
+
+```text
+process.nextTick
+promise microtasks
+```
+
+which interact with JavaScript execution around callback boundaries.
+
+A practical mental model:
+
+```text
+run JavaScript callback
+   ↓
+process Node/JS deferred work according to runtime semantics
+   ↓
+continue event-loop progression
+   ↓
+poll / check / timers / close work
+```
+
+The exact ordering requires context.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Node's event loop is host/runtime behavior
+
+It is not defined by ECMAScript alone.
+
+### Rule 2 — Promises still follow ECMAScript semantics
+
+Node does not replace the language-level promise model.
+
+### Rule 3 — `process.nextTick()` is Node-specific
+
+It has different scheduling behavior from ordinary promise reactions and event-loop phases.
+
+### Rule 4 — Promise microtasks and `process.nextTick()` must not be treated as one queue
+
+They have distinct semantics and priority behavior in Node.
+
+### Rule 5 — `setImmediate()` is Node-specific
+
+It schedules work for the check phase.
+
+### Rule 6 — Timers are not exact deadlines
+
+A timer becomes eligible after its threshold and is subject to runtime scheduling.
+
+### Rule 7 — The poll phase is central to I/O-oriented Node applications
+
+It is where Node can process many I/O-related callbacks and may wait for I/O when appropriate.
+
+### Rule 8 — The worker pool is not the same thing as the event loop
+
+Some Node operations are delegated to libuv's worker pool.
+
+The event loop remains the JavaScript-side coordinator.
+
+### Rule 9 — CPU-heavy JavaScript blocks the event loop
+
+```js
+while (true) {}
+```
+
+still prevents normal progress on that JavaScript execution path.
+
+### Rule 10 — Worker-pool work can saturate independently
+
+Even if the event loop is responsive, excessive worker-pool usage can create latency.
+
+### Rule 11 — `process.nextTick()` can starve the event loop
+
+Recursive use can prevent timers and I/O callbacks from getting opportunities to run.
+
+### Rule 12 — `setImmediate()` does not always run before timers
+
+Relative ordering depends on when the calls are made and the runtime state.
+
+### Rule 13 — Exact examples should identify their starting context
+
+For example:
+
+```text
+top-level module
+timer callback
+I/O callback
+close callback
+```
+
+can produce different ordering.
+
+### Rule 14 — Event-loop responsiveness is a resource
+
+Treat event-loop time like a budget.
+
+### Rule 15 — Shutdown is part of async design
+
+A production process must define what happens to:
+
+- active sockets;
+- timers;
+- pending requests;
+- worker-pool work;
+- streams;
+- child processes.
+
+---
+
+## 7. Syntax
+
+### Timer
+
+```js
+setTimeout(() => {
+  console.log("timer");
+}, 0);
+```
+
+### Immediate
+
+```js
+setImmediate(() => {
+  console.log("immediate");
+});
+```
+
+### Node next tick
+
+```js
+process.nextTick(() => {
+  console.log("nextTick");
+});
+```
+
+### Promise reaction
+
+```js
+Promise.resolve().then(() => {
+  console.log("promise");
+});
+```
+
+### File-system example
+
+```js
+import { readFile } from "node:fs";
+
+readFile("data.txt", "utf8", (error, data) => {
+  if (error) {
+    throw error;
+  }
+
+  console.log(data);
+});
+```
+
+### Async/await
+
+```js
+import { readFile } from "node:fs/promises";
+
+async function load() {
+  const data = await readFile("data.txt", "utf8");
+  return data;
+}
+```
+
+### Event listener
+
+```js
+server.on("request", (req, res) => {
+  res.end("ok");
+});
+```
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Synchronous baseline
+
+```js
+console.log("A");
+console.log("B");
+console.log("C");
+```
+
+Output:
+
+```text
+A
+B
+C
+```
+
+### Example 2 — `process.nextTick`
+
+```js
+console.log("A");
+
+process.nextTick(() => {
+  console.log("B");
+});
+
+console.log("C");
+```
+
+Typical output:
+
+```text
+A
+C
+B
+```
+
+### Example 3 — Promise reaction
+
+```js
+console.log("A");
+
+Promise.resolve().then(() => {
+  console.log("B");
+});
+
+console.log("C");
+```
+
+Output:
+
+```text
+A
+C
+B
+```
+
+### Example 4 — `setImmediate`
+
+```js
+console.log("A");
+
+setImmediate(() => {
+  console.log("B");
+});
+
+console.log("C");
+```
+
+Output:
+
+```text
+A
+C
+B
+```
+
+The important detail is not the output itself but the scheduling boundary.
+
+### Example 5 — Timer
+
+```js
+console.log("A");
+
+setTimeout(() => {
+  console.log("B");
+}, 0);
+
+console.log("C");
+```
+
+Typical result:
+
+```text
+A
+C
+B
+```
+
+### Example 6 — Timer and immediate
+
+At top level:
+
+```js
+setTimeout(() => console.log("timer"), 0);
+setImmediate(() => console.log("immediate"));
+```
+
+Do not blindly assume one order.
+
+The relative order can depend on the surrounding runtime state and the current event-loop context.
+
+### Example 7 — I/O callback context
+
+```js
+import { readFile } from "node:fs";
+
+readFile(__filename, () => {
+  setTimeout(() => console.log("timer"), 0);
+  setImmediate(() => console.log("immediate"));
+});
+```
+
+In an I/O callback context, `setImmediate()` commonly runs before the newly scheduled timer.
+
+The context matters.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+console.log("1");
+
+process.nextTick(() => {
+  console.log("2");
+});
+
+Promise.resolve().then(() => {
+  console.log("3");
+});
+
+setImmediate(() => {
+  console.log("4");
+});
+
+setTimeout(() => {
+  console.log("5");
+}, 0);
+
+console.log("6");
+```
+
+### Step 1
+
+Top-level JavaScript executes synchronously:
+
+```text
+1
+6
+```
+
+### Step 2
+
+Node processes its next-tick work.
+
+The `process.nextTick` callback runs:
+
+```text
+2
+```
+
+### Step 3
+
+Promise reaction work runs:
+
+```text
+3
+```
+
+The exact integration details should be understood as Node runtime behavior layered on ECMAScript promise jobs.
+
+### Step 4
+
+The event loop advances toward timer/check work.
+
+Both:
+
+```text
+setTimeout
+setImmediate
+```
+
+are now candidates, but their exact order from top-level code should not be treated as universally fixed.
+
+### Step 5
+
+The final two values may therefore be:
+
+```text
+4
+5
+```
+
+or:
+
+```text
+5
+4
+```
+
+depending on runtime timing/context.
+
+This is an important lesson:
+
+> Reliable Node async reasoning requires knowing the scheduling context, not just the API names.
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 V8
+
+V8 executes JavaScript.
+
+It supplies:
+
+- JavaScript execution;
+- garbage collection;
+- language-level promise machinery;
+- microtask infrastructure;
+- JIT compilation and runtime support.
+
+### 10.2 Node.js
+
+Node adds:
+
+- filesystem APIs;
+- networking APIs;
+- timers;
+- streams;
+- process APIs;
+- worker threads;
+- child processes;
+- integration with libuv.
+
+### 10.3 libuv
+
+libuv is a cross-platform asynchronous I/O library.
+
+Conceptually it provides:
+
+```text
+event loop
+I/O watchers
+timers
+worker pool
+OS integration
+handles/requests
+```
+
+It abstracts significant platform differences across:
+
+```text
+Linux
+macOS
+Windows
+other supported environments
+```
+
+### 10.4 Event-loop phases
+
+A useful conceptual phase model:
+
+#### Timers
+
+Handles timer-related callbacks whose thresholds have become eligible.
+
+#### Pending callbacks
+
+Handles certain deferred system-level callbacks.
+
+#### Idle / prepare
+
+Internal libuv bookkeeping.
+
+Application developers usually interact with this indirectly.
+
+#### Poll
+
+The event loop processes I/O-related events and may wait for I/O when appropriate.
+
+#### Check
+
+This is where `setImmediate()` callbacks run.
+
+#### Close callbacks
+
+Handles callbacks associated with closing certain resources.
+
+### 10.5 Phase model is not the whole story
+
+Modern Node versions have runtime-specific behavior around timers, microtasks, and phase transitions.
+
+Do not memorize a diagram as if it were an exact implementation trace for every version.
+
+### 10.6 libuv worker pool
+
+Some blocking-oriented operations can be delegated to libuv's worker pool instead of blocking the event loop directly.
+
+Typical examples may include portions of:
+
+- filesystem work;
+- DNS operations;
+- crypto-related operations;
+- compression-related work.
+
+The exact API behavior must be checked against Node documentation.
+
+### 10.7 Event loop versus worker pool
+
+Think:
+
+```text
+Event loop
+→ coordinates callbacks and I/O readiness
+
+Worker pool
+→ performs selected potentially blocking operations
+```
+
+The two are complementary.
+
+### 10.8 OS I/O
+
+Not every async operation requires a worker-pool thread.
+
+Network I/O can often be integrated with OS readiness/completion mechanisms.
+
+This is why:
+
+```text
+“Node uses a thread for every async operation”
+```
+
+is incorrect.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+This chapter is Node-host-specific.
+
+### 11.1 ECMAScript layer
+
+ECMAScript defines:
+
+- promises;
+- async functions;
+- promise reactions;
+- Jobs;
+- language-level microtask/job behavior.
+
+### 11.2 Node host layer
+
+Node defines and exposes:
+
+- `process.nextTick`;
+- `setImmediate`;
+- timers;
+- stream callbacks;
+- filesystem integration;
+- networking;
+- process lifecycle;
+- libuv integration.
+
+### 11.3 Node is not the ECMAScript specification
+
+The language specification does not define:
+
+```js
+process.nextTick()
+```
+
+nor:
+
+```js
+setImmediate()
+```
+
+### 11.4 `process.nextTick()`
+
+`process.nextTick()` is a Node-specific mechanism that runs callbacks after the current operation completes, before the event loop continues through normal phases.
+
+It has historically been a common source of confusion because developers sometimes describe it simply as:
+
+```text
+a microtask
+```
+
+A more precise production explanation is:
+
+> `process.nextTick()` is Node-specific scheduling behavior with priority semantics distinct from ordinary promise reactions and libuv event-loop phases.
+
+### 11.5 Promise microtasks
+
+Node also runs promise reaction jobs according to ECMAScript semantics.
+
+Node integrates V8/ECMAScript microtask processing into its runtime.
+
+### 11.6 `setImmediate()`
+
+`setImmediate()` is a Node API associated with the check phase.
+
+### 11.7 Timers
+
+`setTimeout()` and `setInterval()` are Node host APIs.
+
+Their scheduling is subject to runtime timing behavior and should not be treated as precise deadlines.
+
+### 11.8 Version-specific behavior
+
+Node's event-loop implementation can evolve.
+
+Therefore:
+
+```text
+Node version
++
+platform
++
+context
+```
+
+can matter for exact low-level behavior.
+
+Always verify precise claims against the Node version being deployed.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 `process.nextTick()` versus promise reactions
+
+Consider:
+
+```js
+process.nextTick(() => console.log("nextTick"));
+
+Promise.resolve().then(() => console.log("promise"));
+```
+
+In Node, `process.nextTick()` callbacks are processed with higher priority than ordinary promise microtasks in the relevant scheduling context.
+
+Typical output:
+
+```text
+nextTick
+promise
+```
+
+This is one of the most important Node-specific distinctions.
+
+### 12.2 Next-tick starvation
+
+Danger:
+
+```js
+function loop() {
+  process.nextTick(loop);
+}
+
+loop();
+```
+
+This can prevent the event loop from progressing normally.
+
+Potential impact:
+
+```text
+timers delayed
+I/O delayed
+setImmediate delayed
+server responsiveness degraded
+```
+
+### 12.3 Promise starvation
+
+Similarly:
+
+```js
+function loop() {
+  Promise.resolve().then(loop);
+}
+
+loop();
+```
+
+can continuously produce promise reactions.
+
+The practical effect is runtime-specific but the design problem is the same:
+
+```text
+deferred work continuously consumes execution time
+```
+
+### 12.4 `setImmediate()` after I/O
+
+Within an I/O callback:
+
+```js
+setImmediate(fn);
+setTimeout(fn2, 0);
+```
+
+`setImmediate()` is commonly favored when the intention is:
+
+```text
+run after current I/O cycle
+```
+
+The relative ordering here differs from top-level scheduling scenarios.
+
+### 12.5 Timer versus immediate from top-level
+
+The ordering:
+
+```js
+setTimeout(..., 0);
+setImmediate(...);
+```
+
+from the initial script should not be used as a deterministic synchronization primitive.
+
+### 12.6 Event-loop blocking
+
+Example:
+
+```js
+app.get("/slow", (req, res) => {
+  const start = Date.now();
+
+  while (Date.now() - start < 1000) {
+    // block
+  }
+
+  res.end("done");
+});
+```
+
+During the loop, other JavaScript callbacks are delayed.
+
+A server with one blocked event loop can therefore exhibit:
+
+```text
+global latency spike
+```
+
+even for requests unrelated to the slow endpoint.
+
+### 12.7 Event-loop utilization
+
+Production systems need to measure how much time is spent executing JavaScript versus waiting.
+
+Event-loop utilization/lag metrics can reveal:
+
+```text
+CPU saturation
+synchronous blocking
+poor batching
+hot loops
+```
+
+### 12.8 Worker-pool saturation
+
+Suppose many expensive filesystem operations occupy the worker pool.
+
+Then:
+
+```text
+event loop responsive
++
+worker pool saturated
+=
+I/O API latency increases
+```
+
+This is an important diagnosis:
+
+> Not every Node latency problem is event-loop blocking.
+
+### 12.9 CPU-bound work
+
+For CPU-intensive workloads, consider:
+
+- optimization;
+- chunking;
+- worker threads;
+- child processes;
+- native modules;
+- WebAssembly;
+- external job workers.
+
+### 12.10 Worker threads
+
+A worker thread provides another JavaScript execution environment.
+
+This changes the architecture:
+
+```text
+main thread
+   ↕ messages
+worker thread
+```
+
+It should not be confused with the libuv worker pool.
+
+### 12.11 Child processes
+
+A child process provides process-level isolation and a separate runtime.
+
+Useful when:
+
+- isolation matters;
+- workloads are heavy;
+- process-level failure boundaries are desirable.
+
+### 12.12 Streams
+
+Node streams interact strongly with the event loop.
+
+Backpressure helps prevent:
+
+```text
+producer too fast
+→ memory growth
+```
+
+### 12.13 Async resource lifetime
+
+A socket, file descriptor, stream, or timer can keep a process alive.
+
+This connects event-loop scheduling with resource management from Chapter 30.
+
+### 12.14 Event-loop liveness
+
+A Node process can remain alive because active handles/requests still exist.
+
+Shutdown therefore requires understanding:
+
+```text
+what work remains
+what resources remain
+what callbacks remain
+```
+
+### 12.15 Graceful shutdown
+
+A production server should coordinate:
+
+```text
+stop accepting new work
+↓
+finish / cancel in-flight work
+↓
+close resources
+↓
+drain streams
+↓
+close workers
+↓
+exit
+```
+
+### 12.16 AsyncLocalStorage / context propagation
+
+Node-specific context APIs depend on asynchronous resource relationships.
+
+Later Chapter 63 covers this deeply.
+
+### 12.17 DNS and thread-pool behavior
+
+Different DNS APIs can use different mechanisms.
+
+Never generalize:
+
+```text
+DNS = always worker pool
+```
+
+or:
+
+```text
+DNS = always OS async network
+```
+
+without specifying the API and platform.
+
+### 12.18 Crypto and compression
+
+Some CPU-heavy operations may be offloaded or expose worker-based execution patterns.
+
+The API documentation and implementation determine the details.
+
+### 12.19 libuv pool sizing
+
+The worker pool has bounded capacity.
+
+Increasing its size can improve throughput for some workloads but can also:
+
+- increase CPU contention;
+- increase memory;
+- compete with application workers;
+- hide architectural bottlenecks.
+
+Do not increase pool size blindly.
+
+### 12.20 Event-loop fairness
+
+A callback that runs for:
+
+```text
+500ms
+```
+
+may be logically correct and still be operationally harmful.
+
+The runtime executes callback code cooperatively; applications are responsible for keeping critical callback work bounded.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 `process.nextTick()` recursion
+
+```js
+process.nextTick(function loop() {
+  process.nextTick(loop);
+});
+```
+
+This can prevent ordinary event-loop progress.
+
+### 13.2 Promise recursion
+
+```js
+queueMicrotask(function loop() {
+  queueMicrotask(loop);
+});
+```
+
+can similarly monopolize deferred execution.
+
+### 13.3 Timer ordering ambiguity
+
+Top-level:
+
+```js
+setTimeout(fn, 0);
+setImmediate(fn2);
+```
+
+should not be used to infer a universal order.
+
+### 13.4 I/O context changes ordering
+
+Inside an I/O callback, `setImmediate()` commonly has different relative behavior.
+
+### 13.5 Long callback
+
+A callback may delay:
+
+- timers;
+- I/O;
+- other callbacks;
+- shutdown.
+
+### 13.6 Worker-pool saturation
+
+A seemingly asynchronous API can become slow because all worker threads are occupied.
+
+### 13.7 Too many filesystem operations
+
+A batch can create worker-pool contention.
+
+### 13.8 Large synchronous JSON processing
+
+```js
+JSON.parse(hugeString);
+```
+
+is synchronous CPU work and can block the event loop.
+
+Chapter 28 provides the serialization background; Chapter 85 expands the performance implications.
+
+### 13.9 Large regular expressions
+
+Catastrophic regex behavior can block Node's JavaScript execution path.
+
+### 13.10 Synchronous Node APIs
+
+Examples such as:
+
+```js
+readFileSync()
+```
+
+can intentionally block.
+
+This may be reasonable during startup but dangerous in request handlers.
+
+### 13.11 Async API does not mean cheap
+
+An async call can still:
+
+- allocate heavily;
+- perform large serialization;
+- trigger expensive callbacks;
+- saturate a downstream dependency.
+
+### 13.12 Process exit while work is pending
+
+Not all outstanding work is guaranteed to complete merely because a promise exists.
+
+Process lifecycle determines whether the runtime remains alive.
+
+### 13.13 Unref-ed handles
+
+Some Node handles can be configured not to keep the process alive.
+
+This is a powerful lifecycle feature that requires careful reasoning.
+
+### 13.14 Exceptions in callbacks
+
+An uncaught exception in an ordinary Node callback has process-level implications.
+
+Promise rejection has a different propagation path.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “Node is single-threaded.”
+
+Incomplete.
+
+A primary JavaScript execution path is serialized, but Node can use:
+
+- OS facilities;
+- libuv worker threads;
+- worker threads;
+- child processes.
+
+### Misconception 2 — “Every async API uses the libuv thread pool.”
+
+False.
+
+Many network operations integrate with OS-level I/O mechanisms.
+
+### Misconception 3 — “The thread pool is the event loop.”
+
+No.
+
+They are different parts of the runtime architecture.
+
+### Misconception 4 — “`process.nextTick()` is the same as a promise microtask.”
+
+Not precisely.
+
+It has distinct Node-specific semantics and priority.
+
+### Misconception 5 — “`setImmediate()` always runs before `setTimeout(0)`.”
+
+No.
+
+Context matters.
+
+### Misconception 6 — “Async/await means Node does not block.”
+
+CPU work after `await` can still block.
+
+### Misconception 7 — “Promises run on worker threads.”
+
+No.
+
+Promise reactions execute in JavaScript execution contexts.
+
+### Misconception 8 — “More worker-pool threads always improve performance.”
+
+No.
+
+The workload may be CPU-limited, I/O-limited, or dependency-limited.
+
+### Misconception 9 — “If event-loop lag is low, the application is healthy.”
+
+Not necessarily.
+
+Worker-pool saturation, network latency, memory pressure, database contention, and downstream throttling can still dominate.
+
+### Misconception 10 — “A timer keeps a precise schedule.”
+
+No.
+
+Node timers are scheduling mechanisms, not real-time guarantees.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — CPU-heavy work in request handlers
+
+### Mistake 2 — Recursive `process.nextTick()`
+
+### Mistake 3 — Recursive promise/microtask scheduling
+
+### Mistake 4 — Unbounded filesystem or crypto operations
+
+### Mistake 5 — Assuming top-level timer/immediate ordering
+
+### Mistake 6 — Treating `setImmediate()` as a universal zero-cost yield
+
+### Mistake 7 — Increasing `UV_THREADPOOL_SIZE` without measurement
+
+### Mistake 8 — Using synchronous APIs on hot request paths
+
+### Mistake 9 — Ignoring worker-pool saturation
+
+### Mistake 10 — Ignoring graceful shutdown
+
+### Mistake 11 — Starting detached async work without ownership
+
+### Mistake 12 — Ignoring backpressure in streams
+
+### Mistake 13 — Logging huge objects from every callback
+
+### Mistake 14 — Assuming an async API automatically prevents event-loop blocking
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Mechanism | Layer | Primary role |
+|---|---|---|
+| ECMAScript Job | ECMAScript | Deferred language-level work |
+| Promise reaction | ECMAScript/V8 | Promise continuation |
+| `process.nextTick()` | Node | High-priority Node continuation |
+| `setImmediate()` | Node/libuv | Check-phase callback |
+| `setTimeout()` | Node/libuv | Timer scheduling |
+| Event loop | Node/libuv/host | Coordinate runtime work |
+| Poll phase | libuv | Process I/O-related activity |
+| Check phase | libuv | Run immediates |
+| Worker pool | libuv | Execute selected blocking operations off loop |
+| Worker thread | Node/V8 | Separate JavaScript execution environment |
+| Child process | OS/Node | Separate process/runtime |
+| Stream | Node | Incremental async data flow |
+| `readFileSync()` | Node | Synchronous blocking filesystem operation |
+
+### Event loop vs worker pool
+
+```text
+event loop:
+coordinate
+
+worker pool:
+execute selected offloaded operations
+```
+
+### `process.nextTick()` vs promise reaction
+
+Both defer work relative to current synchronous execution, but Node gives `nextTick` distinct priority semantics.
+
+### `setImmediate()` vs `setTimeout(0)`
+
+Both schedule future work.
+
+Their relative execution order depends on context.
+
+### Worker thread vs libuv worker pool
+
+Worker thread:
+
+```text
+developer-controlled JavaScript execution environment
+```
+
+libuv worker pool:
+
+```text
+runtime-managed offload mechanism for selected operations
+```
+
+### Event loop vs operating system
+
+The event loop is a runtime scheduling abstraction.
+
+The OS provides lower-level I/O and threading primitives.
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 Event-loop latency
+
+One long synchronous callback can affect every request sharing the event loop.
+
+### 17.2 Throughput versus fairness
+
+A callback processing 100,000 items may have high throughput but poor responsiveness.
+
+Consider chunking:
+
+```text
+process batch
+→ yield
+→ process next batch
+```
+
+### 17.3 Worker-pool utilization
+
+Measure:
+
+```text
+queueing
+active work
+completion
+```
+
+before changing pool size.
+
+### 17.4 Network concurrency
+
+Unlimited concurrent requests can overload:
+
+- remote services;
+- local sockets;
+- memory;
+- connection pools.
+
+### 17.5 Serialization cost
+
+Large:
+
+```js
+JSON.stringify()
+JSON.parse()
+```
+
+operations are synchronous.
+
+### 17.6 Garbage collection
+
+Allocations from asynchronous workloads can create GC pressure.
+
+Event-loop latency can increase when GC or allocation-heavy code consumes CPU.
+
+### 17.7 Logging
+
+Large logs from high-frequency callbacks can become a surprising performance bottleneck.
+
+### 17.8 Worker threads
+
+Worker threads can improve CPU isolation but introduce:
+
+- messaging cost;
+- data-copy/transfer cost;
+- coordination complexity.
+
+### 17.9 Backpressure
+
+Streams and queues should prevent producers from overwhelming consumers.
+
+### 17.10 Batching
+
+Batching can reduce:
+
+- callback overhead;
+- syscall overhead;
+- promise creation;
+- network round trips.
+
+### 17.11 Latency decomposition
+
+A production Node latency model should separate:
+
+```text
+event-loop delay
++
+worker-pool queueing
++
+CPU work
++
+network latency
++
+database latency
++
+queueing
++
+serialization
+```
+
+Otherwise the wrong bottleneck may be optimized.
+
+---
+
+## 18. Memory Considerations
+
+### 18.1 Pending promises
+
+Promise chains can retain closures and context.
+
+### 18.2 Timers
+
+Pending timers retain callbacks and captured state.
+
+### 18.3 Event listeners
+
+Listeners can retain application objects.
+
+### 18.4 Unbounded queues
+
+A queue is a data structure with memory consequences.
+
+```text
+producer > consumer
+```
+
+means memory may grow continuously.
+
+### 18.5 Worker-pool backlog
+
+Even if each task is small, a large pending backlog can retain input data.
+
+### 18.6 Large buffers
+
+Node's binary workloads can allocate substantial `Buffer` memory outside ordinary object patterns.
+
+Chapter 27 provides the binary-memory foundation.
+
+### 18.7 Streams
+
+Ignoring backpressure can cause buffers to accumulate.
+
+### 18.8 Detached tasks
+
+A forgotten async operation can retain:
+
+- closures;
+- resources;
+- buffers;
+- request state.
+
+### 18.9 Graceful shutdown
+
+A shutdown that waits forever for retained work is itself a lifecycle bug.
+
+---
+
+## 19. Security Considerations
+
+### 19.1 Event-loop denial of service
+
+Attackers can exploit expensive synchronous handlers.
+
+Examples:
+
+- pathological regex;
+- huge JSON parsing;
+- computationally expensive validation.
+
+### 19.2 Worker-pool exhaustion
+
+Attackers may trigger operations that consume finite worker resources.
+
+### 19.3 Connection exhaustion
+
+Unbounded network concurrency can consume all available sockets.
+
+### 19.4 File-descriptor exhaustion
+
+Resource leaks can prevent new connections/files from being opened.
+
+### 19.5 Async race conditions
+
+Security checks can be invalidated across `await` boundaries.
+
+### 19.6 Graceful shutdown attacks
+
+Poor shutdown handling can leave partially completed operations or inconsistent state.
+
+### 19.7 Message boundaries
+
+Worker threads and child processes require validation of messages.
+
+### 19.8 Error disclosure
+
+Node stack traces and filesystem paths can reveal infrastructure details.
+
+### 19.9 Supply-chain risk
+
+Third-party packages can register background timers, event listeners, or async work that unexpectedly keeps a process alive.
+
+---
+
+## 20. Production Usage
+
+### 20.1 HTTP server
+
+Typical architecture:
+
+```text
+socket
+  ↓
+request callback
+  ↓
+service
+  ↓
+database/network
+  ↓
+response
+```
+
+The request callback should avoid long synchronous CPU work.
+
+### 20.2 API fan-out
+
+If a request calls independent services:
+
+```js
+const [a, b, c] = await Promise.all([
+  fetchA(),
+  fetchB(),
+  fetchC()
+]);
+```
+
+Use bounded concurrency when the fan-out can grow.
+
+### 20.3 Filesystem workloads
+
+Large file processing should consider:
+
+- stream APIs;
+- worker-pool pressure;
+- file descriptor limits;
+- backpressure.
+
+### 20.4 CPU-heavy work
+
+Use:
+
+```text
+algorithm optimization
+→ chunking if feasible
+→ worker threads / processes
+→ external job queue
+```
+
+based on workload requirements.
+
+### 20.5 Graceful shutdown
+
+A service should handle:
+
+```text
+SIGTERM
+↓
+stop accepting new traffic
+↓
+drain current requests
+↓
+close database
+↓
+close server
+↓
+finish/abort owned work
+↓
+exit
+```
+
+### 20.6 Background jobs
+
+Do not let request-bound event loops silently own long-running background jobs.
+
+Use explicit queues or workers when appropriate.
+
+### 20.7 Streams
+
+Use backpressure.
+
+A readable source should not blindly flood a writable destination.
+
+### 20.8 Observability
+
+Monitor:
+
+- event-loop delay;
+- event-loop utilization;
+- process CPU;
+- memory;
+- worker-pool saturation where measurable;
+- active handles;
+- request latency;
+- throughput;
+- queue depth;
+- error rates.
+
+### 20.9 Deployment
+
+Always record:
+
+```text
+Node version
+OS
+CPU count
+worker-pool configuration
+runtime flags
+```
+
+because low-level behavior and performance depend on deployment context.
+
+---
+
+## 21. Implementation From Scratch
+
+### Stage 1 — Guided event-loop model
+
+Implement:
+
+```js
+class NodeLoopModel {
+  constructor() {
+    this.timers = [];
+    this.poll = [];
+    this.check = [];
+  }
+
+  addTimer(task) {}
+  addPoll(task) {}
+  addImmediate(task) {}
+  runTurn() {}
+}
+```
+
+Model:
+
+```text
+timers
+→ pending
+→ poll
+→ check
+→ close
+```
+
+This is educational, not an exact Node implementation.
+
+### Stage 2 — Partially Guided
+
+Add:
+
+- `process.nextTick` queue;
+- promise microtask queue;
+- labeled callbacks;
+- phase tracking;
+- timestamps.
+
+### Stage 3 — No Reference
+
+Build a scheduler simulator that can answer:
+
+```text
+Where did this callback come from?
+Why is it running now?
+What work was ahead of it?
+What queue/phase owns it?
+```
+
+### Stage 4 — Edge-Case Hardened
+
+Simulate:
+
+- recursive nextTick;
+- recursive microtasks;
+- timer/immediate races;
+- I/O callbacks;
+- long callback durations;
+- worker-pool queueing;
+- shutdown.
+
+### Stage 5 — Production Experiment Harness
+
+Build a real Node diagnostic program that records:
+
+```text
+timestamp
+phase/context
+callback source
+duration
+event-loop delay
+```
+
+Run controlled experiments with:
+
+- `process.nextTick`;
+- promise reactions;
+- `queueMicrotask`;
+- timers;
+- `setImmediate`;
+- filesystem I/O;
+- network I/O.
+
+Compare observed behavior across supported Node versions.
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Priority ordering
+
+Predict:
+
+```js
+console.log("A");
+
+process.nextTick(() => console.log("B"));
+
+Promise.resolve().then(() => console.log("C"));
+
+setImmediate(() => console.log("D"));
+
+setTimeout(() => console.log("E"), 0);
+
+console.log("F");
+```
+
+Then run it.
+
+Explain which parts are guaranteed and which are context-dependent.
+
+### Exercise 2 — nextTick starvation
+
+```js
+let count = 0;
+
+function spin() {
+  count++;
+
+  if (count < 100000) {
+    process.nextTick(spin);
+  }
+}
+
+spin();
+
+setTimeout(() => {
+  console.log("timer");
+}, 0);
+```
+
+Measure timer delay.
+
+### Exercise 3 — Promise starvation
+
+Repeat using:
+
+```js
+Promise.resolve().then(spin);
+```
+
+Compare behavior.
+
+### Exercise 4 — I/O ordering
+
+Inside `readFile`:
+
+```js
+setTimeout(() => console.log("timer"), 0);
+setImmediate(() => console.log("immediate"));
+```
+
+Repeat several times and explain the observed behavior.
+
+### Exercise 5 — Event-loop blocking
+
+Create:
+
+```text
+HTTP server
++
+one endpoint with 1 second CPU loop
+```
+
+Send concurrent requests.
+
+Measure how one request affects unrelated requests.
+
+### Exercise 6 — Worker pool
+
+Create many filesystem or other worker-pool tasks.
+
+Measure:
+
+```text
+latency
+queueing
+CPU
+```
+
+Then vary worker-pool settings carefully.
+
+### Exercise 7 — Graceful shutdown
+
+Start:
+
+```text
+HTTP server
+database connection
+background timer
+in-flight request
+```
+
+Send termination.
+
+Observe which resources keep the process alive.
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+import http from "node:http";
+
+const server = http.createServer(async (req, res) => {
+  if (req.url === "/process") {
+    const rows = await loadRows();
+
+    for (const row of rows) {
+      expensiveTransformation(row);
+    }
+
+    res.end("done");
+  }
+});
+
+server.listen(3000);
+```
+
+Identify issues involving:
+
+- event-loop blocking;
+- large input;
+- concurrency;
+- cancellation;
+- backpressure;
+- memory;
+- request timeout;
+- graceful shutdown;
+- observability;
+- worker-thread suitability.
+
+Redesign for production.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is the Node.js event loop?
+2. What is libuv?
+3. What are the major event-loop phases?
+4. What is `process.nextTick()`?
+5. What is `setImmediate()`?
+6. How does `setImmediate()` differ from `setTimeout(0)`?
+7. What is the libuv worker pool?
+8. Does every async Node API use the worker pool?
+9. Why can CPU-heavy JavaScript block Node?
+10. What is the poll phase?
+
+### Intermediate
+
+11. Compare `process.nextTick()` and promise microtasks.
+12. Why can `process.nextTick()` starve the event loop?
+13. Why can promise microtasks also create starvation?
+14. Why can top-level timer/immediate ordering vary?
+15. Why does I/O context change timer/immediate ordering?
+16. What work happens in the check phase?
+17. Why are timers not exact deadlines?
+18. What is event-loop lag?
+19. What is worker-pool saturation?
+20. How does graceful shutdown interact with the event loop?
+
+### Advanced
+
+21. Explain Node's runtime layers: V8, Node, libuv, OS.
+22. Explain event loop vs worker pool.
+23. Explain how network I/O differs from worker-pool operations.
+24. Explain why `async/await` does not make CPU-heavy work non-blocking.
+25. Explain how streams and backpressure interact with the event loop.
+26. Explain how pending handles keep a Node process alive.
+27. Explain the impact of synchronous APIs in request handlers.
+28. How would you diagnose a latency spike with low downstream latency?
+29. How would you detect worker-pool saturation?
+30. How would you choose between worker threads and child processes?
+
+### Principal-Level
+
+31. Design a high-throughput Node API server.
+32. Define the event-loop latency budget for a production service.
+33. How would you prevent one tenant from monopolizing the event loop?
+34. How would you distinguish event-loop blocking from worker-pool saturation?
+35. How would you design bounded concurrency for external APIs?
+36. How would you design graceful shutdown for a large Node service?
+37. How would you decide whether CPU work belongs in the main process, worker thread, or external queue?
+38. How would you tune worker-pool capacity based on evidence?
+39. How would you instrument event-loop health?
+40. How would you reason about Node runtime-version differences in production?
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+console.log("1");
+
+process.nextTick(() => console.log("2"));
+
+Promise.resolve().then(() => console.log("3"));
+
+console.log("4");
+```
+
+Typical output:
+
+```text
+1
+4
+2
+3
+```
+
+### Exercise B
+
+```js
+setImmediate(() => console.log("A"));
+
+setTimeout(() => console.log("B"), 0);
+```
+
+Question:
+
+Why should the result not be treated as universally fixed from top-level execution?
+
+### Exercise C
+
+```js
+import fs from "node:fs";
+
+fs.readFile(__filename, () => {
+  setImmediate(() => console.log("A"));
+  setTimeout(() => console.log("B"), 0);
+});
+```
+
+What ordering is commonly observed, and why is the callback context important?
+
+### Exercise D
+
+```js
+process.nextTick(() => {
+  console.log("A");
+
+  Promise.resolve().then(() => {
+    console.log("B");
+  });
+});
+
+Promise.resolve().then(() => {
+  console.log("C");
+});
+```
+
+Predict the likely ordering and explain the interaction.
+
+### Exercise E
+
+```js
+setImmediate(() => {
+  console.log("A");
+
+  process.nextTick(() => console.log("B"));
+  Promise.resolve().then(() => console.log("C"));
+});
+
+console.log("D");
+```
+
+Explain why `B` and `C` are not simply “another event-loop phase.”
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Event-loop simulator
+
+Implement a simplified Node loop with:
+
+```text
+nextTick
+microtask
+timers
+poll
+check
+close
+```
+
+Then use test cases to validate your model.
+
+### Exercise 2 — Event-loop latency monitor
+
+Build:
+
+```js
+monitorEventLoop()
+```
+
+that measures delay between expected and actual scheduling points.
+
+### Exercise 3 — Worker-pool experiment
+
+Create a benchmark that compares:
+
+```text
+small worker-pool workload
+large worker-pool workload
+```
+
+Measure:
+
+- throughput;
+- latency;
+- CPU;
+- queueing.
+
+### Exercise 4 — CPU isolation
+
+Build the same expensive computation using:
+
+```text
+main thread
+worker thread
+child process
+```
+
+Compare:
+
+- latency;
+- CPU;
+- memory;
+- communication cost;
+- failure isolation.
+
+### Exercise 5 — Bounded async HTTP fan-out
+
+Implement:
+
+```js
+mapWithConcurrency(items, limit, fetcher)
+```
+
+and expose runtime metrics.
+
+### Exercise 6 — Graceful shutdown coordinator
+
+Implement:
+
+```js
+class ShutdownManager {
+  register(name, closeFn) {}
+  async shutdown() {}
+}
+```
+
+Requirements:
+
+- stop accepting new work;
+- wait for critical operations;
+- enforce shutdown timeout;
+- clean up resources;
+- report failures.
+
+### Exercise 7 — Production diagnosis
+
+Given:
+
+```text
+P95 request latency: 1.2s
+event-loop delay: 15ms
+database latency: 100ms
+worker-pool queueing: 800ms
+```
+
+Explain why blaming the event loop would be incorrect.
+
+---
+
+## 27. Key Takeaways
+
+1. Node's event loop is a host/runtime mechanism, not an ECMAScript feature.
+2. Node combines V8, Node runtime code, libuv, operating-system facilities, and external resources.
+3. ECMAScript promise semantics remain in force inside Node.
+4. `process.nextTick()` is Node-specific and has distinct priority semantics.
+5. Promise reactions are distinct from `process.nextTick()` callbacks.
+6. `setImmediate()` is associated with the check phase.
+7. `setTimeout(0)` is a timer scheduling request, not an immediate-execution guarantee.
+8. Timer/immediate ordering depends on context.
+9. I/O callbacks can create scheduling situations where `setImmediate()` is favored over a newly scheduled zero-delay timer.
+10. The poll phase is central to many I/O-driven Node workloads.
+11. The libuv worker pool handles selected operations that would otherwise block progress.
+12. Not every async API uses the worker pool.
+13. Network I/O and worker-pool work should be modeled differently.
+14. CPU-heavy JavaScript still blocks the event loop.
+15. Event-loop health and worker-pool health are distinct dimensions.
+16. Streams require backpressure to prevent uncontrolled memory growth.
+17. Pending handles and requests affect process liveness.
+18. Graceful shutdown is part of asynchronous architecture, not an afterthought.
+19. Event-loop latency must be diagnosed separately from dependency latency, worker-pool queueing, memory pressure, and CPU saturation.
+20. The central Node principle is:
+
+> Keep the JavaScript execution path responsive, use the runtime's asynchronous facilities deliberately, and measure which layer is actually limiting the system before changing the architecture.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+
+### Builds Toward
+
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 58 — Node Architecture
+- Chapter 59 — Node Core APIs
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 67 — Dependency Management / Supply Chain
+- Chapter 70 — Source Maps / Production Debugging
+- Chapter 78 — Production JS Architecture
+- Chapter 82 — API Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 105 — Node REST API
+- Chapter 106 — Real-time WebSocket
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- V8
+- libuv
+- Event loop
+- Event-loop phases
+- `process.nextTick`
+- Promise microtasks
+- Timers
+- `setImmediate`
+- Polling
+- Worker pool
+- Worker threads
+- Child processes
+- I/O readiness
+- Streams
+- Backpressure
+- Event-loop delay
+- Event-loop utilization
+- Graceful shutdown
+- Active handles
+- Concurrency limits
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- ECMAScript Jobs;
+- promise reactions;
+- async functions;
+- resource lifetime;
+- errors;
+- browser scheduling;
+- concurrency.
+
+### Why This Chapter Matters Later
+
+Browser and Node event loops solve similar classes of problems in different host environments.
+
+The learner should now be able to compare:
+
+```text
+Browser
+  → user interaction
+  → rendering
+  → browser tasks
+  → microtasks
+  → workers
+
+Node
+  → network/server activity
+  → libuv phases
+  → timers
+  → poll
+  → check
+  → worker pool
+  → process lifecycle
+```
+
+This distinction becomes essential for backend engineering.
+
+The central principle is:
+
+> JavaScript semantics are shared; host scheduling architecture is not.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 34 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Explain Node's event loop.
+- [ ] Explain libuv.
+- [ ] Explain V8's role.
+- [ ] Explain Node's event-loop phases.
+- [ ] Explain `process.nextTick()`.
+- [ ] Explain promise microtasks.
+- [ ] Explain `setImmediate()`.
+- [ ] Explain timers.
+- [ ] Explain the worker pool.
+- [ ] Explain event loop vs worker pool.
+- [ ] Explain Node vs ECMAScript boundaries.
+
+### Predictive Mastery
+
+- [ ] Predict synchronous/nextTick/promise ordering.
+- [ ] Reason about timer/immediate ordering.
+- [ ] Reason about I/O callback ordering.
+- [ ] Predict starvation from recursive nextTick.
+- [ ] Predict starvation from recursive promise scheduling.
+- [ ] Reason about worker-pool saturation.
+- [ ] Reason about process liveness.
+
+### Implementation
+
+- [ ] Build an event-loop simulator.
+- [ ] Build event-loop delay monitoring.
+- [ ] Build bounded async concurrency.
+- [ ] Build worker-thread/process comparisons.
+- [ ] Build a shutdown manager.
+- [ ] Build a Node scheduling experiment harness.
+
+### Debugging
+
+- [ ] Diagnose event-loop blocking.
+- [ ] Diagnose nextTick starvation.
+- [ ] Diagnose promise microtask starvation.
+- [ ] Diagnose timer/immediate ordering assumptions.
+- [ ] Diagnose worker-pool saturation.
+- [ ] Diagnose resource-lifetime problems.
+- [ ] Diagnose shutdown hangs.
+- [ ] Separate event-loop latency from dependency latency.
+
+### Production Engineering
+
+- [ ] Set an event-loop latency budget.
+- [ ] Design bounded concurrency.
+- [ ] Design backpressure.
+- [ ] Design worker-pool usage.
+- [ ] Choose worker threads vs child processes vs external queues.
+- [ ] Design graceful shutdown.
+- [ ] Instrument event-loop health.
+- [ ] Account for Node version/platform differences.
+
+### Interview Readiness
+
+- [ ] Explain Node's architecture layers.
+- [ ] Explain event-loop phases.
+- [ ] Explain nextTick vs promise microtasks.
+- [ ] Explain timer vs immediate ordering.
+- [ ] Explain libuv worker pool.
+- [ ] Diagnose event-loop lag.
+- [ ] Design high-throughput Node scheduling.
+- [ ] Defend runtime architecture choices.
+
+### Track A — Core Theory
+
+- [ ] Understand V8/Node/libuv layering.
+- [ ] Understand event-loop phases.
+- [ ] Understand Node-specific scheduling.
+- [ ] Understand worker-pool architecture.
+- [ ] Understand process liveness.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production diagnostic experiments reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed event-loop diagnosis.
+- [ ] Completed code review.
+- [ ] Completed worker-pool analysis.
+- [ ] Completed graceful-shutdown design.
+- [ ] Defended performance diagnosis from evidence.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 34 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What is the Node.js event loop?
+2. What is libuv?
+3. What is V8 responsible for?
+4. What are the conceptual event-loop phases?
+5. What is the poll phase?
+6. What is the check phase?
+7. What does `setImmediate()` schedule?
+8. Why is `process.nextTick()` different from a promise reaction?
+9. Why can recursive `process.nextTick()` starve I/O?
+10. Why can promise microtasks also starve the runtime?
+11. When can `setImmediate()` run before `setTimeout(0)`?
+12. What is the libuv worker pool?
+13. Which classes of operations may use the worker pool?
+14. Why doesn't every async API use the worker pool?
+15. How is a worker thread different from the libuv pool?
+16. How can CPU-heavy JavaScript affect unrelated requests?
+17. What is event-loop delay?
+18. What is worker-pool saturation?
+19. How can a Node process remain alive?
+20. How would you design graceful shutdown?
+21. How would you diagnose a latency spike when event-loop delay is low?
+22. When should CPU work move to workers or an external queue?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit Node vs ECMAScript layers
+- [ ] Revisit event-loop phases
+- [ ] Revisit nextTick vs promise microtasks
+- [ ] Revisit timer vs immediate context
+- [ ] Revisit worker pool
+- [ ] Revisit event-loop blocking
+- [ ] Revisit graceful shutdown
+- [ ] Revisit event-loop diagnostics
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 34 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. ECMAScript specification — promises, Jobs, async functions, completion semantics, and language-level scheduling.
+2. Node.js official documentation — event loop, timers, `process.nextTick`, `setImmediate`, worker threads, process lifecycle, diagnostics, and Node API semantics.
+3. libuv documentation/source — event-loop architecture, phases, worker pool, handles, requests, and operating-system integration.
+4. V8 documentation — JavaScript execution, microtasks, garbage collection, and engine behavior.
+5. Operating-system documentation — readiness/completion APIs and platform-specific I/O/threading behavior.
+6. Application architecture documentation — concurrency limits, shutdown, observability, backpressure, worker selection, and operational policy.
+
+For precise behavior, record:
+
+```text
+Node version
+OS/platform
+API used
+execution context
+```
+
+Distinguish:
+
+```text
+ECMAScript semantic
+Node runtime semantic
+libuv implementation detail
+OS behavior
+application policy
+```
+
+Do not present a simplified event-loop diagram as the exact execution algorithm for all Node versions.
+
+Do not assume top-level `setImmediate()` vs `setTimeout(0)` ordering is a stable synchronization contract.
+
+Do not treat `process.nextTick()` as simply another name for a promise microtask.
+
+---
+
+# Chapter 34 — Completion Snapshot
+
+```text
+Chapter: 34
+Title: Node.js Event Loop and libuv
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 35 — Promises
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain what a JavaScript Promise is and what problem it solves.
+- Distinguish promise state from promise result and from promise settlement.
+- Distinguish resolving a promise from fulfilling or rejecting it.
+- Explain the `pending`, `fulfilled`, and `rejected` states.
+- Explain the promise resolution procedure.
+- Explain why a promise can be resolved while remaining pending.
+- Explain thenable assimilation.
+- Explain why a promise settles only once.
+- Explain the executor function and precisely when it runs.
+- Explain `resolve` and `reject` behavior.
+- Explain `.then()`, `.catch()`, and `.finally()`.
+- Explain that promise methods return new promises rather than mutating the original result chain.
+- Explain promise chaining as a transformation pipeline.
+- Explain fulfillment propagation and rejection propagation.
+- Explain how returned values become downstream fulfillment values.
+- Explain how thrown exceptions become downstream rejections.
+- Explain how returned promises and thenables are adopted.
+- Explain the semantic difference between `Promise.resolve(value)` and simply storing `value`.
+- Explain `Promise.reject(reason)`.
+- Explain `Promise.all()`, `Promise.allSettled()`, `Promise.race()`, and `Promise.any()`.
+- Explain the different failure and completion contracts of the promise combinators.
+- Understand why `Promise.all()` does not cancel its remaining operations after one rejection.
+- Understand why `Promise.race()` does not cancel losing operations.
+- Understand `AggregateError` in relation to `Promise.any()`.
+- Explain `Promise.withResolvers()` and when it is useful.
+- Explain promise subclassing and constructor/species considerations at a conceptual level.
+- Explain common promise anti-patterns.
+- Diagnose unhandled and accidentally detached rejections.
+- Reason about promise concurrency, memory retention, queueing, and cancellation.
+- Implement promise-like abstractions for learning.
+- Implement safe concurrency combinators.
+- Test promise behavior deterministically.
+- Design production promise APIs with explicit completion, failure, ownership, and cancellation contracts.
+- Debug complex promise chains without relying on timing intuition.
+- Compare promises with callbacks and explicit result objects.
+- Explain promises precisely at ECMAScript specification level.
+- Defend promise architecture decisions at senior/principal level.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+## 2. Prerequisites
+
+The learner should understand:
+
+- Values and types.
+- Functions and lexical scope.
+- Objects and classes.
+- Errors and abrupt completion.
+- Async fundamentals.
+- ECMAScript Jobs and Promise Reaction Jobs.
+- Browser event-loop fundamentals.
+- Node event-loop fundamentals.
+- Resource management and cleanup.
+
+Primary dependencies:
+
+- Chapter 09 — Functions / First-Class Behavior
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 18 — Classes / OOP
+- Chapter 20 — Symbols / Well-Known Symbols
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+
+Later chapters deepen this topic through:
+
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 84 — Reliability
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+
+---
+
+## 3. What Is It?
+
+A **Promise** is a JavaScript object representing the eventual outcome of an asynchronous or deferred computation.
+
+A promise has one of three states:
+
+```text
+pending
+fulfilled
+rejected
+```
+
+Once it becomes fulfilled or rejected, it is **settled**.
+
+```text
+pending
+  │
+  ├── fulfill(value) ──→ fulfilled
+  │
+  └── reject(reason) ──→ rejected
+```
+
+The core idea is:
+
+```text
+“Here is an object representing a future result.”
+```
+
+This allows asynchronous operations to be composed.
+
+Instead of callback nesting:
+
+```js
+getUser(id, (error, user) => {
+  if (error) {
+    // ...
+    return;
+  }
+
+  getProfile(user, (error, profile) => {
+    // ...
+  });
+});
+```
+
+promise composition can express:
+
+```js
+getUser(id)
+  .then(user => getProfile(user))
+  .then(profile => {
+    // ...
+  })
+  .catch(error => {
+    // ...
+  });
+```
+
+A promise provides:
+
+- eventual success/failure;
+- compositional chaining;
+- standardized reaction behavior;
+- error propagation;
+- multiple consumers;
+- concurrency combinators.
+
+But a Promise is **not**:
+
+- a thread;
+- a scheduler by itself;
+- cancellation;
+- a network request;
+- guaranteed parallel execution;
+- a guarantee that underlying work has even started.
+
+The underlying operation and the promise representing its result are separate concepts.
+
+---
+
+## 4. Why Does It Exist?
+
+Callback APIs become difficult to compose as systems become deeper.
+
+Typical problems include:
+
+```text
+nested control flow
+error propagation duplication
+multiple callback invocation
+unclear ownership
+difficult composition
+manual result forwarding
+```
+
+Promises introduce a normalized abstraction:
+
+```text
+operation
+   ↓
+Promise
+   ↓
+reaction
+   ↓
+new Promise
+   ↓
+reaction
+   ↓
+...
+```
+
+This enables:
+
+```js
+const user = await getUser(id);
+```
+
+and:
+
+```js
+Promise.all([
+  fetchProfile(),
+  fetchPermissions(),
+  fetchSettings()
+]);
+```
+
+The deeper design goal is not merely avoiding callback nesting.
+
+It is:
+
+> Represent asynchronous completion as a composable value-like abstraction.
+
+This enables higher-level reasoning about:
+
+- dependencies;
+- sequencing;
+- concurrency;
+- errors;
+- cleanup;
+- cancellation;
+- aggregation.
+
+---
+
+## 5. Mental Model
+
+Think of a Promise as a small state machine plus a reaction graph.
+
+```text
+                    ┌─────────────┐
+                    │   pending   │
+                    └──────┬──────┘
+                           │
+                  ┌────────┴────────┐
+                  │                 │
+                  ▼                 ▼
+             fulfilled          rejected
+                value              reason
+                  │                 │
+                  └───────┬─────────┘
+                          ▼
+                    reactions
+                          │
+                          ▼
+                  downstream promises
+```
+
+For:
+
+```js
+const q = p.then(onFulfilled, onRejected);
+```
+
+think:
+
+```text
+p
+│
+├── reaction
+│      ├── onFulfilled
+│      ├── onRejected
+│      └── capability for q
+│
+└── q
+```
+
+The downstream promise `q` depends on the reaction's eventual completion.
+
+A second important model:
+
+```text
+resolve(value)
+```
+
+does **not** always mean:
+
+```text
+fulfilled with value
+```
+
+If `value` is a promise/thenable, the promise can become **resolved to follow that value** while still being pending.
+
+Therefore:
+
+```text
+resolved
+```
+
+and:
+
+```text
+settled
+```
+
+are not synonyms.
+
+This distinction is one of the most important promise concepts.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — A promise has one settlement
+
+After fulfillment or rejection:
+
+```text
+future resolve/reject attempts do not replace the settled result
+```
+
+### Rule 2 — A promise can be resolved before it is fulfilled
+
+Example:
+
+```js
+new Promise(resolve => {
+  resolve(new Promise(resolveInner => {
+    setTimeout(() => resolveInner("done"), 100);
+  }));
+});
+```
+
+The outer promise follows the inner promise.
+
+It is resolved to that promise but remains pending until the inner promise settles.
+
+### Rule 3 — The executor runs synchronously
+
+```js
+new Promise(() => {
+  console.log("runs now");
+});
+```
+
+The executor is called during construction.
+
+### Rule 4 — Promise reactions run asynchronously
+
+```js
+Promise.resolve().then(() => {
+  console.log("later");
+});
+```
+
+The reaction is scheduled rather than called inline.
+
+### Rule 5 — `.then()` creates a new promise
+
+```js
+const q = p.then(handler);
+```
+
+`q` is distinct from `p`.
+
+### Rule 6 — Returning a normal value fulfills the downstream promise
+
+```js
+p.then(() => 42);
+```
+
+The returned promise eventually fulfills with `42`.
+
+### Rule 7 — Throwing in a handler rejects the downstream promise
+
+```js
+p.then(() => {
+  throw error;
+});
+```
+
+### Rule 8 — Returning a promise adopts its outcome
+
+```js
+p.then(() => otherPromise);
+```
+
+### Rule 9 — Missing handlers propagate the original outcome
+
+Conceptually:
+
+```js
+p.then()
+```
+
+passes fulfillment/rejection onward.
+
+### Rule 10 — `.catch(onRejected)` is rejection handling through promise chaining
+
+Conceptually:
+
+```js
+p.catch(onRejected)
+```
+
+is equivalent to:
+
+```js
+p.then(undefined, onRejected)
+```
+
+### Rule 11 — `.finally()` is outcome-transparent when it succeeds
+
+```js
+p.finally(cleanup)
+```
+
+normally preserves the original fulfillment/rejection.
+
+If cleanup throws or rejects, the resulting promise rejects instead.
+
+### Rule 12 — `Promise.all()` fails fast on the first observed rejection
+
+The returned promise rejects when an input rejects.
+
+Remaining input operations continue unless separately cancelled.
+
+### Rule 13 — `Promise.allSettled()` waits for every input to settle
+
+It gives a result record for each input.
+
+### Rule 14 — `Promise.race()` settles from the first input settlement
+
+It may fulfill or reject depending on which settles first.
+
+It does not cancel the losers.
+
+### Rule 15 — `Promise.any()` fulfills from the first successful fulfillment
+
+It rejects only when all inputs reject, using `AggregateError`.
+
+### Rule 16 — Combinators consume iterables
+
+The input need not literally be an array.
+
+### Rule 17 — Non-promise values are normalized
+
+Combinators and promise resolution can adopt ordinary values as completed inputs.
+
+### Rule 18 — `Promise.resolve(promise)` can return the same promise
+
+For an appropriate native Promise of the relevant constructor, no unnecessary new promise is required.
+
+### Rule 19 — `Promise.reject(reason)` creates a rejected promise
+
+It does not throw synchronously to the caller.
+
+### Rule 20 — Promise settlement does not cancel underlying work
+
+A promise has no universal cancellation primitive.
+
+Cancellation must be designed separately.
+
+---
+
+## 7. Syntax
+
+### Constructor
+
+```js
+const promise = new Promise((resolve, reject) => {
+  // asynchronous setup
+});
+```
+
+### Resolve
+
+```js
+resolve(value);
+```
+
+### Reject
+
+```js
+reject(error);
+```
+
+### Then
+
+```js
+promise.then(onFulfilled, onRejected);
+```
+
+### Catch
+
+```js
+promise.catch(onRejected);
+```
+
+### Finally
+
+```js
+promise.finally(onFinally);
+```
+
+### Resolve helper
+
+```js
+Promise.resolve(value);
+```
+
+### Reject helper
+
+```js
+Promise.reject(reason);
+```
+
+### Aggregation
+
+```js
+Promise.all(iterable);
+Promise.allSettled(iterable);
+Promise.race(iterable);
+Promise.any(iterable);
+```
+
+### External resolver access
+
+Modern ECMAScript provides:
+
+```js
+const { promise, resolve, reject } = Promise.withResolvers();
+```
+
+This is useful when the resolution events are controlled outside a single Promise constructor executor.
+
+### Promise subclassing
+
+```js
+class MyPromise extends Promise {}
+```
+
+Promise instance methods participate in constructor/species behavior.
+
+Use subclassing only when there is a strong semantic reason.
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Basic fulfillment
+
+```js
+const promise = new Promise(resolve => {
+  resolve(42);
+});
+
+promise.then(value => {
+  console.log(value);
+});
+```
+
+Output:
+
+```text
+42
+```
+
+### Example 2 — Basic rejection
+
+```js
+const promise = Promise.reject(new Error("failed"));
+
+promise.catch(error => {
+  console.log(error.message);
+});
+```
+
+### Example 3 — Chaining
+
+```js
+Promise.resolve(10)
+  .then(value => value * 2)
+  .then(value => value + 5)
+  .then(console.log);
+```
+
+Result:
+
+```text
+25
+```
+
+### Example 4 — Throw becomes rejection
+
+```js
+Promise.resolve()
+  .then(() => {
+    throw new Error("boom");
+  })
+  .catch(error => {
+    console.log(error.message);
+  });
+```
+
+### Example 5 — Return promise
+
+```js
+Promise.resolve()
+  .then(() => Promise.resolve("done"))
+  .then(console.log);
+```
+
+The final handler receives:
+
+```text
+done
+```
+
+### Example 6 — `finally`
+
+```js
+Promise.resolve("value")
+  .finally(() => {
+    console.log("cleanup");
+  })
+  .then(value => {
+    console.log(value);
+  });
+```
+
+Output:
+
+```text
+cleanup
+value
+```
+
+### Example 7 — `Promise.all`
+
+```js
+const results = await Promise.all([
+  getUser(),
+  getSettings()
+]);
+```
+
+All must fulfill.
+
+### Example 8 — `Promise.allSettled`
+
+```js
+const results = await Promise.allSettled([
+  taskA(),
+  taskB(),
+  taskC()
+]);
+```
+
+Every operation gets a final result record.
+
+### Example 9 — `Promise.any`
+
+```js
+const fastestSuccess = await Promise.any([
+  replicaA(),
+  replicaB(),
+  replicaC()
+]);
+```
+
+The first fulfillment wins.
+
+### Example 10 — `Promise.race`
+
+```js
+const result = await Promise.race([
+  operation(),
+  timeoutPromise()
+]);
+```
+
+Important:
+
+```text
+timeout winning does not stop operation()
+```
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+const p = new Promise(resolve => {
+  console.log("executor");
+  resolve(1);
+});
+
+console.log("after");
+
+p.then(value => {
+  console.log(value);
+});
+```
+
+### Step 1
+
+Promise construction begins.
+
+### Step 2
+
+The executor runs immediately:
+
+```text
+executor
+```
+
+### Step 3
+
+`resolve(1)` resolves the promise.
+
+Because `1` is an ordinary value, the promise can fulfill with `1`.
+
+### Step 4
+
+The constructor returns the promise.
+
+### Step 5
+
+Synchronous code prints:
+
+```text
+after
+```
+
+### Step 6
+
+`.then()` registers a reaction.
+
+The source promise is already settled, so its reaction is scheduled rather than executed inline.
+
+### Step 7
+
+The reaction job executes and prints:
+
+```text
+1
+```
+
+Final output:
+
+```text
+executor
+after
+1
+```
+
+This demonstrates three separate events:
+
+```text
+executor execution
+promise settlement
+reaction execution
+```
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 Promise state
+
+A Promise has internal state conceptually equivalent to:
+
+```text
+[[PromiseState]]
+[[PromiseResult]]
+[[PromiseFulfillReactions]]
+[[PromiseRejectReactions]]
+```
+
+The precise internal-slot model is defined by ECMAScript.
+
+### 10.2 Pending state
+
+While pending:
+
+```text
+state = pending
+result = no final outcome
+reactions = retained
+```
+
+Handlers registered by `.then()` remain associated with the promise.
+
+### 10.3 Fulfillment
+
+When fulfilled:
+
+```text
+state = fulfilled
+result = value
+```
+
+relevant fulfillment reactions become eligible for reaction-job scheduling.
+
+### 10.4 Rejection
+
+When rejected:
+
+```text
+state = rejected
+result = reason
+```
+
+relevant rejection reactions become eligible.
+
+### 10.5 Reaction records
+
+Conceptually:
+
+```text
+reaction:
+  type
+  handler
+  capability
+```
+
+The capability connects reaction execution to the downstream promise.
+
+### 10.6 Promise capability
+
+A promise capability contains conceptually:
+
+```text
+promise
+resolve
+reject
+```
+
+This is why promise machinery can connect callback execution to the promise returned from `.then()`.
+
+### 10.7 Resolver functions
+
+The resolving functions created for a promise protect the settlement invariant.
+
+Conceptually:
+
+```text
+already resolved?
+   yes → ignore later attempt
+   no  → mark resolved and process value
+```
+
+### 10.8 Resolution versus settlement
+
+This deserves explicit emphasis.
+
+```js
+let resolveOuter;
+
+const outer = new Promise(resolve => {
+  resolveOuter = resolve;
+});
+
+const inner = new Promise(resolve => {
+  setTimeout(() => resolve("done"), 100);
+});
+
+resolveOuter(inner);
+```
+
+The outer promise now follows `inner`.
+
+The outer is not necessarily fulfilled immediately.
+
+### 10.9 Thenable assimilation
+
+If a resolution value behaves like a thenable:
+
+```js
+{
+  then(resolve, reject) {}
+}
+```
+
+the Promise machinery obtains and invokes its `then` behavior according to the resolution procedure.
+
+### 10.10 Handler execution
+
+For a fulfillment reaction:
+
+```text
+source fulfillment value
+    ↓
+handler(value)
+    ↓
+returned value OR throw
+    ↓
+settle downstream promise
+```
+
+For rejection:
+
+```text
+source rejection reason
+    ↓
+onRejected(reason)
+    ↓
+returned value OR throw
+    ↓
+settle downstream promise
+```
+
+### 10.11 Downstream promise
+
+Every `.then()` creates another promise.
+
+This makes promise chains graph-like:
+
+```text
+P0 → P1 → P2 → P3
+```
+
+Branches are possible:
+
+```text
+        → P1
+P0
+        → P2
+        → P3
+```
+
+### 10.12 Promise sharing
+
+Multiple consumers can attach to one promise:
+
+```js
+const shared = loadConfig();
+
+shared.then(useByA);
+shared.then(useByB);
+shared.then(useByC);
+```
+
+The promise is not consumed by the first listener.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+### 11.1 Promise constructor
+
+The Promise constructor:
+
+1. creates a Promise object;
+2. initializes its state;
+3. creates resolving functions;
+4. calls the executor;
+5. converts executor throws into rejection.
+
+The executor is synchronous.
+
+### 11.2 Resolve functions
+
+Calling the resolve function does not always immediately settle the promise.
+
+For an ordinary value:
+
+```text
+resolve(value)
+→ fulfill
+```
+
+For a promise/thenable:
+
+```text
+resolve(thenable)
+→ adopt/follow
+→ possibly remain pending
+```
+
+### 11.3 Reject function
+
+Calling reject transitions an unresolved promise toward rejection.
+
+Subsequent settlement attempts do not replace the outcome.
+
+### 11.4 `then`
+
+The specification's `PerformPromiseThen` machinery:
+
+- creates the result capability;
+- normalizes handlers;
+- records reactions;
+- schedules reactions when the source is already settled.
+
+The current ECMAScript specification defines `Promise.prototype.then` in this model. citeturn842571search8turn842571search4
+
+### 11.5 Promise Reaction Jobs
+
+When a relevant promise reaction executes, the Promise Reaction Job:
+
+- determines the handler;
+- calls it if present;
+- resolves the derived promise with the returned value;
+- rejects the derived promise if the handler throws.
+
+This is the bridge between promise settlement and asynchronous continuation. citeturn842571search4
+
+### 11.6 Handler normalization
+
+A missing fulfillment handler behaves like value propagation.
+
+A missing rejection handler behaves like rejection propagation.
+
+Conceptually:
+
+```js
+p.then()
+```
+
+does not consume the result.
+
+### 11.7 Promise resolution procedure
+
+Resolution recursively handles:
+
+```text
+ordinary values
+thenables
+promises
+```
+
+It must protect invariants such as:
+
+```text
+single settlement
+self-resolution prevention
+thenable first-call behavior
+exception handling
+```
+
+### 11.8 Thenable assimilation
+
+A foreign object with a callable `then` can participate in Promise resolution.
+
+This supports interoperation across promise-like implementations.
+
+### 11.9 `Promise.resolve`
+
+`Promise.resolve(x)` normalizes its input into a promise.
+
+If the value is already a suitable Promise from the same constructor, it can return that promise rather than unnecessarily creating another wrapper.
+
+### 11.10 `Promise.reject`
+
+`Promise.reject(reason)` creates a new rejected promise.
+
+It does not synchronously throw `reason`.
+
+### 11.11 Combinators
+
+The combinators consume iterables and build aggregate promise behavior:
+
+```text
+all
+allSettled
+race
+any
+```
+
+Each has distinct settlement rules.
+
+### 11.12 `Promise.withResolvers`
+
+`Promise.withResolvers()` creates a Promise together with externally accessible `resolve` and `reject` functions.
+
+It is particularly useful when a promise must be settled from event-driven code outside the constructor executor. Current developer documentation lists it as a widely available modern Promise feature. citeturn842571search9
+
+### 11.13 `finally`
+
+`finally` schedules cleanup-style work while preserving the prior outcome when the cleanup completes normally.
+
+If cleanup throws or rejects, the resulting promise rejects with that failure. citeturn842571search2
+
+### 11.14 Subclassing
+
+Promise methods participate in constructor/species behavior.
+
+A `.then()` call on a Promise subclass can produce a derived promise of an appropriate constructor.
+
+This connects Promise behavior with Chapter 21's constructor/species model.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Promise resolution is recursive
+
+Suppose:
+
+```js
+resolve(
+  Promise.resolve(
+    Promise.resolve(42)
+  )
+);
+```
+
+The outer promise conceptually follows through the nested resolution until the eventual outcome becomes an ordinary value.
+
+### 12.2 Self-resolution
+
+This is invalid:
+
+```js
+let resolve;
+
+const p = new Promise(r => {
+  resolve = r;
+});
+
+resolve(p);
+```
+
+A promise must not resolve to itself.
+
+### 12.3 Thenable first-call semantics
+
+Consider:
+
+```js
+const thenable = {
+  then(resolve, reject) {
+    resolve("A");
+    resolve("B");
+    reject(new Error("C"));
+  }
+};
+```
+
+Only the first effective resolution wins.
+
+### 12.4 Thenable throws after resolution
+
+```js
+const thenable = {
+  then(resolve) {
+    resolve("A");
+    throw new Error("B");
+  }
+};
+```
+
+The later throw cannot replace the earlier effective resolution.
+
+### 12.5 Throw inside executor
+
+```js
+const p = new Promise(() => {
+  throw new Error("boom");
+});
+```
+
+The promise becomes rejected.
+
+The exception does not escape synchronously as an ordinary uncaught throw from the constructor call.
+
+### 12.6 Throw inside reaction
+
+```js
+Promise.resolve()
+  .then(() => {
+    throw new Error("boom");
+  });
+```
+
+The resulting downstream promise becomes rejected.
+
+### 12.7 Return undefined
+
+```js
+Promise.resolve(1)
+  .then(() => {});
+```
+
+The downstream promise fulfills with `undefined`.
+
+### 12.8 Return a thenable
+
+```js
+Promise.resolve()
+  .then(() => ({
+    then(resolve) {
+      resolve("A");
+    }
+  }))
+  .then(console.log);
+```
+
+The downstream chain receives `"A"` after thenable assimilation.
+
+### 12.9 Multiple consumers
+
+```js
+const p = expensiveOperation();
+
+p.then(a);
+p.then(b);
+p.then(c);
+```
+
+All consumers observe the same underlying promise outcome.
+
+### 12.10 Branches do not coordinate automatically
+
+```js
+const p = Promise.resolve();
+
+const a = p.then(stepA);
+const b = p.then(stepB);
+```
+
+`a` and `b` are separate chains.
+
+If `a` takes longer, `b` does not wait for `a`.
+
+### 12.11 Chains are dependent
+
+```js
+const a = p.then(stepA);
+const b = a.then(stepB);
+```
+
+`b` depends on `a`'s settlement.
+
+### 12.12 `Promise.all` result ordering
+
+Input:
+
+```js
+[
+  slow,
+  fast
+]
+```
+
+may complete as:
+
+```text
+fast
+slow
+```
+
+but:
+
+```js
+await Promise.all([slow, fast])
+```
+
+produces results in input order:
+
+```text
+[slowResult, fastResult]
+```
+
+The combinator separates completion order from result-position order.
+
+### 12.13 `Promise.all` failure
+
+If any input rejects:
+
+```text
+returned aggregate promise → rejected
+```
+
+Other operations are not automatically cancelled.
+
+### 12.14 `Promise.allSettled`
+
+Result shape is conceptually:
+
+```js
+[
+  {
+    status: "fulfilled",
+    value: ...
+  },
+  {
+    status: "rejected",
+    reason: ...
+  }
+]
+```
+
+### 12.15 `Promise.any`
+
+If:
+
+```text
+A rejects
+B rejects
+C fulfills
+```
+
+the aggregate fulfills with C.
+
+If all reject:
+
+```text
+Promise.any(...)
+→ AggregateError
+```
+
+### 12.16 `Promise.race`
+
+The first settlement wins:
+
+```text
+fulfillment → aggregate fulfillment
+rejection → aggregate rejection
+```
+
+A losing operation continues unless separately cancelled.
+
+### 12.17 Empty combinators
+
+Important edge cases:
+
+```text
+Promise.all([])        → fulfills with []
+Promise.allSettled([]) → fulfills with []
+Promise.any([])        → rejects with AggregateError
+Promise.race([])       → remains pending
+```
+
+### 12.18 Non-promise inputs
+
+```js
+Promise.all([1, 2, 3]);
+```
+
+normalizes the values into completed inputs.
+
+### 12.19 Thenable inputs
+
+Combinators can receive thenables and apply promise-resolution behavior.
+
+### 12.20 Constructor capture
+
+Static combinators are constructor-sensitive.
+
+Subclassing can therefore change the constructor used for derived promises.
+
+### 12.21 Promise subclassing
+
+Subclassing may be useful for specialized semantics, but it can complicate:
+
+- constructor behavior;
+- species;
+- interoperability;
+- combinators;
+- ecosystem expectations.
+
+Default to ordinary Promise unless there is a concrete design requirement.
+
+### 12.22 `Promise.withResolvers`
+
+Good use case:
+
+```text
+external callback/event
+       ↓
+resolve/reject
+       ↓
+promise
+```
+
+For example, an event-driven adapter can maintain a promise whose resolver is invoked later by an event callback.
+
+### 12.23 `withResolvers` misuse
+
+It can make promise ownership too manual:
+
+```js
+const { promise, resolve, reject } = Promise.withResolvers();
+```
+
+If the resolver escapes too broadly, the lifecycle becomes difficult to reason about.
+
+### 12.24 Promise as memoization state
+
+A promise can represent an in-flight shared operation:
+
+```js
+let current;
+
+function load() {
+  if (!current) {
+    current = expensiveLoad();
+  }
+
+  return current;
+}
+```
+
+But failure-reset policy must be designed:
+
+```text
+cache forever?
+retry after rejection?
+invalidate on timeout?
+```
+
+### 12.25 Promise as state machine
+
+A promise can represent a one-time transition:
+
+```text
+pending → fulfilled/rejected
+```
+
+It is not an ideal replacement for reusable mutable state machines.
+
+### 12.26 Promise as synchronization primitive
+
+Promises can coordinate one-time events:
+
+```js
+const ready = initialize();
+await ready;
+```
+
+But reusable synchronization such as locks, semaphores, and queues requires additional abstractions.
+
+### 12.27 Promise cancellation limit
+
+There is no universal:
+
+```js
+promise.cancel()
+```
+
+The operation must expose cancellation separately.
+
+Common modern pattern:
+
+```js
+operation({ signal })
+```
+
+where the operation observes an `AbortSignal`.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 Resolve and reject both called
+
+```js
+new Promise((resolve, reject) => {
+  resolve("A");
+  reject(new Error("B"));
+});
+```
+
+Result:
+
+```text
+fulfilled with A
+```
+
+### 13.2 Reject then resolve
+
+```text
+rejected with first effective outcome
+```
+
+### 13.3 Executor throws after resolve
+
+The prior effective resolution remains in control.
+
+### 13.4 Handler returns itself
+
+A handler creating an indirect cycle can cause a promise to remain pending or trigger rejection depending on the exact cycle.
+
+### 13.5 Direct self-return
+
+```js
+let p;
+
+p = Promise.resolve().then(() => p);
+```
+
+This can create self-resolution problems.
+
+### 13.6 `then` property getter throws
+
+Thenable assimilation may trigger property-access exceptions.
+
+### 13.7 `then` is non-callable
+
+An object with:
+
+```js
+then: 123
+```
+
+is treated according to promise resolution rules rather than as a usable thenable.
+
+### 13.8 Thenable calls multiple callbacks
+
+First effective settlement wins.
+
+### 13.9 `Promise.all` receives an invalid non-iterable
+
+```js
+Promise.all(123);
+```
+
+throws/rejects according to the API's invocation semantics rather than behaving like a normal iterable aggregation.
+
+### 13.10 `Promise.any` all reject
+
+The result rejects with `AggregateError` containing rejection reasons.
+
+### 13.11 `Promise.race([])`
+
+It remains pending indefinitely.
+
+### 13.12 Pending promise retaining handlers
+
+A pending promise can retain registered reactions for as long as it remains reachable.
+
+### 13.13 Chaining on forever-pending promises
+
+```js
+const forever = new Promise(() => {});
+
+forever.then(handler);
+```
+
+The handler remains retained because the source never settles.
+
+### 13.14 Promise returned from `finally`
+
+```js
+p.finally(() => someAsyncCleanup());
+```
+
+The next promise waits for cleanup before reflecting the original result.
+
+### 13.15 `finally` throws
+
+The original result is replaced by rejection.
+
+### 13.16 `finally` returns a rejected promise
+
+Same principle:
+
+```text
+cleanup failure
+→ resulting promise rejected
+```
+
+### 13.17 `Promise.all` with a long-lived pending promise
+
+Repeatedly combining a forever-pending promise can accumulate reactions and memory.
+
+### 13.18 Losing `race` operations
+
+A losing operation may continue executing and retaining resources.
+
+### 13.19 `Promise.any` losers
+
+Rejected losers continue until they settle; their underlying operations are not cancelled.
+
+### 13.20 Unhandled rejection timing
+
+Reporting policies are host-specific.
+
+Do not treat one runtime's unhandled-rejection timing as universal language behavior.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “Promise means asynchronous execution.”
+
+A Promise represents eventual completion. The operation producing it may begin synchronously.
+
+### Misconception 2 — “The Promise executor is asynchronous.”
+
+Usually false.
+
+The executor runs synchronously during Promise construction.
+
+### Misconception 3 — “Resolved means fulfilled.”
+
+Not always.
+
+A promise can be resolved to another thenable while remaining pending.
+
+### Misconception 4 — “A promise can settle twice.”
+
+No.
+
+A promise has one final settlement.
+
+### Misconception 5 — “`.then()` modifies the promise result.”
+
+It registers a reaction and returns a new promise.
+
+### Misconception 6 — “The first `.then()` consumes the Promise.”
+
+No.
+
+Multiple consumers can observe the same Promise.
+
+### Misconception 7 — “Returning a promise creates nested promises.”
+
+Promise resolution adopts the returned promise/thenable outcome.
+
+### Misconception 8 — “Promise rejection automatically cancels work.”
+
+No.
+
+Rejection describes outcome, not cancellation.
+
+### Misconception 9 — “`Promise.race` cancels slower operations.”
+
+No.
+
+It only settles the returned promise from the first settlement.
+
+### Misconception 10 — “`Promise.all` runs everything in parallel.”
+
+It aggregates promises. Whether underlying operations run concurrently depends on the operations and host.
+
+### Misconception 11 — “`Promise.all` stops the other operations after failure.”
+
+No.
+
+The aggregate promise rejects, but input operations can continue.
+
+### Misconception 12 — “`Promise.any` returns the fastest operation.”
+
+More precisely, it returns the first fulfilled input.
+
+### Misconception 13 — “`finally` receives the value/error.”
+
+It does not receive the original outcome as an argument.
+
+### Misconception 14 — “A pending Promise is harmless.”
+
+Pending promises can retain handlers, closures, and associated memory.
+
+### Misconception 15 — “Promises are threads.”
+
+No.
+
+They are language-level completion abstractions.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Creating Promise wrappers unnecessarily
+
+```js
+return new Promise(resolve => {
+  resolve(existingPromise);
+});
+```
+
+This may add needless complexity.
+
+### Mistake 2 — Nested Promise construction
+
+```js
+return new Promise((resolve, reject) => {
+  somePromise.then(resolve, reject);
+});
+```
+
+Often unnecessary when an API already returns a promise.
+
+### Mistake 3 — Missing returns in chains
+
+```js
+doA()
+  .then(() => {
+    doB();
+  })
+  .then(() => {
+    // may run before doB completes
+  });
+```
+
+Correct:
+
+```js
+doA()
+  .then(() => {
+    return doB();
+  });
+```
+
+### Mistake 4 — Fire-and-forget without a policy
+
+```js
+doImportantWork();
+```
+
+### Mistake 5 — Using `Promise.all` for huge unbounded inputs
+
+### Mistake 6 — Treating timeout as cancellation
+
+### Mistake 7 — Swallowing rejection
+
+```js
+promise.catch(() => {});
+```
+
+### Mistake 8 — Logging and rethrowing at every layer
+
+### Mistake 9 — Retaining forever-pending promises
+
+### Mistake 10 — Resolving a Promise with a resource and losing ownership semantics
+
+### Mistake 11 — Using one shared promise as a permanent cache without invalidation strategy
+
+### Mistake 12 — Assuming `Promise.any` or `race` cleans up losers
+
+### Mistake 13 — Creating a promise for ordinary synchronous branching
+
+### Mistake 14 — Depending on host-specific unhandled rejection timing
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Concept | Main role | Key property |
+|---|---|---|
+| Promise | Future completion | One final settlement |
+| Callback | Function invoked by an API | API-defined invocation |
+| Result object | Explicit success/failure value | Synchronous/data-oriented |
+| `async/await` | Syntax over promise-based async flow | Structured control flow |
+| Generator | Suspended synchronous/iterative computation | Explicit `yield` |
+| Observable | Multiple future values over time | Many emissions |
+| EventEmitter | Repeated event notifications | Many events |
+| Queue | Work ordering | Multiple tasks |
+| AbortSignal | Cancellation notification | Separate from promise settlement |
+
+### Promise vs callback
+
+Callback:
+
+```js
+read(callback);
+```
+
+Promise:
+
+```js
+read().then(...);
+```
+
+Promises give:
+
+- composition;
+- chaining;
+- standard propagation;
+- combinators.
+
+### Promise vs Observable
+
+Promise:
+
+```text
+one eventual result
+```
+
+Observable:
+
+```text
+zero/one/many values over time
+```
+
+### Promise vs event emitter
+
+Promise:
+
+```text
+one settlement
+```
+
+Event emitter:
+
+```text
+repeated notifications
+```
+
+### Promise vs result object
+
+Promise is appropriate when completion is asynchronous.
+
+A result object can be clearer when the outcome is an expected synchronous domain branch.
+
+### Promise vs cancellation
+
+Promise:
+
+```text
+what happened
+```
+
+Cancellation:
+
+```text
+stop trying to make it happen
+```
+
+These are complementary.
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 Promise allocation
+
+Each Promise object has memory and bookkeeping costs.
+
+Deep chains create:
+
+```text
+promise objects
+reaction records
+closures
+jobs
+```
+
+### 17.2 High-frequency promise creation
+
+In very hot synchronous loops, unnecessary promise creation can be expensive.
+
+Do not promisify purely synchronous work without a reason.
+
+### 17.3 Microtask volume
+
+Large promise pipelines can generate many deferred reaction jobs.
+
+### 17.4 Combinator fan-out
+
+```js
+Promise.all(hugeArray.map(operation))
+```
+
+can create large numbers of:
+
+- promises;
+- reactions;
+- closures;
+- retained input values.
+
+### 17.5 Bounded concurrency
+
+Instead of:
+
+```js
+await Promise.all(items.map(process));
+```
+
+consider a bounded scheduler when the input is large or dependencies are rate-limited.
+
+### 17.6 Promise chains and latency
+
+Each dependent stage can increase total wall-clock latency:
+
+```text
+A → B → C → D
+```
+
+independent stages can sometimes be reorganized:
+
+```text
+A ─┐
+B ─┼→ aggregate
+C ─┘
+```
+
+### 17.7 `Promise.all` is not a worker scheduler
+
+Its performance depends on the underlying operations.
+
+### 17.8 Memory retained by pending chains
+
+A forever-pending promise with thousands of handlers can consume significant memory.
+
+### 17.9 Repeated `Promise.race`
+
+Repeatedly racing a short timeout against a long-lived promise can accumulate handlers on the long-lived promise.
+
+### 17.10 Error overhead
+
+Creating and retaining deep error chains can add cost.
+
+### 17.11 Measurement
+
+Measure:
+
+```text
+promise allocation
+GC
+reaction count
+operation latency
+queue delay
+concurrency
+downstream saturation
+```
+
+rather than optimizing promise syntax by intuition.
+
+---
+
+## 18. Memory Considerations
+
+### 18.1 Pending promises retain handlers
+
+```js
+const pending = new Promise(() => {});
+
+pending.then(() => use(largeObject));
+```
+
+If `pending` remains reachable forever, the reaction and its closure can remain retained.
+
+### 18.2 Shared promises retain consumers
+
+A long-lived shared promise can retain all attached handlers until settlement.
+
+### 18.3 Promise chains retain intermediate state
+
+Long chains may keep closures and intermediate references alive.
+
+### 18.4 Large combinators
+
+`Promise.all()` often retains:
+
+- input values;
+- result array;
+- reaction state;
+
+until all required outcomes are resolved or the aggregate rejects.
+
+### 18.5 Losing operations
+
+With `race`:
+
+```text
+winner settles
+losers continue
+```
+
+Those losing operations can keep memory/resources alive.
+
+### 18.6 Cancellation reduces retention
+
+Actual cancellation can stop work that would otherwise retain resources.
+
+### 18.7 In-flight memoization
+
+A shared in-flight promise is useful, but stale or permanently pending operations require expiration/invalidation.
+
+---
+
+## 19. Security Considerations
+
+### 19.1 Promise rejection can carry secrets
+
+Never automatically log arbitrary rejection reasons.
+
+### 19.2 Thenable execution
+
+Thenable assimilation can execute attacker-controlled code.
+
+### 19.3 Unbounded concurrency
+
+Attackers can trigger high fan-out Promise creation and overload downstream systems.
+
+### 19.4 Promise races
+
+Security-sensitive code can have stale-result races.
+
+Example:
+
+```text
+authorization check
+↓
+await
+↓
+state changed
+↓
+action continues
+```
+
+### 19.5 Timeout is not cancellation
+
+A request can continue after the caller has stopped waiting.
+
+That can cause:
+
+- duplicated writes;
+- resource exhaustion;
+- inconsistent audit trails.
+
+### 19.6 Rejection disclosure
+
+Returning raw errors from rejected promises to clients can leak:
+
+- stack traces;
+- infrastructure names;
+- database details.
+
+### 19.7 Untrusted thenables
+
+Do not assume a `.then()` property is inert.
+
+### 19.8 Promise-based resource leakage
+
+A rejected or abandoned promise can leave resources alive if the underlying operation has no cancellation/cleanup path.
+
+---
+
+## 20. Production Usage
+
+### 20.1 API design
+
+A production async function should make clear:
+
+```text
+what the promise represents
+success shape
+failure shape
+cancellation
+timeout
+resource ownership
+side effects
+```
+
+### 20.2 Shared request deduplication
+
+Example:
+
+```js
+const inFlight = new Map();
+
+function loadUser(id) {
+  if (!inFlight.has(id)) {
+    const promise = fetchUser(id)
+      .finally(() => {
+        inFlight.delete(id);
+      });
+
+    inFlight.set(id, promise);
+  }
+
+  return inFlight.get(id);
+}
+```
+
+This allows concurrent callers to share one in-flight operation.
+
+The invalidation policy is essential.
+
+### 20.3 Dependency fan-out
+
+```js
+const [profile, permissions, settings] =
+  await Promise.all([
+    getProfile(id),
+    getPermissions(id),
+    getSettings(id)
+  ]);
+```
+
+Use only when the operations are independent and downstream capacity allows it.
+
+### 20.4 Graceful failure
+
+When one dependency fails, decide whether:
+
+```text
+fail whole request
+degrade partially
+use fallback
+retry
+serve stale cache
+```
+
+Do not let Promise combinators make business decisions accidentally.
+
+### 20.5 `Promise.allSettled` for partial results
+
+Use when every operation's outcome matters.
+
+Examples:
+
+- batch notifications;
+- multi-destination telemetry;
+- best-effort cleanup;
+- diagnostics.
+
+### 20.6 `Promise.any` for redundant providers
+
+Useful where:
+
+```text
+any successful replica/provider is sufficient
+```
+
+Combine with cancellation if losing requests should stop.
+
+### 20.7 `Promise.race` for time-bound policy
+
+Use when a first outcome is needed, but pair it with actual cancellation where possible.
+
+### 20.8 `withResolvers` for event adapters
+
+Useful for:
+
+```text
+callback/event API
+→ one Promise settlement
+```
+
+Be careful with resolver ownership and lifetime.
+
+### 20.9 Cleanup
+
+```js
+await operation()
+  .finally(cleanup);
+```
+
+For richer ownership semantics, integrate with resource-management mechanisms from Chapter 30.
+
+### 20.10 Process boundaries
+
+At HTTP/worker/CLI boundaries:
+
+```text
+Promise rejection
+→ explicit boundary
+→ classify
+→ log/trace
+→ recover/translate/terminate
+```
+
+### 20.11 Observability
+
+Record:
+
+- operation name;
+- duration;
+- success/failure;
+- error class/code;
+- retry count;
+- cancellation;
+- dependency;
+- request/trace context.
+
+Do not make logging the only failure-handling mechanism.
+
+---
+
+## 21. Implementation From Scratch
+
+### Stage 1 — Guided
+
+Implement a minimal asynchronous result abstraction:
+
+```js
+class MiniPromise {
+  constructor(executor) {
+    // state
+    // reactions
+    // resolve
+    // reject
+  }
+}
+```
+
+Support:
+
+```text
+pending
+fulfilled
+rejected
+```
+
+### Stage 2 — Partially Guided
+
+Add:
+
+```js
+then(onFulfilled, onRejected)
+```
+
+and deferred execution.
+
+Requirements:
+
+- return a new MiniPromise;
+- propagate values;
+- propagate errors;
+- convert handler throws to rejection.
+
+### Stage 3 — No Reference
+
+Implement:
+
+```js
+MiniPromise.resolve(value)
+MiniPromise.reject(reason)
+```
+
+and chaining:
+
+```js
+MiniPromise.resolve(1)
+  .then(x => x + 1)
+  .then(console.log);
+```
+
+### Stage 4 — Edge-Case Hardened
+
+Add:
+
+- thenable assimilation;
+- self-resolution protection;
+- multiple resolve/reject calls;
+- executor throws;
+- returned promises;
+- error propagation;
+- empty combinators;
+- multiple consumers.
+
+### Stage 5 — Production-Oriented Learning Engine
+
+Do not use this as a replacement for native Promise.
+
+Build it to expose instrumentation:
+
+```text
+promise ID
+parent ID
+state
+created at
+settled at
+reaction count
+handler duration
+cause/error
+```
+
+Then study:
+
+```text
+allocation
+scheduling
+retention
+chain depth
+latency
+```
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Missing return
+
+```js
+doA()
+  .then(() => {
+    doB();
+  })
+  .then(() => {
+    console.log("done");
+  });
+```
+
+Determine why `"done"` may occur before `doB()` completes.
+
+### Exercise 2 — Detached rejection
+
+```js
+function run() {
+  doWork().then(saveResult);
+}
+
+run();
+```
+
+Who owns failures from `saveResult`?
+
+### Exercise 3 — Race timeout
+
+```js
+await Promise.race([
+  doWork(),
+  timeout(1000)
+]);
+```
+
+Determine what still runs when timeout wins.
+
+### Exercise 4 — `all` cancellation misconception
+
+```js
+await Promise.all([
+  taskA(),
+  taskB(),
+  taskC()
+]);
+```
+
+Assume B rejects immediately.
+
+What happens to A and C?
+
+### Exercise 5 — Forever pending
+
+```js
+const pending = new Promise(() => {});
+
+for (let i = 0; i < 100000; i++) {
+  pending.then(() => {});
+}
+```
+
+Identify memory consequences.
+
+### Exercise 6 — Thenable trap
+
+```js
+const value = {
+  then(resolve) {
+    console.log("then called");
+    resolve(42);
+  }
+};
+
+Promise.resolve(value).then(console.log);
+```
+
+Trace the assimilation sequence.
+
+### Exercise 7 — Shared in-flight promise
+
+Implement:
+
+```js
+getUser(id)
+```
+
+so simultaneous requests share one network operation.
+
+Then answer:
+
+```text
+What happens on success?
+What happens on failure?
+What happens on timeout?
+What happens if the promise never settles?
+```
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+async function loadDashboard() {
+  const user = await getUser();
+  const stats = await getStats();
+  const notifications = await getNotifications();
+
+  return {
+    user,
+    stats,
+    notifications
+  };
+}
+```
+
+Determine:
+
+- which dependencies are real;
+- which operations could overlap;
+- what should happen if notifications fail;
+- whether partial data is acceptable;
+- whether all work should be cancellable;
+- whether a shared in-flight cache is appropriate.
+
+Then review this variation:
+
+```js
+async function loadDashboard() {
+  return Promise.all([
+    getUser(),
+    getStats(),
+    getNotifications()
+  ]);
+}
+```
+
+Determine whether it is semantically equivalent.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is a Promise?
+2. What states can it have?
+3. What does “settled” mean?
+4. What is the difference between resolved and fulfilled?
+5. Does the Promise executor run synchronously?
+6. Why does `.then()` return another Promise?
+7. What happens when a `.then()` handler returns a value?
+8. What happens when it throws?
+9. What happens when it returns another Promise?
+10. What does `.catch()` do?
+
+### Intermediate
+
+11. What is thenable assimilation?
+12. Why can a Promise be resolved but pending?
+13. Why can multiple consumers attach to the same Promise?
+14. What does `Promise.all()` do on rejection?
+15. Does `Promise.all()` cancel remaining work?
+16. What is the difference between `all` and `allSettled`?
+17. What is the difference between `race` and `any`?
+18. When does `Promise.any()` reject?
+19. What is `AggregateError`?
+20. What is `Promise.withResolvers()`?
+
+### Advanced
+
+21. Explain Promise resolution precisely.
+22. Explain self-resolution.
+23. Explain first-effective-settlement behavior.
+24. Explain the relationship between Promise reactions and Jobs.
+25. Explain missing handlers and propagation.
+26. Explain `finally()` semantics.
+27. Explain Promise memory retention.
+28. Explain why `race()` is not cancellation.
+29. Explain Promise subclass/species behavior.
+30. Explain how Promise combinators consume iterables.
+
+### Principal-Level
+
+31. Design a production Promise-based API contract.
+32. Design in-flight request deduplication.
+33. Design bounded concurrent Promise processing.
+34. Design cancellation around Promise-based operations.
+35. Design partial-failure handling with `allSettled`.
+36. Design redundant-provider selection with `any`.
+37. Design timeout + cancellation correctly.
+38. Diagnose a promise-heavy memory leak.
+39. Diagnose a detached rejection in production.
+40. Defend when to use Promise combinators versus an explicit scheduler.
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+console.log("A");
+
+new Promise(resolve => {
+  console.log("B");
+  resolve();
+}).then(() => {
+  console.log("C");
+});
+
+console.log("D");
+```
+
+Expected:
+
+```text
+A
+B
+D
+C
+```
+
+### Exercise B
+
+```js
+const p = Promise.resolve("A");
+
+p.then(value => {
+  console.log(value);
+  return "B";
+}).then(value => {
+  console.log(value);
+});
+
+console.log("C");
+```
+
+Predict:
+
+```text
+C
+A
+B
+```
+
+### Exercise C
+
+```js
+Promise.resolve()
+  .then(() => {
+    console.log("A");
+    throw new Error("B");
+  })
+  .catch(error => {
+    console.log(error.message);
+    return "C";
+  })
+  .then(console.log);
+```
+
+Predict:
+
+```text
+A
+B
+C
+```
+
+### Exercise D
+
+```js
+const p = Promise.resolve();
+
+p.then(() => console.log("A"));
+p.then(() => console.log("B"));
+
+p.then(() => {
+  console.log("C");
+  return Promise.resolve();
+}).then(() => {
+  console.log("D");
+});
+```
+
+Explain why the first-level reactions and chained reaction do not all execute as one callback.
+
+### Exercise E
+
+```js
+Promise.all([
+  Promise.resolve("A"),
+  Promise.reject(new Error("B")),
+  Promise.resolve("C")
+])
+  .then(() => console.log("success"))
+  .catch(error => console.log(error.message));
+```
+
+Predict:
+
+```text
+B
+```
+
+Then explain what happened to A and C.
+
+### Exercise F
+
+```js
+Promise.any([
+  Promise.reject("A"),
+  Promise.resolve("B"),
+  Promise.resolve("C")
+]).then(console.log);
+```
+
+Predict:
+
+```text
+B
+```
+
+### Exercise G
+
+```js
+Promise.race([
+  Promise.resolve("A"),
+  Promise.resolve("B")
+]).then(console.log);
+```
+
+Determine the result based on iterable order and Promise reaction scheduling rather than saying “the first line is faster.”
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Promise state machine
+
+Draw:
+
+```text
+pending
+  ↓
+resolved-to-value
+  ↓
+fulfilled
+```
+
+and:
+
+```text
+pending
+  ↓
+resolved-to-thenable
+  ↓
+follow thenable
+  ↓
+fulfilled/rejected
+```
+
+Explain why “resolved” and “settled” differ.
+
+### Exercise 2 — Promise implementation
+
+Implement a MiniPromise with:
+
+```text
+constructor
+resolve
+reject
+then
+catch
+finally
+```
+
+### Exercise 3 — Thenable compatibility
+
+Test your implementation against:
+
+- native Promise;
+- custom thenable;
+- throwing thenable;
+- double-settling thenable;
+- self-resolution.
+
+### Exercise 4 — Combinators
+
+Implement:
+
+```js
+miniAll
+miniAllSettled
+miniRace
+miniAny
+```
+
+using your own Promise-like abstraction.
+
+### Exercise 5 — Bounded concurrency
+
+Implement:
+
+```js
+mapConcurrent(items, limit, worker)
+```
+
+Requirements:
+
+- preserve result order;
+- bound active workers;
+- reject/settle according to policy;
+- support cancellation;
+- avoid unbounded promise creation.
+
+### Exercise 6 — Timeout + cancellation
+
+Implement:
+
+```js
+withTimeout(operation, ms, { signal })
+```
+
+where the underlying operation can actually be cancelled.
+
+### Exercise 7 — In-flight deduplication
+
+Implement:
+
+```js
+getResource(key)
+```
+
+where concurrent requests for the same key share one operation.
+
+Add:
+
+- expiration;
+- failure reset;
+- cancellation policy;
+- metrics.
+
+### Exercise 8 — Promise leak investigation
+
+Construct a benchmark with a forever-pending Promise and many `.then()` registrations.
+
+Measure memory growth.
+
+---
+
+## 27. Key Takeaways
+
+1. A Promise represents eventual completion.
+2. Promise state is `pending`, `fulfilled`, or `rejected`.
+3. Fulfillment/rejection means settlement.
+4. Resolution is broader than fulfillment: a Promise can resolve to a thenable and remain pending while it follows that thenable.
+5. The Promise executor runs synchronously during construction.
+6. Promise reactions execute asynchronously through the language/runtime job mechanism.
+7. `.then()` creates a new downstream Promise.
+8. Returning a value fulfills the downstream Promise.
+9. Throwing in a reaction rejects the downstream Promise.
+10. Returning a Promise/thenable causes adoption of its eventual outcome.
+11. Promise resolution protects the one-settlement invariant.
+12. Thenable assimilation provides interoperability but can execute arbitrary code.
+13. `catch()` is rejection handling within the Promise chain.
+14. `finally()` is cleanup-oriented and normally preserves the prior outcome.
+15. `Promise.all()` requires every input to fulfill and rejects on the first rejection.
+16. `Promise.allSettled()` waits for every input.
+17. `Promise.race()` settles from the first input settlement.
+18. `Promise.any()` fulfills from the first successful input and rejects with `AggregateError` if all inputs reject.
+19. None of the standard combinators automatically cancels losing/remaining underlying operations.
+20. `Promise.withResolvers()` is useful for externally controlled settlement.
+21. Promise chains are dependency graphs, not just lists of callbacks.
+22. Pending Promises can retain closures and reactions.
+23. Promise-heavy systems need explicit concurrency and lifecycle policies.
+24. Promises represent completion; cancellation must be designed separately.
+25. The central principle is:
+
+> A Promise is a one-settlement, composable representation of eventual completion—not a thread, scheduler, or cancellation mechanism.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 09 — Functions / First-Class Behavior
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 18 — Classes / OOP
+- Chapter 20 — Symbols / Well-Known Symbols
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+
+### Builds Toward
+
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 40 — Observables / Reactive
+- Chapter 45 — Memory / GC
+- Chapter 46 — Weak Refs / Finalization
+- Chapter 51 — Browser APIs
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 58 — Node Architecture
+- Chapter 59 — Node Core APIs
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 78 — Production JS Architecture
+- Chapter 79 — API Design
+- Chapter 82 — API Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 89 — Code Review / Refactoring
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 104 — Production HTTP Client
+- Chapter 105 — Node REST API
+- Chapter 106 — Real-time WebSocket
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- Promise state
+- Promise resolution
+- Thenables
+- Promise reactions
+- Jobs
+- Async/await
+- Cancellation
+- `AbortSignal`
+- Timeout
+- Concurrency
+- `Promise.all`
+- `Promise.allSettled`
+- `Promise.race`
+- `Promise.any`
+- `AggregateError`
+- `Promise.withResolvers`
+- Resource lifetime
+- Error propagation
+- Backpressure
+- Observability
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- abrupt completion;
+- objects;
+- classes;
+- species/subclassing;
+- errors;
+- Jobs;
+- microtasks;
+- asynchronous execution;
+- resource ownership.
+
+### Why This Chapter Matters Later
+
+Promises are the central asynchronous abstraction for modern JavaScript.
+
+Async/await, Fetch, many Node APIs, browser APIs, concurrency utilities, and production service code all build on Promise semantics.
+
+A shallow Promise model causes recurring mistakes:
+
+```text
+executor is async
+resolved = fulfilled
+race = cancellation
+all = parallelism
+await = blocking
+rejection = cancellation
+promise = thread
+```
+
+A precise Promise model eliminates these errors before they spread into larger architecture.
+
+The central principle is:
+
+> Promise semantics are the foundation on which modern JavaScript asynchronous control flow is built.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 35 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Define a Promise.
+- [ ] Explain pending, fulfilled, rejected.
+- [ ] Explain settlement.
+- [ ] Explain resolution versus settlement.
+- [ ] Explain the executor.
+- [ ] Explain `resolve` and `reject`.
+- [ ] Explain thenable assimilation.
+- [ ] Explain `.then()`, `.catch()`, `.finally()`.
+- [ ] Explain downstream promises.
+- [ ] Explain promise combinators.
+- [ ] Explain `Promise.withResolvers`.
+
+### Predictive Mastery
+
+- [ ] Predict executor timing.
+- [ ] Predict reaction timing.
+- [ ] Predict chain ordering.
+- [ ] Predict error propagation.
+- [ ] Predict returned-promise adoption.
+- [ ] Predict `all`.
+- [ ] Predict `allSettled`.
+- [ ] Predict `race`.
+- [ ] Predict `any`.
+- [ ] Predict `finally`.
+- [ ] Predict thenable edge cases.
+- [ ] Predict pending-promise memory behavior.
+
+### Implementation
+
+- [ ] Implement a MiniPromise.
+- [ ] Implement chaining.
+- [ ] Implement resolution/adoption.
+- [ ] Implement combinators.
+- [ ] Implement bounded concurrency.
+- [ ] Implement timeout + cancellation.
+- [ ] Implement in-flight deduplication.
+
+### Debugging
+
+- [ ] Diagnose missing Promise returns.
+- [ ] Diagnose detached rejections.
+- [ ] Diagnose timeout/race misconceptions.
+- [ ] Diagnose unbounded concurrency.
+- [ ] Diagnose pending-promise memory retention.
+- [ ] Diagnose thenable behavior.
+- [ ] Diagnose `finally` masking.
+- [ ] Diagnose combinator failure policies.
+
+### Production Engineering
+
+- [ ] Design Promise-based API contracts.
+- [ ] Choose appropriate combinators.
+- [ ] Define cancellation separately.
+- [ ] Design bounded concurrency.
+- [ ] Design shared in-flight operations.
+- [ ] Define failure policy.
+- [ ] Define resource ownership.
+- [ ] Instrument async operations.
+- [ ] Prevent unhandled/detached failures.
+
+### Interview Readiness
+
+- [ ] Explain resolved vs fulfilled.
+- [ ] Explain executor timing.
+- [ ] Explain thenable adoption.
+- [ ] Explain `.then()` chaining.
+- [ ] Explain all/allSettled/race/any.
+- [ ] Explain why race is not cancellation.
+- [ ] Explain Promise memory behavior.
+- [ ] Design production Promise APIs.
+- [ ] Defend Promise architecture decisions.
+
+### Track A — Core Theory
+
+- [ ] Understand Promise state.
+- [ ] Understand Promise resolution.
+- [ ] Understand reactions.
+- [ ] Understand combinators.
+- [ ] Understand specification semantics.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production-oriented learning implementation reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed chain-debugging exercises.
+- [ ] Completed code review exercise.
+- [ ] Completed bounded concurrency design.
+- [ ] Completed cancellation design.
+- [ ] Defended Promise architecture decisions.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 35 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What is the difference between resolved and fulfilled?
+2. Does the Promise executor run synchronously?
+3. Why are `.then()` handlers asynchronous?
+4. Why does `.then()` return a new Promise?
+5. What happens when a handler returns a normal value?
+6. What happens when it throws?
+7. What happens when it returns a Promise?
+8. What is thenable assimilation?
+9. What is self-resolution?
+10. What does `Promise.all()` do when one input rejects?
+11. Does `Promise.all()` cancel remaining operations?
+12. What does `Promise.allSettled()` guarantee?
+13. What does `Promise.race()` guarantee?
+14. What does `Promise.any()` guarantee?
+15. When does `Promise.any()` produce `AggregateError`?
+16. What does `Promise.withResolvers()` solve?
+17. Why is timeout not cancellation?
+18. How can a pending Promise retain memory?
+19. How would you implement bounded concurrent Promise processing?
+20. How would you debug a detached Promise rejection?
+21. How would you design in-flight request deduplication?
+22. When should you avoid creating a new Promise wrapper?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit resolved vs fulfilled
+- [ ] Revisit thenable assimilation
+- [ ] Revisit reaction/chaining semantics
+- [ ] Revisit combinators
+- [ ] Revisit cancellation limitations
+- [ ] Revisit Promise memory retention
+- [ ] Revisit bounded concurrency
+- [ ] Revisit withResolvers
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 35 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. ECMAScript specification — Promise objects, constructor semantics, resolution, reactions, Jobs, `then`, `catch`, `finally`, and combinators.
+2. TC39 proposal/history material — only where historical evolution or feature introduction is relevant, such as `Promise.withResolvers`.
+3. MDN / browser documentation — practical developer behavior and compatibility information.
+4. Node.js documentation — host integration, diagnostics, unhandled rejection behavior, and runtime-specific APIs.
+5. JavaScript engine/runtime documentation — implementation and performance details.
+6. Application architecture documentation — cancellation, concurrency, retries, ownership, observability, and operational policy.
+
+The current ECMAScript specification describes `Promise.prototype.then`, `PerformPromiseThen`, and `NewPromiseReactionJob` in the Promise model. citeturn842571search8turn842571search4
+
+Current developer documentation also describes the modern Promise combinators and `Promise.withResolvers()` behavior. citeturn842571search3turn842571search5turn842571search9
+
+Always distinguish:
+
+```text
+ECMAScript semantics
+vs
+engine implementation
+vs
+browser behavior
+vs
+Node.js behavior
+vs
+application policy
+```
+
+Do not claim that Promise settlement cancels underlying host work.
+
+Do not treat `Promise.race()` as a cancellation API.
+
+Do not treat `Promise.all()` as a general-purpose concurrency scheduler.
+
+---
+
+# Chapter 35 — Completion Snapshot
+
+```text
+Chapter: 35
+Title: Promises
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 36 — Async Functions and `await`
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain what an `async` function is and what contract it provides.
+- Explain why every call to an async function produces a Promise.
+- Distinguish the synchronous portion of an async function from its suspended continuation.
+- Explain `await` as a control-flow mechanism built around Promise resolution.
+- Explain why `await` does not block the entire JavaScript execution environment.
+- Explain how `await` affects the returned Promise of an async function.
+- Explain how synchronous throws inside async functions become Promise rejections.
+- Explain how rejected awaited Promises become throw-like failures inside the async function.
+- Predict execution ordering around `await`.
+- Predict behavior when awaiting ordinary values, fulfilled Promises, rejected Promises, and thenables.
+- Understand why `await` always introduces asynchronous continuation semantics even when the value is already fulfilled.
+- Explain async function return-value normalization.
+- Explain how returned thenables are adopted by the async function's result Promise.
+- Explain error propagation through `try/catch/finally` around `await`.
+- Explain common differences between `return await` and `return promise`.
+- Understand sequential versus concurrent `await`.
+- Explain accidental serialization in async functions.
+- Use `Promise.all`, `allSettled`, `race`, and `any` appropriately inside async code.
+- Understand async function stack behavior and debugging boundaries.
+- Explain the interaction between `await`, promise reactions, Jobs, microtasks, and host scheduling.
+- Explain how `await` interacts with resource lifetime and cleanup.
+- Explain cancellation limitations and why `await` alone does not cancel the underlying operation.
+- Diagnose unhandled rejections and detached asynchronous work.
+- Understand memory retention across suspension points.
+- Design production async functions with explicit success, failure, timeout, cancellation, and ownership behavior.
+- Implement async-like control flow from scratch for learning.
+- Build robust sequential and concurrent async workflows.
+- Debug complex async/await ordering without relying on intuition.
+- Defend async/await design decisions at senior/principal level.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+## 2. Prerequisites
+
+The learner should understand:
+
+- Functions and lexical scope.
+- Execution contexts.
+- Errors and abrupt completion.
+- Promises.
+- Promise resolution and chaining.
+- ECMAScript Jobs and Promise Reaction Jobs.
+- Browser and Node event-loop fundamentals.
+- Resource management and cleanup.
+
+Primary dependencies:
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+
+Later chapters build directly on this chapter:
+
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 84 — Reliability
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+
+---
+
+## 3. What Is It?
+
+An `async` function is a JavaScript function whose completion is represented by a Promise.
+
+Example:
+
+```js
+async function add(a, b) {
+  return a + b;
+}
+```
+
+Calling:
+
+```js
+const result = add(2, 3);
+```
+
+does not produce the number directly.
+
+It produces:
+
+```text
+Promise → eventually fulfilled with 5
+```
+
+An `async` function can also suspend at:
+
+```js
+await expression;
+```
+
+Example:
+
+```js
+async function load() {
+  const value = await getValue();
+  return value;
+}
+```
+
+The function can be understood as two broad execution regions:
+
+```text
+before await
+     ↓
+suspend
+     ↓
+future continuation
+     ↓
+after await
+```
+
+The central idea is:
+
+> `async/await` provides structured control flow for Promise-based asynchronous operations.
+
+It does not create a separate thread.
+
+It does not automatically parallelize work.
+
+It does not automatically cancel work.
+
+It changes how asynchronous completion is expressed and composed.
+
+---
+
+## 4. Why Does It Exist?
+
+Promise chains can become structurally difficult:
+
+```js
+getUser()
+  .then(user => getProfile(user))
+  .then(profile => getPermissions(profile))
+  .then(permissions => {
+    // ...
+  })
+  .catch(handleError);
+```
+
+The equivalent async style:
+
+```js
+async function load() {
+  try {
+    const user = await getUser();
+    const profile = await getProfile(user);
+    const permissions = await getPermissions(profile);
+
+    return permissions;
+  } catch (error) {
+    handleError(error);
+  }
+}
+```
+
+often maps more directly onto the conceptual sequence:
+
+```text
+get user
+then get profile
+then get permissions
+```
+
+This improves readability, but readability is not the only reason.
+
+`async/await` also provides a structured control-flow model for:
+
+- local variables across suspension;
+- `try/catch/finally`;
+- loops;
+- conditional logic;
+- early returns;
+- resource ownership;
+- sequential workflows.
+
+The key distinction is:
+
+> Async/await changes the control-flow representation of Promise-based programs; it does not remove asynchronous semantics.
+
+---
+
+## 5. Mental Model
+
+Think of an async function as a state machine.
+
+```text
+                    ┌───────────────┐
+                    │ running sync  │
+                    └───────┬───────┘
+                            │
+                         await
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │   suspended   │
+                    └───────┬───────┘
+                            │
+                 awaited outcome available
+                            │
+                    ┌───────┴────────┐
+                    │                │
+                fulfillment       rejection
+                    │                │
+                    ▼                ▼
+                 resume           throw-like
+                 with value       failure
+                    │                │
+                    └───────┬────────┘
+                            ▼
+                       continue
+                            │
+                            ▼
+                         return
+                            │
+                            ▼
+                   async function Promise
+```
+
+Another useful model:
+
+```text
+async function call
+      ↓
+create result Promise
+      ↓
+start function body
+      ↓
+reach await
+      ↓
+pause function progress
+      ↓
+arrange continuation
+      ↓
+later resume
+      ↓
+eventual return/rejection
+```
+
+The important distinction:
+
+```text
+function is suspended
+```
+
+does not mean:
+
+```text
+entire JavaScript runtime is blocked
+```
+
+Other work can proceed.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Calling an async function returns a Promise
+
+```js
+async function f() {
+  return 42;
+}
+
+f() instanceof Promise;
+```
+
+Conceptually:
+
+```text
+fulfilled Promise<42>
+```
+
+### Rule 2 — Code before the first `await` can run synchronously
+
+```js
+async function f() {
+  console.log("A");
+  await something;
+  console.log("B");
+}
+```
+
+Calling `f()` can print `"A"` before the caller continues.
+
+### Rule 3 — `await` suspends the async function's continuation
+
+It does not block the entire JavaScript environment.
+
+### Rule 4 — Awaiting a value normalizes it through Promise-like semantics
+
+```js
+await 42
+```
+
+is valid.
+
+### Rule 5 — Awaiting a rejected promise causes a throw-like failure inside the async function
+
+```js
+try {
+  await Promise.reject(error);
+} catch (error) {
+  // handles rejection
+}
+```
+
+### Rule 6 — A throw from an async function produces a rejected Promise
+
+```js
+async function fail() {
+  throw new Error("boom");
+}
+```
+
+The caller observes:
+
+```text
+rejected Promise
+```
+
+### Rule 7 — A normal return fulfills the async function's Promise
+
+```js
+async function f() {
+  return 42;
+}
+```
+
+### Rule 8 — Returning another Promise is adopted by the async function's completion model
+
+```js
+async function f() {
+  return somePromise;
+}
+```
+
+The caller observes the eventual outcome rather than receiving a useful “Promise of Promise” API shape.
+
+### Rule 9 — Every `await` introduces a continuation boundary
+
+Even:
+
+```js
+await Promise.resolve(42);
+```
+
+does not simply behave like:
+
+```js
+const x = 42;
+```
+
+inside the async function.
+
+### Rule 10 — Sequential awaits are sequential
+
+```js
+const a = await first();
+const b = await second();
+```
+
+The second operation begins only after the first expression has completed if `second()` is invoked after the first await.
+
+### Rule 11 — Start independent work before awaiting to overlap it
+
+```js
+const aPromise = first();
+const bPromise = second();
+
+const [a, b] = await Promise.all([aPromise, bPromise]);
+```
+
+### Rule 12 — `await` itself is not cancellation
+
+The underlying operation may continue after the caller stops waiting.
+
+### Rule 13 — `try/catch` can catch awaited rejection
+
+```js
+try {
+  await task();
+} catch (error) {
+  // handle
+}
+```
+
+### Rule 14 — Unawaited Promise work requires explicit ownership
+
+```js
+task();
+```
+
+should never be interpreted as harmless merely because the function is async.
+
+### Rule 15 — Async scope must match resource lifetime
+
+Do not dispose a resource before the async work using it finishes.
+
+### Rule 16 — `return await` and `return promise` are related but not identical in every observable scenario
+
+The difference becomes especially important around local `try/catch/finally`, error transformation, and async stack diagnostics.
+
+---
+
+## 7. Syntax
+
+### Async function declaration
+
+```js
+async function fetchData() {
+  return value;
+}
+```
+
+### Async function expression
+
+```js
+const fetchData = async function () {
+  return value;
+};
+```
+
+### Async arrow function
+
+```js
+const fetchData = async () => {
+  return value;
+};
+```
+
+### Await
+
+```js
+const result = await promise;
+```
+
+`await` is valid in:
+
+- async functions;
+- modules with top-level await where supported by the module system/runtime.
+
+### Error handling
+
+```js
+async function run() {
+  try {
+    const value = await task();
+    return value;
+  } catch (error) {
+    handle(error);
+  }
+}
+```
+
+### Sequential operations
+
+```js
+const a = await taskA();
+const b = await taskB();
+```
+
+### Concurrent operations
+
+```js
+const aPromise = taskA();
+const bPromise = taskB();
+
+const [a, b] = await Promise.all([
+  aPromise,
+  bPromise
+]);
+```
+
+### Top-level await
+
+In an appropriate module:
+
+```js
+const config = await loadConfig();
+```
+
+Top-level await affects module evaluation and dependency readiness.
+
+The deeper module semantics are covered later in the modules chapters.
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Basic async return
+
+```js
+async function f() {
+  return 42;
+}
+
+f().then(console.log);
+```
+
+Output:
+
+```text
+42
+```
+
+### Example 2 — Basic await
+
+```js
+async function f() {
+  const value = await Promise.resolve(42);
+  console.log(value);
+}
+
+f();
+```
+
+Output:
+
+```text
+42
+```
+
+### Example 3 — Synchronous prefix
+
+```js
+async function f() {
+  console.log("A");
+  await Promise.resolve();
+  console.log("B");
+}
+
+console.log("C");
+f();
+console.log("D");
+```
+
+Typical output:
+
+```text
+C
+A
+D
+B
+```
+
+### Example 4 — Rejection
+
+```js
+async function fail() {
+  throw new Error("boom");
+}
+
+fail().catch(error => {
+  console.log(error.message);
+});
+```
+
+### Example 5 — Await rejection
+
+```js
+async function run() {
+  try {
+    await Promise.reject(new Error("boom"));
+  } catch (error) {
+    console.log(error.message);
+  }
+}
+
+run();
+```
+
+### Example 6 — Sequential operations
+
+```js
+async function load() {
+  const user = await getUser();
+  const profile = await getProfile(user.id);
+
+  return profile;
+}
+```
+
+### Example 7 — Concurrent independent operations
+
+```js
+async function load() {
+  const userPromise = getUser();
+  const configPromise = getConfig();
+
+  const [user, config] = await Promise.all([
+    userPromise,
+    configPromise
+  ]);
+
+  return { user, config };
+}
+```
+
+### Example 8 — Loop with sequential awaits
+
+```js
+for (const item of items) {
+  await process(item);
+}
+```
+
+This is often intentionally sequential.
+
+### Example 9 — Parallel array processing
+
+```js
+const results = await Promise.all(
+  items.map(item => process(item))
+);
+```
+
+This can create unbounded concurrency and therefore requires workload analysis.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+async function f() {
+  console.log("A");
+
+  const value = await Promise.resolve("B");
+
+  console.log(value);
+
+  return "C";
+}
+
+console.log("D");
+
+const promise = f();
+
+console.log("E");
+
+promise.then(value => {
+  console.log(value);
+});
+```
+
+### Step 1
+
+Print:
+
+```text
+D
+```
+
+### Step 2
+
+Call `f()`.
+
+The async function starts executing its body.
+
+### Step 3
+
+Print:
+
+```text
+A
+```
+
+### Step 4
+
+Evaluate:
+
+```js
+await Promise.resolve("B")
+```
+
+The awaited expression is normalized through Promise semantics.
+
+### Step 5
+
+The async function suspends before printing the next line.
+
+The caller receives the async function's result Promise.
+
+### Step 6
+
+Print:
+
+```text
+E
+```
+
+### Step 7
+
+The awaited continuation is scheduled for later execution.
+
+### Step 8
+
+The async function resumes and prints:
+
+```text
+B
+```
+
+### Step 9
+
+The function returns:
+
+```text
+C
+```
+
+The async function's result Promise becomes fulfilled with `"C"`.
+
+### Step 10
+
+Its attached reaction later executes:
+
+```text
+C
+```
+
+Typical output:
+
+```text
+D
+A
+E
+B
+C
+```
+
+This demonstrates:
+
+```text
+async invocation
+→ synchronous prefix
+→ await suspension
+→ continuation
+→ final Promise settlement
+→ consumer reaction
+```
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 Async function result Promise
+
+Calling an async function creates a Promise representing the function's eventual completion.
+
+Conceptually:
+
+```text
+call async function
+     ↓
+completion capability
+     ↓
+result Promise
+```
+
+### 10.2 Execution before suspension
+
+The body can begin synchronously:
+
+```js
+async function f() {
+  doSynchronousWork();
+  await something();
+}
+```
+
+`doSynchronousWork()` executes before the first suspension.
+
+### 10.3 Await operation
+
+At a high level:
+
+```text
+evaluate awaited expression
+        ↓
+normalize/adopt as Promise-like outcome
+        ↓
+suspend current async function
+        ↓
+register fulfillment/rejection continuations
+        ↓
+later resume
+```
+
+### 10.4 Fulfillment resume
+
+If the awaited outcome fulfills:
+
+```text
+resume with fulfillment value
+```
+
+### 10.5 Rejection resume
+
+If it rejects:
+
+```text
+resume through throw-like failure
+```
+
+This is why local `try/catch` works:
+
+```js
+try {
+  await task();
+} catch (error) {
+  ...
+}
+```
+
+### 10.6 Async function return
+
+When the function returns normally:
+
+```text
+return value
+→ fulfill async result Promise
+```
+
+### 10.7 Async function throw
+
+When the function throws:
+
+```text
+throw
+→ reject async result Promise
+```
+
+### 10.8 Returned promise adoption
+
+Example:
+
+```js
+async function f() {
+  return task();
+}
+```
+
+The async function's completion follows the returned promise's outcome.
+
+### 10.9 Promise identity nuance
+
+Although:
+
+```js
+async function f() {
+  return p;
+}
+```
+
+eventually follows `p`, the returned Promise from the async function is not necessarily the same object `p`.
+
+This matters when reasoning about identity:
+
+```js
+const p = Promise.resolve(42);
+
+async function f() {
+  return p;
+}
+
+f() === p; // false
+```
+
+The async function's own Promise completion adopts `p`'s state.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+### 11.1 Async functions are part of ECMAScript
+
+Unlike browser-specific timers, `async function` and `await` are language features.
+
+### 11.2 Async function invocation
+
+The specification defines async function invocation so that the function has a Promise-based completion capability.
+
+### 11.3 `await`
+
+The specification's await evaluation performs Promise-like normalization and sets up continuation behavior.
+
+At a conceptual level:
+
+```text
+await expression
+→ evaluate expression
+→ promise-like normalization
+→ suspend
+→ schedule resume
+```
+
+### 11.4 Awaiting ordinary values
+
+```js
+await 42;
+```
+
+is valid because the await machinery treats the value through Promise resolution semantics.
+
+### 11.5 Awaiting thenables
+
+If:
+
+```js
+await {
+  then(resolve) {
+    resolve(42);
+  }
+}
+```
+
+the thenable protocol can participate in resolution.
+
+### 11.6 Awaiting rejection
+
+A rejection resumes the async function through its throw path.
+
+This is why:
+
+```js
+try {
+  await Promise.reject(error);
+} catch (error) {
+  ...
+}
+```
+
+works.
+
+### 11.7 Async completion
+
+The async function's result Promise is fulfilled when the function completes normally and rejected when it completes abruptly through a throw.
+
+### 11.8 Job scheduling
+
+Continuation execution is connected to Promise/Job machinery.
+
+The exact host integration remains a separate layer.
+
+### 11.9 `return await`
+
+Consider:
+
+```js
+async function f() {
+  return await g();
+}
+```
+
+versus:
+
+```js
+async function f() {
+  return g();
+}
+```
+
+Both commonly produce the same eventual outcome.
+
+But `return await` causes the function to await `g()` within its own async control flow, which can matter for:
+
+- local `try/catch`;
+- local `finally`;
+- error transformation;
+- observable sequencing;
+- debugging stack behavior in some runtimes.
+
+Use it when the surrounding function needs to observe the awaited outcome.
+
+### 11.10 Example where `return await` matters
+
+```js
+async function f() {
+  try {
+    return await g();
+  } catch (error) {
+    return fallback(error);
+  }
+}
+```
+
+The local `catch` can observe the rejection.
+
+Compare:
+
+```js
+async function f() {
+  try {
+    return g();
+  } catch (error) {
+    return fallback(error);
+  }
+}
+```
+
+The local `catch` does not catch the later rejection from `g()`.
+
+### 11.11 `return` versus `return await`
+
+Do not adopt:
+
+```text
+always use return await
+```
+
+or:
+
+```text
+never use return await
+```
+
+as a universal rule.
+
+The correct choice depends on whether the local function needs to observe the awaited result before completing.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Awaiting an already-fulfilled Promise
+
+Even when:
+
+```js
+await Promise.resolve(42)
+```
+
+the async function continuation does not simply continue within the same synchronous statement execution.
+
+The continuation is deferred.
+
+### 12.2 Awaiting a rejected Promise
+
+```js
+async function f() {
+  await Promise.reject(new Error("boom"));
+}
+```
+
+The returned Promise from `f()` rejects.
+
+### 12.3 Awaiting a thenable
+
+```js
+async function f() {
+  const value = await {
+    then(resolve) {
+      resolve(42);
+    }
+  };
+
+  return value;
+}
+```
+
+The thenable participates in Promise resolution.
+
+### 12.4 Awaiting a forever-pending Promise
+
+```js
+await new Promise(() => {});
+```
+
+The async function never reaches subsequent statements unless the awaited operation eventually settles.
+
+Its associated Promise remains pending.
+
+### 12.5 Sequential versus concurrent awaits
+
+Sequential:
+
+```js
+await a();
+await b();
+```
+
+Concurrency:
+
+```js
+const pa = a();
+const pb = b();
+
+await Promise.all([pa, pb]);
+```
+
+The difference is when the underlying operations are initiated.
+
+### 12.6 Conditional concurrency
+
+```js
+const aPromise = a();
+
+if (needsB) {
+  const bPromise = b();
+  return await Promise.all([aPromise, bPromise]);
+}
+
+return await aPromise;
+```
+
+Be careful: initiating work before knowing it is needed can itself be wasteful.
+
+### 12.7 `await` in loops
+
+A loop can intentionally enforce:
+
+```text
+one item at a time
+```
+
+This can be correct when:
+
+- order matters;
+- rate limits matter;
+- each operation depends on the previous.
+
+### 12.8 `forEach` and async
+
+This is a classic bug:
+
+```js
+items.forEach(async item => {
+  await process(item);
+});
+```
+
+The outer code does not await the callbacks.
+
+Better:
+
+```js
+await Promise.all(
+  items.map(item => process(item))
+);
+```
+
+or sequentially:
+
+```js
+for (const item of items) {
+  await process(item);
+}
+```
+
+### 12.9 Async callbacks and APIs
+
+An API that accepts callbacks does not automatically await an async callback:
+
+```js
+items.forEach(async item => {
+  await work(item);
+});
+```
+
+The API controls the callback lifecycle.
+
+### 12.10 Async function as callback
+
+```js
+button.addEventListener("click", async () => {
+  await doWork();
+});
+```
+
+The browser dispatch mechanism does not automatically await the returned Promise for the purpose of event dispatch.
+
+The Promise exists independently of event listener invocation semantics.
+
+### 12.11 Async errors at host boundaries
+
+Errors in an async event handler often become Promise rejections.
+
+They are not necessarily caught by a surrounding synchronous `try/catch` around the event registration call.
+
+### 12.12 Detached async functions
+
+```js
+async function save() {
+  await db.write();
+}
+
+save();
+```
+
+The caller has chosen not to observe the returned Promise.
+
+This can create:
+
+```text
+unhandled failure
+unclear completion
+unclear lifecycle
+```
+
+### 12.13 Structured async ownership
+
+A better design usually makes ownership explicit:
+
+```js
+await save();
+```
+
+or:
+
+```js
+const task = save();
+registerOwnedTask(task);
+```
+
+### 12.14 `finally` with async cleanup
+
+```js
+try {
+  await work();
+} finally {
+  await cleanup();
+}
+```
+
+The function does not finish until the cleanup completes, subject to cleanup success/failure.
+
+### 12.15 Async resource management
+
+This connects directly to:
+
+```js
+{
+  await using resource = acquire();
+  await work(resource);
+}
+```
+
+The resource lifetime must encompass the awaited work.
+
+### 12.16 Cancellation
+
+This:
+
+```js
+await operation();
+```
+
+does not imply:
+
+```text
+operation is cancellable
+```
+
+Cancellation must be communicated through an explicit mechanism such as `AbortSignal`.
+
+### 12.17 Timeout wrappers
+
+```js
+await Promise.race([
+  operation(),
+  timeout(1000)
+]);
+```
+
+is not cancellation.
+
+### 12.18 Retries
+
+Async functions make retry loops readable:
+
+```js
+for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!shouldRetry(error, attempt)) {
+      throw error;
+    }
+  }
+}
+```
+
+The policy must define:
+
+- retryable failures;
+- backoff;
+- jitter;
+- cancellation;
+- maximum attempts.
+
+### 12.19 Async recursion
+
+Recursive async functions can appear safe because each recursion may suspend:
+
+```js
+async function poll() {
+  await delay(1000);
+  return poll();
+}
+```
+
+This still creates a perpetual lifecycle and needs explicit cancellation/shutdown.
+
+### 12.20 Async stack traces
+
+Modern engines may provide useful async stack information, but exact stack formatting and retention behavior are implementation-specific.
+
+Use runtime diagnostic tooling rather than relying on universal stack formatting.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 `await` of a primitive
+
+```js
+const x = await 42;
+```
+
+works.
+
+### 13.2 `await` of a thenable that throws
+
+```js
+const value = await {
+  get then() {
+    throw new Error("boom");
+  }
+};
+```
+
+The async function rejects.
+
+### 13.3 `await` of a thenable that resolves twice
+
+Promise resolution semantics ensure only the first effective settlement wins.
+
+### 13.4 Awaiting a promise that never settles
+
+The async function stays pending.
+
+### 13.5 Returning a rejected Promise inside async
+
+```js
+async function f() {
+  return Promise.reject("boom");
+}
+```
+
+The async function's result rejects.
+
+### 13.6 Throwing after an await
+
+```js
+async function f() {
+  await task();
+  throw new Error("boom");
+}
+```
+
+The async function's result rejects.
+
+### 13.7 `return await` in `finally`
+
+```js
+async function f() {
+  try {
+    return await task();
+  } finally {
+    await cleanup();
+  }
+}
+```
+
+Cleanup delays function completion.
+
+If cleanup fails, the final result reflects the cleanup failure according to normal abrupt-completion semantics.
+
+### 13.8 `finally` masking
+
+```js
+async function f() {
+  try {
+    throw new Error("A");
+  } finally {
+    throw new Error("B");
+  }
+}
+```
+
+The resulting Promise rejects with the failure from the final completion path.
+
+### 13.9 `await` inside `finally`
+
+```js
+async function f() {
+  try {
+    return 1;
+  } finally {
+    await cleanup();
+  }
+}
+```
+
+The function must complete cleanup before the returned Promise fulfills.
+
+### 13.10 Async `forEach`
+
+`forEach` does not await callback Promises.
+
+### 13.11 `map(async ...)`
+
+```js
+const values = items.map(async item => process(item));
+```
+
+produces an array of Promises, not resolved values.
+
+Use:
+
+```js
+const values = await Promise.all(
+  items.map(item => process(item))
+);
+```
+
+### 13.12 Async constructor
+
+Class constructors cannot be declared `async`.
+
+Use a static factory:
+
+```js
+class Service {
+  static async create() {
+    const service = new Service();
+    await service.initialize();
+    return service;
+  }
+}
+```
+
+### 13.13 Async arrow and lexical `this`
+
+An async arrow preserves lexical `this` just like a normal arrow function.
+
+### 13.14 Top-level await cycle
+
+Module dependency cycles involving top-level await can create complex readiness behavior.
+
+Module semantics must be understood separately.
+
+### 13.15 Awaiting the same pending Promise multiple times
+
+Multiple async functions can await one shared promise.
+
+They resume according to their respective reactions when it settles.
+
+### 13.16 Shared Promise rejection
+
+Many consumers may observe the same rejection.
+
+Failure policy should avoid duplicate noisy handling.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “Async functions run on another thread.”
+
+No.
+
+They use Promise-based asynchronous semantics.
+
+### Misconception 2 — “`await` blocks the thread.”
+
+It suspends the async function's continuation.
+
+It does not block unrelated JavaScript execution.
+
+### Misconception 3 — “Async makes CPU work non-blocking.”
+
+No.
+
+CPU work after or before `await` still executes synchronously on the relevant JavaScript execution agent.
+
+### Misconception 4 — “An async function starts entirely later.”
+
+No.
+
+Its synchronous prefix may run immediately.
+
+### Misconception 5 — “Awaiting an already-resolved Promise is synchronous.”
+
+No.
+
+Continuation remains asynchronous.
+
+### Misconception 6 — “Every await makes independent tasks concurrent.”
+
+No.
+
+`await` often creates sequential execution.
+
+### Misconception 7 — “`await` cancels the Promise when the function exits.”
+
+No.
+
+### Misconception 8 — “`Promise.all` is required for every async operation.”
+
+No.
+
+Sequential execution can be intentional and necessary.
+
+### Misconception 9 — “`forEach` waits for async callbacks.”
+
+No.
+
+### Misconception 10 — “`map(async ...)` produces resolved values.”
+
+No.
+
+It produces Promises.
+
+### Misconception 11 — “Returning a Promise from async creates a Promise of Promise API.”
+
+The async function adopts the returned Promise's eventual outcome.
+
+### Misconception 12 — “`return await` is always bad.”
+
+No.
+
+It is useful when local error/finally handling needs to observe the awaited result.
+
+### Misconception 13 — “`return await` is always necessary.”
+
+No.
+
+If no local observation is needed, directly returning the Promise can be simpler.
+
+### Misconception 14 — “Async event handlers are awaited by the browser.”
+
+Generally, event dispatch does not treat an async listener's returned Promise as a completion contract for the event.
+
+### Misconception 15 — “If the caller does not await, the work stops.”
+
+No.
+
+The async operation can continue.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Accidental serialization
+
+```js
+await a();
+await b();
+await c();
+```
+
+without checking independence.
+
+### Mistake 2 — Unbounded concurrency
+
+```js
+await Promise.all(items.map(process));
+```
+
+with huge inputs.
+
+### Mistake 3 — Async `forEach`
+
+### Mistake 4 — Missing `await` on important work
+
+```js
+save();
+return response;
+```
+
+### Mistake 5 — Missing return in Promise callback chains
+
+### Mistake 6 — Treating timeout as cancellation
+
+### Mistake 7 — Catching only synchronous call-site errors
+
+```js
+try {
+  asyncTask();
+} catch {
+  // does not catch later rejection
+}
+```
+
+### Mistake 8 — Resource cleanup before async completion
+
+### Mistake 9 — Detached background work without supervision
+
+### Mistake 10 — Retrying every error
+
+### Mistake 11 — Forgetting backoff and jitter
+
+### Mistake 12 — Creating unnecessary async functions
+
+```js
+const f = async x => x;
+```
+
+when no asynchronous behavior is needed can add Promise semantics and overhead.
+
+### Mistake 13 — Ignoring pending operation memory
+
+### Mistake 14 — Assuming async means scalable
+
+A system can remain asynchronous while still being bottlenecked by CPU, memory, database capacity, or downstream limits.
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Concept | Main idea | Key difference |
+|---|---|---|
+| `async` function | Promise-returning function | Completion is Promise-based |
+| `await` | Suspend current async function until Promise-like outcome | Structured continuation |
+| `.then()` | Register Promise reaction | Explicit chain |
+| Callback | API-specific completion callback | No universal Promise contract |
+| `Promise.all` | Aggregate concurrent/independent outcomes | Does not create cancellation |
+| Generator | Suspends/resumes synchronously around `yield` | Different protocol and completion model |
+| Worker | Separate execution agent | Actual parallel JS execution possible |
+| Thread | Execution resource | Not created by async/await |
+| AbortSignal | Cancellation notification | Separate lifecycle mechanism |
+| `try/finally` | Cleanup/control flow | Can span awaits inside async functions |
+
+### Async/await vs `.then()`
+
+Equivalent broad intent:
+
+```js
+const value = await task();
+```
+
+versus:
+
+```js
+return task().then(value => {
+  return value;
+});
+```
+
+But async/await integrates more naturally with ordinary statement-level control flow.
+
+### Async/await vs generators
+
+Generators provide explicit suspension with:
+
+```js
+yield
+```
+
+Async functions integrate suspension with Promise completion.
+
+### Async/await vs workers
+
+Async/await:
+
+```text
+convenient asynchronous control flow
+```
+
+Worker:
+
+```text
+separate execution agent
+```
+
+### Async/await vs cancellation
+
+Async/await:
+
+```text
+how to wait
+```
+
+Cancellation:
+
+```text
+how to stop
+```
+
+### Sequential await vs concurrent Promise aggregation
+
+Sequential:
+
+```text
+A
+↓
+B
+↓
+C
+```
+
+Concurrent initiation:
+
+```text
+A ─┐
+B ─┼→ aggregate
+C ─┘
+```
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 `await` has continuation overhead
+
+Each suspension/resumption involves Promise/job machinery.
+
+Do not place unnecessary async boundaries in extremely hot synchronous code.
+
+### 17.2 Async function calls create Promise semantics
+
+Calling:
+
+```js
+async function f() {
+  return 1;
+}
+```
+
+still creates Promise-based completion.
+
+### 17.3 Sequential awaits increase wall-clock latency
+
+Independent operations should be evaluated for safe concurrent initiation.
+
+### 17.4 Unbounded concurrency increases resource pressure
+
+```js
+await Promise.all(hugeArray.map(process));
+```
+
+may create massive:
+
+- Promise counts;
+- closures;
+- network load;
+- memory use.
+
+### 17.5 Bounded concurrency
+
+A scheduler can control:
+
+```text
+active operations ≤ limit
+```
+
+and often provides a better production cost model.
+
+### 17.6 Async does not reduce CPU cost
+
+Heavy processing remains heavy.
+
+### 17.7 Serialization across awaits
+
+Every dependency boundary can add latency.
+
+Measure:
+
+```text
+operation time
++
+queueing
++
+await/scheduling overhead
++
+dependency latency
+```
+
+### 17.8 `return await`
+
+In modern engines, simplistic claims that `return await` is always a major performance problem are unreliable.
+
+The decision should primarily be semantic unless profiling demonstrates a real hot-path difference.
+
+### 17.9 Promise allocation and GC
+
+Heavy async workloads can create substantial temporary object graphs.
+
+### 17.10 Concurrency is not free
+
+Higher concurrency can reduce latency until a bottleneck becomes saturated.
+
+Beyond that point it can increase:
+
+```text
+queueing
+timeouts
+retries
+memory
+```
+
+---
+
+## 18. Memory Considerations
+
+### 18.1 Async locals can survive suspension
+
+```js
+async function f() {
+  const data = createLargeData();
+  await slowOperation();
+  use(data);
+}
+```
+
+`data` may remain live across the suspension.
+
+### 18.2 Closures
+
+Continuation functions can retain surrounding state.
+
+### 18.3 Pending promises
+
+Forever-pending operations can retain:
+
+- reactions;
+- closures;
+- resources.
+
+### 18.4 Large Promise.all
+
+Aggregators can retain:
+
+- input references;
+- result arrays;
+- reaction state.
+
+### 18.5 Detached work
+
+Background tasks can extend object lifetime unexpectedly.
+
+### 18.6 Cancellation reduces retention
+
+Actually stopping abandoned work can release references earlier.
+
+### 18.7 Async queues
+
+An unbounded queue is an unbounded memory-risk unless downstream capacity matches production rate.
+
+### 18.8 Resource state
+
+An open resource may remain live through an async continuation.
+
+Resource management must therefore include both:
+
+```text
+memory lifetime
+resource lifetime
+```
+
+---
+
+## 19. Security Considerations
+
+### 19.1 Race conditions across await
+
+State can change during suspension:
+
+```text
+check
+↓
+await
+↓
+use
+```
+
+The state at use time may differ.
+
+### 19.2 Authorization windows
+
+Security-sensitive authorization decisions may need to be repeated or tied to immutable state.
+
+### 19.3 Request abandonment
+
+A client may disconnect while server-side async work continues.
+
+The server needs cancellation or lifecycle policies.
+
+### 19.4 Unbounded concurrency
+
+Attackers can exploit fan-out endpoints to exhaust resources.
+
+### 19.5 Timeout without cancellation
+
+A timeout can leave expensive operations running.
+
+### 19.6 Detached async failures
+
+Ignored rejections can hide security-relevant failures.
+
+### 19.7 Error leakage
+
+Async boundaries should preserve internal diagnostics without automatically exposing them.
+
+### 19.8 Resource lifetime
+
+A long-lived async task can keep credentials, buffers, or sockets alive longer than intended.
+
+### 19.9 Stale writes
+
+An older asynchronous result can overwrite newer state unless versioning or cancellation is used.
+
+---
+
+## 20. Production Usage
+
+### 20.1 HTTP handler
+
+```js
+async function handler(req, res) {
+  try {
+    const user = await getUser(req.params.id);
+    const data = await buildResponse(user);
+
+    res.json(data);
+  } catch (error) {
+    handleHttpError(res, error);
+  }
+}
+```
+
+The boundary should explicitly own:
+
+- errors;
+- timeout;
+- cancellation;
+- response lifecycle.
+
+### 20.2 Concurrent dependency loading
+
+```js
+async function loadDashboard(id) {
+  const userPromise = getUser(id);
+  const statsPromise = getStats(id);
+  const notificationsPromise = getNotifications(id);
+
+  const [user, stats, notifications] = await Promise.all([
+    userPromise,
+    statsPromise,
+    notificationsPromise
+  ]);
+
+  return {
+    user,
+    stats,
+    notifications
+  };
+}
+```
+
+Use concurrency only when the operations are independent and capacity allows it.
+
+### 20.3 Bounded concurrency
+
+```js
+async function mapLimited(items, limit, worker) {
+  // production implementation required
+}
+```
+
+Use for:
+
+- batch jobs;
+- API fan-out;
+- migration scripts;
+- image processing;
+- queue consumers.
+
+### 20.4 Retry with cancellation
+
+```js
+async function retry(operation, options) {
+  // bounded attempts + backoff + AbortSignal
+}
+```
+
+Do not retry blindly.
+
+### 20.5 Transaction lifecycle
+
+```js
+async function runTransaction() {
+  const connection = await acquire();
+
+  try {
+    const tx = await connection.begin();
+
+    try {
+      await doWork(tx);
+      await tx.commit();
+    } catch (error) {
+      await tx.rollback();
+      throw error;
+    }
+  } finally {
+    await connection.close();
+  }
+}
+```
+
+Later resource-management features can simplify this structure.
+
+### 20.6 Graceful shutdown
+
+A service should track important async work:
+
+```text
+in-flight requests
+background jobs
+resource cleanup
+workers
+streams
+```
+
+### 20.7 Request cancellation
+
+```js
+async function handler(req) {
+  const controller = createLinkedAbortController(req);
+
+  return fetchDependency({
+    signal: controller.signal
+  });
+}
+```
+
+The exact implementation depends on the framework and transport.
+
+### 20.8 Streaming
+
+Async functions often coordinate stream consumption:
+
+```js
+for await (const chunk of stream) {
+  await process(chunk);
+}
+```
+
+Chapter 38 goes deeper into async iteration and streaming.
+
+### 20.9 Observability
+
+Instrument:
+
+- operation duration;
+- await-boundary latency where useful;
+- concurrency;
+- retries;
+- cancellation;
+- rejection;
+- dependency timing;
+- request context.
+
+### 20.10 Background work
+
+Use explicit ownership:
+
+```text
+request-bound
+or
+application-owned
+or
+queue-owned
+```
+
+Do not accidentally create application-owned work from request-local resources.
+
+---
+
+## 21. Implementation From Scratch
+
+### Stage 1 — Guided
+
+Implement a callback-to-Promise adapter:
+
+```js
+function promisifyOne(callbackApi) {
+  return (...args) =>
+    new Promise((resolve, reject) => {
+      callbackApi(...args, (error, value) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(value);
+      });
+    });
+}
+```
+
+Then consume it with async/await.
+
+### Stage 2 — Partially Guided
+
+Build:
+
+```js
+async function sequentialPipeline(steps) {}
+```
+
+Requirements:
+
+- preserve output;
+- stop on failure;
+- expose original cause;
+- execute in order.
+
+### Stage 3 — No Reference
+
+Build:
+
+```js
+async function mapConcurrent(items, limit, worker) {}
+```
+
+Requirements:
+
+- bounded concurrency;
+- preserve result order;
+- propagate failure;
+- cancellation support;
+- cleanup;
+- graceful completion.
+
+### Stage 4 — Edge-Case Hardened
+
+Add:
+
+- empty input;
+- synchronous worker throws;
+- asynchronous rejection;
+- cancellation before start;
+- cancellation during processing;
+- worker timeout;
+- partial completion;
+- cleanup failure.
+
+### Stage 5 — Production Grade
+
+Implement:
+
+```js
+class AsyncExecutor {
+  constructor(options) {}
+
+  submit(task, options) {}
+
+  cancel(id) {}
+
+  async close(options) {}
+
+  metrics() {}
+}
+```
+
+Track:
+
+```text
+queued
+active
+completed
+failed
+cancelled
+timed out
+```
+
+The implementation is a learning exercise, not a replacement for the platform's native Promise system.
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Ordering
+
+Predict:
+
+```js
+async function f() {
+  console.log("A");
+  await Promise.resolve();
+  console.log("B");
+}
+
+console.log("C");
+f();
+console.log("D");
+```
+
+### Exercise 2 — Async throw
+
+```js
+async function f() {
+  throw new Error("boom");
+}
+
+try {
+  f();
+} catch {
+  console.log("caught");
+}
+```
+
+Does `"caught"` print?
+
+Why?
+
+### Exercise 3 — Missing await
+
+```js
+async function saveEverything() {
+  saveA();
+  saveB();
+}
+```
+
+Does completion guarantee A and B are finished?
+
+### Exercise 4 — `forEach`
+
+```js
+await items.forEach(async item => {
+  await process(item);
+});
+```
+
+Why is this wrong?
+
+### Exercise 5 — Sequential bottleneck
+
+```js
+for (const id of ids) {
+  results.push(await fetch(id));
+}
+```
+
+Determine whether ordering or concurrency requirements justify the design.
+
+### Exercise 6 — Timeout
+
+```js
+await Promise.race([
+  operation(),
+  timeout(1000)
+]);
+```
+
+Identify what happens after timeout.
+
+### Exercise 7 — `return await`
+
+Compare:
+
+```js
+async function a() {
+  try {
+    return await task();
+  } catch (error) {
+    return fallback(error);
+  }
+}
+```
+
+with:
+
+```js
+async function b() {
+  try {
+    return task();
+  } catch (error) {
+    return fallback(error);
+  }
+}
+```
+
+Explain the behavioral difference.
+
+### Exercise 8 — Resource lifetime
+
+```js
+{
+  using resource = createResource();
+  startAsyncWork(resource);
+}
+```
+
+Identify the lifecycle bug.
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+async function syncUsers(users) {
+  users.forEach(async user => {
+    try {
+      const profile = await fetchProfile(user.id);
+      await saveProfile(profile);
+    } catch (error) {
+      console.error(error);
+    }
+  });
+
+  return "done";
+}
+```
+
+Identify at least ten issues involving:
+
+- completion semantics;
+- concurrency;
+- errors;
+- ownership;
+- cancellation;
+- resource lifetime;
+- observability;
+- return contract;
+- memory;
+- shutdown.
+
+Redesign it for production.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What does `async` do?
+2. What does an async function return?
+3. What does `await` do?
+4. Does `await` block the thread?
+5. Can async function code execute synchronously?
+6. What happens when an async function throws?
+7. What happens when `await` receives a rejected Promise?
+8. Can you await a normal value?
+9. What happens when an async function returns a Promise?
+10. Why is `await` useful?
+
+### Intermediate
+
+11. What is the difference between sequential and concurrent awaits?
+12. Why is async `forEach` problematic?
+13. Why does `map(async ...)` produce Promises?
+14. What is accidental serialization?
+15. What happens if an awaited Promise never settles?
+16. Why doesn't `await` cancel work?
+17. When should you use `Promise.all`?
+18. When should you use `allSettled`?
+19. When is `return await` useful?
+20. Why does an async event handler not become an event-dispatch completion contract?
+
+### Advanced
+
+21. Explain async function completion semantics.
+22. Explain `await` using Promise resolution and reaction jobs.
+23. Explain why awaiting an already-fulfilled Promise still creates a continuation boundary.
+24. Explain thenable assimilation through `await`.
+25. Explain how exceptions inside async functions become rejections.
+26. Explain how awaited rejection becomes a local throw path.
+27. Explain async function Promise identity.
+28. Explain resource lifetime across await.
+29. Explain memory retention across suspension.
+30. Explain why timeout is not cancellation.
+
+### Principal-Level
+
+31. Design an async API for a production service.
+32. Design bounded concurrency.
+33. Design cancellation propagation.
+34. Design request-scoped async ownership.
+35. Design graceful shutdown for in-flight Promises.
+36. Design retry logic with backoff and jitter.
+37. Diagnose a service whose latency increased after refactoring Promise chains to async/await.
+38. Diagnose an async memory leak.
+39. Design a safe detached background-task system.
+40. Defend sequential awaits where they reduce concurrency but improve correctness.
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+async function f() {
+  console.log("A");
+  await Promise.resolve();
+  console.log("B");
+}
+
+console.log("C");
+
+f();
+
+console.log("D");
+```
+
+Expected:
+
+```text
+C
+A
+D
+B
+```
+
+### Exercise B
+
+```js
+async function f() {
+  return 42;
+}
+
+console.log("A");
+
+f().then(value => {
+  console.log(value);
+});
+
+console.log("B");
+```
+
+Expected:
+
+```text
+A
+B
+42
+```
+
+### Exercise C
+
+```js
+async function f() {
+  try {
+    await Promise.reject(new Error("A"));
+  } catch (error) {
+    console.log(error.message);
+    return "B";
+  }
+}
+
+f().then(value => console.log(value));
+```
+
+Expected:
+
+```text
+A
+B
+```
+
+### Exercise D
+
+```js
+async function f() {
+  console.log("A");
+  await Promise.resolve();
+  console.log("B");
+}
+
+async function g() {
+  console.log("C");
+  await f();
+  console.log("D");
+}
+
+g();
+
+Promise.resolve().then(() => {
+  console.log("E");
+});
+
+console.log("F");
+```
+
+Predict carefully.
+
+### Exercise E
+
+```js
+const a = async () => {
+  console.log("A");
+  await null;
+  console.log("B");
+};
+
+const b = async () => {
+  console.log("C");
+  await null;
+  console.log("D");
+};
+
+console.log("E");
+
+a();
+b();
+
+console.log("F");
+```
+
+Explain:
+
+```text
+synchronous prefixes
+suspension
+continuation ordering
+```
+
+### Exercise F
+
+```js
+async function f() {
+  try {
+    return await Promise.reject("A");
+  } catch (error) {
+    return "B";
+  }
+}
+
+f().then(console.log);
+```
+
+Predict the final value.
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Async state machine
+
+Draw the state transitions for:
+
+```js
+async function f() {
+  const a = await taskA();
+  const b = await taskB(a);
+  return b;
+}
+```
+
+Mark:
+
+```text
+running
+suspended
+resumed
+fulfilled
+rejected
+```
+
+### Exercise 2 — Sequential/concurrent comparison
+
+Implement the same workload as:
+
+```text
+sequential
+fully concurrent
+bounded concurrent
+```
+
+Measure:
+
+- wall-clock latency;
+- memory;
+- dependency load;
+- failure behavior.
+
+### Exercise 3 — Production async map
+
+Implement:
+
+```js
+mapLimited(items, {
+  concurrency,
+  signal,
+  timeout
+}, worker)
+```
+
+Requirements:
+
+- ordered results;
+- bounded active work;
+- cancellation;
+- timeout;
+- error propagation;
+- cleanup.
+
+### Exercise 4 — Async transaction
+
+Build a transaction helper that:
+
+```text
+acquire
+→ begin
+→ operation
+→ commit OR rollback
+→ close
+```
+
+Test every failure boundary.
+
+### Exercise 5 — Request ownership
+
+Design:
+
+```text
+HTTP request
+  ├── async dependency A
+  ├── async dependency B
+  └── request-scoped resource
+```
+
+Ensure no task continues using the resource after the request scope closes.
+
+### Exercise 6 — Retry policy
+
+Implement:
+
+```js
+retry(operation, {
+  retries,
+  baseDelay,
+  signal
+})
+```
+
+Add:
+
+- exponential backoff;
+- jitter;
+- retry predicate;
+- cancellation;
+- final error cause.
+
+### Exercise 7 — Background task supervisor
+
+Build:
+
+```js
+class TaskSupervisor {
+  start(task) {}
+  stop(id) {}
+  async shutdown() {}
+}
+```
+
+Requirements:
+
+- ownership;
+- error handling;
+- cancellation;
+- graceful shutdown;
+- metrics.
+
+### Exercise 8 — Async memory investigation
+
+Create a workload with:
+
+```text
+large closure
+pending Promise
+long await
+```
+
+Measure retained memory and determine when references can be released.
+
+---
+
+## 27. Key Takeaways
+
+1. `async` functions provide Promise-based completion.
+2. Calling an async function returns a Promise.
+3. Code before the first suspension point can execute synchronously.
+4. `await` suspends the current async function's continuation.
+5. `await` does not block the whole JavaScript environment.
+6. Awaiting ordinary values is valid.
+7. Awaiting a rejected Promise creates a throw-like failure path inside the async function.
+8. A throw inside an async function becomes rejection of its result Promise.
+9. Returning normally fulfills the result Promise.
+10. Returning a Promise causes the async completion to follow that Promise's outcome.
+11. Awaiting an already-fulfilled Promise still crosses an asynchronous continuation boundary.
+12. Sequential awaits are truly sequential when later operations are not initiated until after earlier completion.
+13. Independent operations can overlap by being started before the aggregate await.
+14. `Promise.all` coordinates concurrent completion but does not provide cancellation.
+15. `await` is a waiting/control-flow mechanism, not a cancellation mechanism.
+16. `return await` is useful when the local async function needs to observe the awaited outcome.
+17. Async callbacks are not automatically awaited by every host API.
+18. `forEach(async ...)` does not create an awaitable aggregate.
+19. `map(async ...)` creates an array of Promises.
+20. Async suspension can retain local variables and closures.
+21. Resource scope must encompass all async work that depends on the resource.
+22. Timeouts do not automatically stop underlying operations.
+23. Unbounded async concurrency can overload memory and downstream systems.
+24. Async architecture must define ownership, errors, cancellation, retry, timeout, and shutdown.
+25. The central principle is:
+
+> `async/await` makes asynchronous control flow look sequential while preserving asynchronous execution; correctness depends on understanding exactly where execution suspends, what continues concurrently, and who owns the underlying work.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+
+### Builds Toward
+
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 40 — Observables / Reactive
+- Chapter 45 — Memory / GC
+- Chapter 46 — Weak Refs / Finalization
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 58 — Node Architecture
+- Chapter 59 — Node Core APIs
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 78 — Production JS Architecture
+- Chapter 79 — API Design
+- Chapter 82 — API Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 89 — Code Review / Refactoring
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 104 — Production HTTP Client
+- Chapter 105 — Node REST API
+- Chapter 106 — Real-time WebSocket
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- Promise
+- Promise reaction
+- Job
+- Microtask
+- Async function
+- Await
+- Thenable
+- Cancellation
+- AbortSignal
+- Timeout
+- Retry
+- Backoff
+- Concurrency
+- Backpressure
+- Resource ownership
+- Structured concurrency
+- Event loop
+- Error propagation
+- Observability
+- Graceful shutdown
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- execution contexts;
+- abrupt completion;
+- Promise resolution;
+- Promise jobs;
+- microtasks;
+- error handling;
+- resource disposal;
+- browser and Node event loops.
+
+### Why This Chapter Matters Later
+
+`async/await` is where the Promise and event-loop models become the primary day-to-day syntax of production JavaScript.
+
+The major engineering risk is that readable syntax can hide important scheduling behavior.
+
+This:
+
+```js
+await operation();
+```
+
+looks simple.
+
+But a principal engineer must still ask:
+
+```text
+What operation?
+How long?
+What resources are held?
+Can it be cancelled?
+Who owns it?
+What happens if it fails?
+Is it sequential unnecessarily?
+Can it race with another task?
+What memory survives across the await?
+What happens during shutdown?
+```
+
+The central principle is:
+
+> Readable asynchronous code is not automatically correct asynchronous architecture.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 36 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Explain async functions.
+- [ ] Explain async function Promise completion.
+- [ ] Explain `await`.
+- [ ] Explain suspension/resumption.
+- [ ] Explain synchronous prefix execution.
+- [ ] Explain await of ordinary values.
+- [ ] Explain await of fulfilled/rejected Promises.
+- [ ] Explain awaited thenables.
+- [ ] Explain async return/throw behavior.
+- [ ] Explain `return await`.
+
+### Predictive Mastery
+
+- [ ] Predict async prefix ordering.
+- [ ] Predict continuation ordering.
+- [ ] Predict rejected-await behavior.
+- [ ] Predict chained async execution.
+- [ ] Predict sequential vs concurrent workloads.
+- [ ] Predict `forEach(async ...)` behavior.
+- [ ] Predict `map(async ...)` results.
+- [ ] Predict resource lifetime across await.
+- [ ] Predict timeout vs cancellation behavior.
+
+### Implementation
+
+- [ ] Build sequential async pipelines.
+- [ ] Build concurrent async pipelines.
+- [ ] Build bounded async concurrency.
+- [ ] Build cancellation-aware async execution.
+- [ ] Build timeout-aware operations.
+- [ ] Build retry with backoff.
+- [ ] Build task supervision.
+- [ ] Build async transaction lifecycle.
+
+### Debugging
+
+- [ ] Diagnose missing await.
+- [ ] Diagnose accidental serialization.
+- [ ] Diagnose unbounded concurrency.
+- [ ] Diagnose async `forEach`.
+- [ ] Diagnose detached Promises.
+- [ ] Diagnose timeout/cancellation confusion.
+- [ ] Diagnose resource use-after-disposal.
+- [ ] Diagnose async memory retention.
+- [ ] Diagnose stale async results.
+
+### Production Engineering
+
+- [ ] Design async API contracts.
+- [ ] Define ownership.
+- [ ] Define cancellation.
+- [ ] Define timeout.
+- [ ] Define retry policy.
+- [ ] Define graceful shutdown.
+- [ ] Instrument async operations.
+- [ ] Control concurrency and backpressure.
+- [ ] Preserve resource lifetime across awaits.
+
+### Interview Readiness
+
+- [ ] Explain `async`/`await` precisely.
+- [ ] Explain why await does not block the thread.
+- [ ] Explain synchronous prefix execution.
+- [ ] Explain async error propagation.
+- [ ] Explain sequential vs concurrent awaits.
+- [ ] Explain `return await`.
+- [ ] Explain async callback limitations.
+- [ ] Design production-grade async workflows.
+- [ ] Defend concurrency and ownership decisions.
+
+### Track A — Core Theory
+
+- [ ] Understand async-function completion.
+- [ ] Understand await semantics.
+- [ ] Understand suspension/resumption.
+- [ ] Understand Promise/Job integration.
+- [ ] Understand async error flow.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production-oriented async executor reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed async debugging.
+- [ ] Completed code review.
+- [ ] Completed bounded concurrency design.
+- [ ] Completed cancellation design.
+- [ ] Defended async architecture trade-offs.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 36 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What does an async function return?
+2. What can execute before the first await?
+3. What does await suspend?
+4. What happens when awaiting an ordinary value?
+5. What happens when awaiting a rejected Promise?
+6. What happens when an async function throws?
+7. What happens when an async function returns a Promise?
+8. Why does `await Promise.resolve()` still introduce a continuation boundary?
+9. What is the difference between sequential and concurrent awaits?
+10. Why is async `forEach` wrong for waiting?
+11. Why does `map(async ...)` produce Promises?
+12. When is `return await` useful?
+13. Why doesn't await cancel the underlying operation?
+14. How do resources interact with await?
+15. How can async suspension retain memory?
+16. How would you implement bounded async concurrency?
+17. How would you design cancellation?
+18. How would you design graceful shutdown for async work?
+19. How would you diagnose accidental serialization?
+20. How would you diagnose an async memory leak?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit async function completion
+- [ ] Revisit await suspension/resumption
+- [ ] Revisit sequential vs concurrent awaits
+- [ ] Revisit return await
+- [ ] Revisit async callback pitfalls
+- [ ] Revisit cancellation
+- [ ] Revisit resource lifetime
+- [ ] Revisit memory retention
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 36 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. ECMAScript specification — async functions, `await`, Promise completion, async function execution, Promise resolution, Jobs, and completion semantics.
+2. TC39 specification/history material — feature evolution or proposal-stage context only where relevant.
+3. Browser platform documentation — top-level await/module integration and host scheduling behavior.
+4. Node.js documentation — runtime behavior, diagnostics, process lifecycle, and host-specific async APIs.
+5. JavaScript engine documentation — implementation, optimization, diagnostics, and performance behavior.
+6. Application architecture documentation — cancellation, timeout, retries, ownership, concurrency, backpressure, and shutdown.
+
+Always distinguish:
+
+```text
+ECMAScript language semantics
+vs
+engine implementation
+vs
+browser behavior
+vs
+Node.js behavior
+vs
+application policy
+```
+
+Do not present `async/await` as a threading mechanism.
+
+Do not present `await` as cancellation.
+
+Do not claim that all async APIs share one identical host scheduling path.
+
+---
+
+# Chapter 36 — Completion Snapshot
+
+```text
+Chapter: 36
+Title: Async Functions and `await`
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 37 — Cancellation and Abort
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain cancellation as a lifecycle and control-flow concern rather than as a Promise state.
+- Distinguish completion, failure, timeout, cancellation, and abortion.
+- Explain why standard Promises do not provide universal built-in cancellation.
+- Explain the `AbortController` / `AbortSignal` model.
+- Distinguish the controller that initiates cancellation from the signal that communicates cancellation.
+- Explain one-shot abort semantics.
+- Explain `signal.aborted` and `signal.reason`.
+- Explain the `abort` event and how APIs can react to it.
+- Explain `signal.throwIfAborted()`.
+- Understand how an asynchronous API should accept a signal.
+- Design cancellation-aware Promise-based APIs.
+- Distinguish cancellation notification from actual termination of underlying work.
+- Explain why simply racing an operation against a timeout does not cancel the operation.
+- Use `AbortSignal.timeout()` appropriately.
+- Use `AbortSignal.any()` to combine cancellation sources.
+- Understand the difference between a user abort, a timeout, and another application-defined abort reason.
+- Understand how already-aborted signals should be handled.
+- Explain signal propagation through layered application code.
+- Design cancellation trees and parent/child ownership relationships.
+- Understand how cancellation interacts with retries, backoff, concurrency limits, streams, resources, and shutdown.
+- Explain how cancellation interacts with `fetch`, response consumption, and streaming APIs where the host supports it.
+- Explain why cancellation is cooperative rather than magical.
+- Handle races between completion and cancellation correctly.
+- Make cancellation idempotent and race-safe.
+- Avoid memory leaks from long-lived signals and listeners.
+- Distinguish cancellation from rollback, compensation, and cleanup.
+- Understand how cancellation semantics differ between browser APIs, Node.js APIs, and application-defined abstractions.
+- Build a cancellable operation from scratch.
+- Build a cancellation-aware task supervisor.
+- Debug stale asynchronous work and cancellation races.
+- Design production cancellation contracts for HTTP requests, background jobs, UI interactions, and service shutdown.
+- Reason about cancellation at principal level: ownership, consistency, resource lifetime, user experience, performance, reliability, and observability.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+## 2. Prerequisites
+
+The learner should understand:
+
+- Errors and abrupt completion.
+- Resource lifetime and deterministic cleanup.
+- Asynchronous fundamentals.
+- ECMAScript Jobs.
+- Browser event loop.
+- Node event loop.
+- Promises.
+- Async/await.
+
+Primary dependencies:
+
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async Functions / `await`
+
+Later chapters build directly on this chapter:
+
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 87 — Deterministic Async Testing
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+
+---
+
+## 3. What Is It?
+
+**Cancellation** is a request to stop or abandon asynchronous work before its normal completion.
+
+Examples:
+
+```text
+user closed a page
+user changed search query
+HTTP client disconnected
+request timeout reached
+service shutting down
+job was superseded
+parent operation was cancelled
+```
+
+The key distinction is:
+
+```text
+Promise:
+  What is the eventual outcome?
+
+Cancellation:
+  Should the operation continue trying to produce an outcome?
+```
+
+A Promise can be:
+
+```text
+fulfilled
+rejected
+pending
+```
+
+Cancellation is not a fourth Promise state.
+
+Instead, cancellation is usually communicated through a separate control signal.
+
+Modern JavaScript environments commonly use:
+
+```js
+AbortController
+AbortSignal
+```
+
+The architecture is:
+
+```text
+caller
+  │
+  │ owns controller
+  ▼
+AbortController
+  │
+  │ exposes
+  ▼
+AbortSignal
+  │
+  │ observed by
+  ▼
+async operation
+```
+
+When the caller decides to cancel:
+
+```js
+controller.abort();
+```
+
+the signal becomes aborted and carries a reason.
+
+The operation must observe that signal and implement the actual stop behavior.
+
+Therefore:
+
+> Abort notification is standardized; cancellation of the underlying work is cooperative and API-specific.
+
+---
+
+## 4. Why Does It Exist?
+
+Without cancellation, asynchronous work often continues after the caller no longer needs it.
+
+Example:
+
+```text
+search "j"
+  ↓ request starts
+
+search "ja"
+  ↓ request starts
+
+search "jav"
+  ↓ request starts
+```
+
+If the user only needs the `"jav"` result:
+
+```text
+"j" operation = stale
+"ja" operation = stale
+"jav" operation = current
+```
+
+Continuing all three wastes:
+
+- bandwidth;
+- server capacity;
+- CPU;
+- memory;
+- connection resources;
+- UI update opportunities.
+
+Cancellation also matters for:
+
+```text
+timeouts
+shutdown
+resource limits
+user navigation
+job supersession
+deadlines
+```
+
+The deeper purpose is:
+
+> Stop work whose ownership, usefulness, or deadline has ended.
+
+This is a lifecycle problem.
+
+---
+
+## 5. Mental Model
+
+Use this model:
+
+```text
+operation starts
+      │
+      ▼
+   running
+      │
+      ├───────────────┐
+      │               │
+ completed        cancellation requested
+      │               │
+      ▼               ▼
+ finished          abort signal
+                      │
+                      ▼
+                operation observes
+                      │
+                      ▼
+              stops / closes / rejects
+```
+
+The controller and signal have different responsibilities:
+
+```text
+Controller:
+  “I want this operation cancelled.”
+
+Signal:
+  “Cancellation has been requested.”
+
+Operation:
+  “I decide how to stop safely.”
+```
+
+Cancellation is therefore:
+
+```text
+request
++
+observation
++
+cooperative termination
++
+cleanup
++
+final outcome
+```
+
+A more complete model:
+
+```text
+parent lifetime
+      │
+      ▼
+  child operation
+      │
+      ├── success → fulfill
+      ├── failure → reject
+      └── cancel  → stop work + cleanup + chosen outcome
+```
+
+The central mental model:
+
+> Cancellation is not the outcome; it is an instruction that changes whether work should continue.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Promise state does not include cancellation
+
+A Promise is still:
+
+```text
+pending / fulfilled / rejected
+```
+
+Cancellation is a separate concern.
+
+### Rule 2 — `AbortController` initiates abort
+
+```js
+controller.abort();
+```
+
+### Rule 3 — `AbortSignal` communicates abort
+
+```js
+operation({ signal });
+```
+
+### Rule 4 — Abort is one-shot
+
+Once:
+
+```js
+signal.aborted === true
+```
+
+the signal does not become un-aborted.
+
+### Rule 5 — Every signal has a reason after abort
+
+```js
+signal.reason
+```
+
+The caller can supply an explicit reason:
+
+```js
+controller.abort(new Error("superseded"));
+```
+
+### Rule 6 — Operations must explicitly observe the signal
+
+Passing a signal to an API only works if the API actually supports and uses it.
+
+### Rule 7 — Cancellation is cooperative
+
+The signal does not forcibly interrupt arbitrary synchronous JavaScript:
+
+```js
+while (true) {}
+```
+
+An event cannot magically stop this computation in the middle.
+
+### Rule 8 — A signal can be already aborted
+
+An API must check for this case before expensive setup where appropriate.
+
+```js
+signal.throwIfAborted();
+```
+
+### Rule 9 — Abort is idempotent at the controller level
+
+Calling:
+
+```js
+controller.abort();
+controller.abort();
+```
+
+does not repeatedly transition the same signal through new states.
+
+### Rule 10 — Cancellation should trigger cleanup
+
+Stopping work without releasing associated resources is an incomplete cancellation design.
+
+### Rule 11 — Timeout is a policy, not a Promise state
+
+A timeout can be implemented using cancellation:
+
+```js
+AbortSignal.timeout(1000)
+```
+
+but the operation still needs to honor the signal.
+
+### Rule 12 — `Promise.race()` is not cancellation
+
+```js
+Promise.race([operation(), timeout()])
+```
+
+only settles the aggregate Promise from the first result.
+
+### Rule 13 — `AbortSignal.any()` combines cancellation sources
+
+The resulting signal aborts when one of its sources aborts.
+
+### Rule 14 — Combined-signal abortion does not abort every source
+
+Aborting a signal created by `AbortSignal.any()` does not automatically abort the original input controllers.
+
+### Rule 15 — Cancellation and failure can carry different semantic meanings
+
+Possible categories include:
+
+```text
+user cancelled
+timeout
+shutdown
+superseded
+parent cancelled
+resource limit
+```
+
+### Rule 16 — Cancellation can race with completion
+
+An operation may complete immediately before cancellation is requested.
+
+Correct code must define which outcome wins.
+
+### Rule 17 — Cancellation does not imply rollback
+
+Stopping work is not the same as undoing side effects that already occurred.
+
+### Rule 18 — Cancellation does not imply cleanup automatically
+
+The operation must release resources.
+
+### Rule 19 — Cancellation should propagate through layers
+
+If a request is cancelled:
+
+```text
+HTTP layer
+  ↓
+service
+  ↓
+database/network calls
+  ↓
+subtasks
+```
+
+the signal should usually flow through relevant child operations.
+
+### Rule 20 — Abort listeners have lifecycle costs
+
+Long-lived signals can retain listeners and captured state.
+
+Remove listeners when operations finish if the listener is no longer needed.
+
+---
+
+## 7. Syntax
+
+### Create controller
+
+```js
+const controller = new AbortController();
+```
+
+### Obtain signal
+
+```js
+const { signal } = controller;
+```
+
+### Abort
+
+```js
+controller.abort();
+```
+
+### Abort with reason
+
+```js
+controller.abort(new Error("superseded"));
+```
+
+### Observe state
+
+```js
+if (signal.aborted) {
+  // already cancelled
+}
+```
+
+### Observe reason
+
+```js
+console.log(signal.reason);
+```
+
+### Throw if already aborted
+
+```js
+signal.throwIfAborted();
+```
+
+### Listen for abort
+
+```js
+signal.addEventListener("abort", onAbort);
+```
+
+### Fetch
+
+```js
+const controller = new AbortController();
+
+const response = await fetch(url, {
+  signal: controller.signal
+});
+
+controller.abort();
+```
+
+### Timeout signal
+
+```js
+const signal = AbortSignal.timeout(5000);
+```
+
+Current browser documentation describes `AbortSignal.timeout()` as creating a signal that automatically aborts after its specified active time. citeturn586943search2
+
+### Combined signals
+
+```js
+const signal = AbortSignal.any([
+  userSignal,
+  timeoutSignal
+]);
+```
+
+Current documentation describes `AbortSignal.any()` as aborting when one of the supplied signals aborts and using the first abort reason. citeturn586943search1
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Basic controller
+
+```js
+const controller = new AbortController();
+
+controller.abort();
+
+console.log(controller.signal.aborted); // true
+```
+
+### Example 2 — Abort event
+
+```js
+const controller = new AbortController();
+
+controller.signal.addEventListener("abort", () => {
+  console.log("cancelled");
+});
+
+controller.abort();
+```
+
+### Example 3 — Abort reason
+
+```js
+const controller = new AbortController();
+
+const reason = new Error("user navigated away");
+
+controller.abort(reason);
+
+console.log(controller.signal.reason === reason); // true
+```
+
+### Example 4 — Fetch cancellation
+
+```js
+const controller = new AbortController();
+
+const promise = fetch("/api/data", {
+  signal: controller.signal
+});
+
+controller.abort();
+
+try {
+  await promise;
+} catch (error) {
+  console.log("request ended", error);
+}
+```
+
+A supported fetch implementation observes the signal and aborts the request lifecycle. Browser documentation specifically describes aborting fetch requests, response-body consumption, and streams. citeturn586943search3
+
+### Example 5 — Custom cancellable operation
+
+```js
+function delay(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    function onAbort() {
+      clearTimeout(timer);
+      reject(signal.reason);
+    }
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+```
+
+### Example 6 — Timeout
+
+```js
+await delay(5000, {
+  signal: AbortSignal.timeout(1000)
+});
+```
+
+### Example 7 — Combined cancellation
+
+```js
+const controller = new AbortController();
+
+const signal = AbortSignal.any([
+  controller.signal,
+  AbortSignal.timeout(5000)
+]);
+
+await doWork({ signal });
+```
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+function wait(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve("done");
+    }, ms);
+
+    function onAbort() {
+      clearTimeout(timer);
+      reject(signal.reason);
+    }
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function run() {
+  const controller = new AbortController();
+
+  const task = wait(5000, {
+    signal: controller.signal
+  });
+
+  setTimeout(() => {
+    controller.abort(new Error("cancelled"));
+  }, 100);
+
+  try {
+    await task;
+  } catch (error) {
+    console.log(error.message);
+  }
+}
+
+run();
+```
+
+### Step 1
+
+`run()` creates a controller.
+
+### Step 2
+
+The custom operation receives the signal.
+
+### Step 3
+
+The signal is currently not aborted.
+
+### Step 4
+
+The timer for the operation is created.
+
+### Step 5
+
+An abort listener is registered.
+
+### Step 6
+
+The outer timer schedules cancellation after approximately 100ms.
+
+### Step 7
+
+The function awaits the operation.
+
+### Step 8
+
+The cancellation timer fires.
+
+### Step 9
+
+`controller.abort()` transitions the signal to aborted.
+
+### Step 10
+
+The abort listener runs.
+
+### Step 11
+
+The operation clears its own timer.
+
+### Step 12
+
+The operation rejects with the signal's reason.
+
+### Step 13
+
+`await task` resumes through its rejection path.
+
+### Step 14
+
+The `catch` block receives the cancellation reason.
+
+This reveals the complete model:
+
+```text
+request cancellation
+→ signal state change
+→ operation observes
+→ operation performs cleanup
+→ operation settles
+→ caller handles outcome
+```
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 `AbortController`
+
+The controller provides an imperative operation:
+
+```js
+abort(reason)
+```
+
+The controller itself is usually owned by the code responsible for deciding the lifecycle.
+
+### 10.2 `AbortSignal`
+
+The signal is the observable side of that lifecycle.
+
+It exposes:
+
+```text
+aborted
+reason
+abort event
+throwIfAborted()
+```
+
+### 10.3 One-shot state
+
+Conceptually:
+
+```text
+not aborted
+     │
+     │ abort(reason)
+     ▼
+aborted(reason)
+```
+
+There is no reverse transition.
+
+### 10.4 Abort event
+
+Consumers can register an abort listener:
+
+```js
+signal.addEventListener("abort", handler);
+```
+
+The event tells the operation:
+
+```text
+stop now if safely possible
+```
+
+### 10.5 Synchronous pre-check
+
+An operation should normally handle:
+
+```js
+if (signal?.aborted) {
+  ...
+}
+```
+
+before starting expensive work.
+
+`throwIfAborted()` provides a convenient standardized check. Current documentation lists it as an `AbortSignal` instance method. citeturn586943search0
+
+### 10.6 Mid-operation observation
+
+For long-running work:
+
+```js
+for (...) {
+  signal.throwIfAborted();
+  doChunk();
+}
+```
+
+Cancellation is cooperative.
+
+A synchronous function that never checks the signal cannot be interrupted by it.
+
+### 10.7 Abort reason
+
+The reason can be any JavaScript value.
+
+A caller can distinguish:
+
+```js
+controller.abort(new DOMException("Timeout", "TimeoutError"));
+```
+
+from:
+
+```js
+controller.abort(new DOMException("User cancelled", "AbortError"));
+```
+
+or application-defined reasons.
+
+### 10.8 Listener lifecycle
+
+An operation can retain state through an abort listener:
+
+```js
+signal.addEventListener("abort", onAbort);
+```
+
+When the operation completes normally, it should often remove that listener if it is no longer needed.
+
+Current documentation explicitly warns that `{ once: true }` only removes the listener if the abort event actually fires; a long-lived non-aborted signal can otherwise retain listeners and captured state. citeturn586943search0
+
+### 10.9 `AbortSignal.abort()`
+
+A pre-aborted signal can be created directly:
+
+```js
+const signal = AbortSignal.abort(reason);
+```
+
+This is useful for APIs that need an immediately aborted input.
+
+Current documentation describes `AbortSignal.abort()` as returning an already-aborted signal. citeturn586943search5
+
+### 10.10 `AbortSignal.timeout()`
+
+The timeout signal represents a future abort event rather than a rejected Promise by itself.
+
+The operation determines how the abort affects its own result.
+
+Current browser documentation describes timeout abortion as carrying a `TimeoutError` DOMException reason in the relevant fetch scenario. citeturn586943search2
+
+### 10.11 `AbortSignal.any()`
+
+The combined signal behaves like:
+
+```text
+source A ─┐
+source B ─┼→ combined signal
+source C ─┘
+```
+
+If any source aborts:
+
+```text
+combined → aborted
+```
+
+The sources themselves remain independent.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+Cancellation through `AbortController` and `AbortSignal` is primarily a **host/platform API model**, not an ECMAScript Promise state.
+
+The DOM Standard defines the `AbortController` and `AbortSignal` interfaces and their abort algorithms. Browser-facing APIs such as Fetch integrate with those signals.
+
+Therefore the source hierarchy is:
+
+```text
+ECMAScript:
+  Promise / async function / Job semantics
+
+DOM / platform:
+  AbortController / AbortSignal semantics
+
+Host API:
+  fetch / streams / other abortable operations
+
+Application:
+  custom cancellation policy
+```
+
+### 11.1 Abort is not a Promise state
+
+The Promise specification does not define:
+
+```text
+pending
+fulfilled
+rejected
+cancelled
+```
+
+as four states.
+
+Instead:
+
+```text
+Promise = completion state
+Signal  = cancellation intent/state
+```
+
+### 11.2 Signal state
+
+An `AbortSignal` transitions from:
+
+```text
+not aborted
+```
+
+to:
+
+```text
+aborted with reason
+```
+
+and remains aborted.
+
+### 11.3 Abort event
+
+The platform exposes an `abort` event so dependent algorithms can react.
+
+### 11.4 `throwIfAborted`
+
+The signal can synchronously throw its current reason when aborted.
+
+### 11.5 Fetch integration
+
+Fetch accepts an `AbortSignal`.
+
+When the associated signal aborts, the Fetch operation follows its own abort steps.
+
+This demonstrates the key rule:
+
+> The signal does not forcibly interrupt arbitrary code; the consuming API defines what abort means.
+
+### 11.6 Timeout signals
+
+`AbortSignal.timeout()` creates a signal whose abort is driven by a timeout mechanism.
+
+The timeout signal itself is not the same thing as a Promise timeout.
+
+### 11.7 Combined signals
+
+`AbortSignal.any()` composes independent abort sources into one derived signal.
+
+The first source to abort determines the combined reason according to platform semantics. Current documentation explicitly describes this first-abort-reason behavior. citeturn586943search1
+
+### 11.8 Node.js integration
+
+Node.js exposes `AbortController` / `AbortSignal` and integrates signals into multiple APIs.
+
+Exact support and error types depend on the specific Node API.
+
+Always verify the target Node version and API documentation.
+
+### 11.9 Language/runtime boundary
+
+Do not say:
+
+> “Promises have an AbortSignal built into them.”
+
+More precise:
+
+> AbortSignal is a separate platform/runtime cancellation mechanism that asynchronous APIs can integrate with.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Cancellation versus timeout
+
+A timeout is often implemented as:
+
+```text
+deadline expires
+→ abort signal
+→ operation stops
+```
+
+But timeout is one reason for cancellation, not a fundamentally different Promise state.
+
+### 12.2 User cancellation
+
+A UI might have:
+
+```js
+const controller = new AbortController();
+
+cancelButton.addEventListener("click", () => {
+  controller.abort(new DOMException("User cancelled", "AbortError"));
+});
+```
+
+The operation can handle the reason differently from an infrastructure timeout.
+
+### 12.3 Parent-child cancellation
+
+A parent operation may own several children:
+
+```text
+request
+ ├── db task
+ ├── HTTP task
+ └── cache task
+```
+
+Cancelling the parent can propagate:
+
+```text
+parent signal
+   ↓
+children
+```
+
+This creates structured cancellation.
+
+### 12.4 Combining cancellation with timeout
+
+```js
+const signal = AbortSignal.any([
+  userSignal,
+  AbortSignal.timeout(5000)
+]);
+```
+
+Now:
+
+```text
+user abort
+OR
+timeout
+```
+
+ends the operation.
+
+### 12.5 Important nuance: `any()` does not cancel sources
+
+If the timeout signal wins, the caller's controller is not automatically aborted.
+
+Likewise, aborting the controller does not stop the timeout source itself.
+
+This matters for source ownership.
+
+### 12.6 Cancellation trees
+
+Consider:
+
+```text
+application
+   ↓
+request
+   ↓
+service
+   ├── provider A
+   ├── provider B
+   └── cache
+```
+
+A clean cancellation graph mirrors ownership.
+
+### 12.7 Cancellation and `Promise.all`
+
+Suppose:
+
+```js
+await Promise.all([
+  taskA({ signal }),
+  taskB({ signal }),
+  taskC({ signal })
+]);
+```
+
+If the signal aborts:
+
+```text
+shared signal
+  ↓
+A aborts
+B aborts
+C aborts
+```
+
+assuming all APIs honor the signal.
+
+This creates a coordinated cancellation boundary.
+
+### 12.8 Cancellation and `Promise.race`
+
+Bad:
+
+```js
+await Promise.race([
+  work(),
+  timeout(1000)
+]);
+```
+
+Better:
+
+```js
+const controller = new AbortController();
+
+const timer = setTimeout(() => {
+  controller.abort(new Error("timeout"));
+}, 1000);
+
+try {
+  await work({ signal: controller.signal });
+} finally {
+  clearTimeout(timer);
+}
+```
+
+Or use `AbortSignal.timeout()` when its semantics fit the application.
+
+### 12.9 Cancellation and retries
+
+Consider:
+
+```text
+attempt 1
+  ↓ fails transiently
+backoff
+  ↓
+attempt 2
+```
+
+If cancellation arrives during backoff:
+
+```text
+stop retry loop
+```
+
+Cancellation should therefore reach:
+
+- operation;
+- delay;
+- backoff;
+- queue wait.
+
+### 12.10 Cancellation and queueing
+
+A task can be cancelled before it starts.
+
+A production scheduler should define:
+
+```text
+queued + cancelled
+```
+
+as a valid state and avoid starting the work.
+
+### 12.11 Cancellation and resource management
+
+Cancellation should generally trigger cleanup:
+
+```text
+abort
+↓
+stop work
+↓
+release resource
+↓
+settle operation
+```
+
+This connects directly to Chapters 29 and 30.
+
+### 12.12 Cancellation and streams
+
+A stream operation may need to:
+
+```text
+stop reading
+cancel source
+close destination
+release buffers
+```
+
+not simply reject a Promise.
+
+### 12.13 Cancellation and side effects
+
+Suppose:
+
+```js
+await sendPayment();
+controller.abort();
+```
+
+The payment may already have occurred.
+
+Cancellation cannot retroactively undo an external side effect.
+
+This leads to:
+
+```text
+idempotency
+compensation
+transaction semantics
+```
+
+### 12.14 Cancellation and transactions
+
+Cancellation during a database transaction may require:
+
+```text
+rollback
+release connection
+```
+
+rather than merely stopping the caller's await.
+
+### 12.15 Cancellation and idempotency
+
+Multiple cancellation paths may race:
+
+```text
+user abort
+timeout
+shutdown
+```
+
+A good operation makes its shutdown sequence safe to invoke more than once.
+
+### 12.16 Cancellation and completion race
+
+Consider:
+
+```text
+task completes
+signal aborts
+```
+
+The result depends on which event reaches the operation first.
+
+The API contract should define behavior that remains deterministic and safe regardless of race ordering.
+
+### 12.17 Cancellation after success
+
+If cancellation occurs after the operation is already complete, it may have no effect on the completed operation.
+
+The controller can still become aborted even if no consumer remains.
+
+### 12.18 Already-aborted signal
+
+Always consider:
+
+```js
+signal?.throwIfAborted();
+```
+
+before setup.
+
+Otherwise an operation may:
+
+```text
+allocate
+open socket
+start work
+```
+
+and only later discover cancellation.
+
+### 12.19 Reusable signals
+
+Do not treat an aborted signal as resettable.
+
+To start a fresh operation, create a new controller/signal.
+
+### 12.20 Signal fan-out
+
+One signal can control many operations:
+
+```js
+const signal = controller.signal;
+
+taskA({ signal });
+taskB({ signal });
+taskC({ signal });
+```
+
+This is useful for shared ownership.
+
+### 12.21 Signal over-sharing
+
+A global controller can accidentally cancel unrelated operations.
+
+Prefer the smallest sensible ownership scope.
+
+### 12.22 Long-lived signals
+
+A global signal may live for hours.
+
+Listeners registered on it can retain data until:
+
+```text
+abort
+or
+explicit removal
+```
+
+Listener lifecycle therefore matters.
+
+### 12.23 Stale search results
+
+Cancellation is often paired with result validation:
+
+```text
+request A
+request B
+
+A aborts
+B completes
+```
+
+Even with cancellation, some systems may still have a race around completion.
+
+Defensive UI code can track request identity/version.
+
+### 12.24 Cancellation and worker threads
+
+A signal does not automatically terminate arbitrary worker computation.
+
+The worker must receive cancellation information and cooperate, or the application must use a stronger lifecycle mechanism such as worker termination.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 Abort before operation starts
+
+```js
+const controller = new AbortController();
+controller.abort();
+
+await doWork({ signal: controller.signal });
+```
+
+The operation should fail quickly rather than allocate unnecessary resources.
+
+### 13.2 Abort after successful completion
+
+Cancellation may become irrelevant to an already completed operation.
+
+### 13.3 Abort twice
+
+```js
+controller.abort("A");
+controller.abort("B");
+```
+
+The signal remains aborted with its first effective reason.
+
+### 13.4 Abort with arbitrary reason
+
+```js
+controller.abort(42);
+```
+
+Consumers must not blindly assume the reason is an `Error`.
+
+### 13.5 Abort event listener throws
+
+An abort listener is ordinary event-handler code.
+
+Exceptions from listeners have their own host/event semantics and should not be used as the operation's only failure channel.
+
+### 13.6 Remove listener on normal completion
+
+A long-lived signal with many completed operations can otherwise accumulate listeners.
+
+### 13.7 `{ once: true }` limitation
+
+`once: true` handles the actual abort path, but if the signal never aborts, it does not remove the listener merely because the operation completed.
+
+Current documentation specifically calls out this retention issue. citeturn586943search0
+
+### 13.8 `AbortSignal.timeout(0)`
+
+The signal becomes aborted according to timeout scheduling semantics; it should not be treated as a synchronous throw merely because the timeout is zero.
+
+### 13.9 Timeout signal cannot be manually aborted
+
+A timeout-generated signal is not controlled by an `AbortController` owned by the caller.
+
+Use a controller when the timeout itself must be manually cleared/cancelled.
+
+Current documentation notes that `AbortSignal.timeout()` does not provide a method to cancel its timeout early. citeturn586943search2
+
+### 13.10 Combined signal reason
+
+`AbortSignal.any()` uses the first abort reason.
+
+This can make user-vs-timeout classification important. citeturn586943search1
+
+### 13.11 Combined signal source lifetime
+
+Derived signals can have lifecycle interactions with their source signals and listeners.
+
+Avoid unnecessary long-lived registrations.
+
+### 13.12 Cancellation after irreversible side effect
+
+An operation may report cancellation even though a side effect already occurred.
+
+The application must reconcile the state separately.
+
+### 13.13 Cancellation while waiting in a queue
+
+A bounded scheduler should remove or mark queued work cancelled before execution.
+
+### 13.14 Cancellation during retry backoff
+
+The delay must itself be cancellation-aware.
+
+### 13.15 Cancellation while disposing
+
+Cleanup should generally be allowed to finish safely even if the original operation was cancelled.
+
+### 13.16 Cleanup takes longer than deadline
+
+A timeout for business work does not necessarily mean all cleanup must instantly stop.
+
+Define separate cleanup policy.
+
+### 13.17 Nested controllers
+
+A child controller cannot automatically “inherit” a parent controller unless the application explicitly links their signals.
+
+### 13.18 Worker termination versus cancellation
+
+Terminating a worker is a stronger lifecycle action than merely requesting cooperative cancellation.
+
+### 13.19 Node-specific APIs
+
+Not every Node API accepts `signal`.
+
+Check the exact API contract.
+
+### 13.20 Browser-specific APIs
+
+Not every browser API supports AbortSignal.
+
+Check the actual platform API.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “Promises are cancellable.”
+
+Not universally.
+
+Cancellation is separate from Promise settlement.
+
+### Misconception 2 — “Calling `abort()` kills the JavaScript code.”
+
+No.
+
+It signals cancellation to cooperating APIs.
+
+### Misconception 3 — “Abort instantly interrupts any synchronous function.”
+
+No.
+
+Synchronous JavaScript must reach a cancellation check/yield boundary.
+
+### Misconception 4 — “Timeout and cancellation are different Promise states.”
+
+No.
+
+Timeout is commonly a reason for cancellation or a separate policy layered on completion.
+
+### Misconception 5 — “`Promise.race()` cancels losers.”
+
+No.
+
+### Misconception 6 — “`AbortSignal.any()` aborts all source controllers.”
+
+No.
+
+It creates a derived signal.
+
+### Misconception 7 — “One signal can be reset.”
+
+No.
+
+Abort is one-shot.
+
+### Misconception 8 — “An aborted signal can be reused for a new operation.”
+
+It remains aborted, so create a new signal for a new lifecycle.
+
+### Misconception 9 — “Cancellation undoes side effects.”
+
+No.
+
+Rollback/compensation is a separate concern.
+
+### Misconception 10 — “Cancellation automatically cleans resources.”
+
+Only if the operation implements cleanup correctly.
+
+### Misconception 11 — “Every async Node/browser API supports signals.”
+
+No.
+
+Support is API-specific.
+
+### Misconception 12 — “`AbortSignal.timeout()` is just a Promise timeout.”
+
+No.
+
+It creates a signal; an abort-aware operation decides how that signal affects its own execution.
+
+### Misconception 13 — “`once: true` always prevents listener leaks.”
+
+Not if the signal never aborts.
+
+### Misconception 14 — “Cancellation guarantees no work happened.”
+
+No.
+
+The operation may have progressed before cancellation was observed.
+
+### Misconception 15 — “Cancellation is just error handling.”
+
+Cancellation is a lifecycle request. It may result in rejection, normal completion, special status, or another domain-specific outcome.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Passing a signal but never observing it
+
+```js
+function work({ signal }) {
+  return expensiveOperation();
+}
+```
+
+### Mistake 2 — Checking cancellation only at the beginning
+
+Long-running operations need periodic cooperation.
+
+### Mistake 3 — Using `Promise.race()` instead of actual cancellation
+
+### Mistake 4 — Not clearing timers
+
+### Mistake 5 — Not removing abort listeners after successful completion
+
+### Mistake 6 — Reusing an aborted signal
+
+### Mistake 7 — Using one global controller for unrelated operations
+
+### Mistake 8 — Cancelling work without releasing resources
+
+### Mistake 9 — Treating cancellation as rollback
+
+### Mistake 10 — Retrying after cancellation
+
+### Mistake 11 — Continuing retries after a parent request is gone
+
+### Mistake 12 — Ignoring cancellation during queue waiting
+
+### Mistake 13 — Ignoring cancellation during backoff
+
+### Mistake 14 — Treating every abort reason as `Error`
+
+### Mistake 15 — Exposing raw cancellation internals to clients
+
+### Mistake 16 — Letting cancelled stale UI requests still update application state
+
+### Mistake 17 — Assuming worker computation stops because a signal object exists elsewhere
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Mechanism | Meaning | Does it stop underlying work? |
+|---|---|---|
+| `AbortController.abort()` | Requests cancellation | Only cooperating operations |
+| `AbortSignal` | Communicates cancellation | No by itself |
+| Promise rejection | Reports failed completion | No |
+| `Promise.race()` | Chooses first settlement | No |
+| Timeout | Deadline policy | Only if linked to cancellation/stop |
+| `clearTimeout()` | Cancels a timer | Yes for that timer |
+| Worker `terminate()` | Stops worker execution | Strong lifecycle termination |
+| Rollback | Undoes transactional state | Domain/database dependent |
+| Compensation | Repairs an already-applied side effect | Domain dependent |
+| Dispose | Releases owned resources | Cleanup |
+| Close | Ends a particular resource | API specific |
+| Abort | Requests an operation stop | API specific |
+| Cancellation token | General cancellation signal abstraction | Cooperative |
+
+### Cancellation vs rejection
+
+```text
+rejection:
+  “operation completed unsuccessfully”
+
+cancellation:
+  “operation should stop because its outcome is no longer needed/allowed”
+```
+
+An operation may be cancelled and represent that cancellation by rejecting its Promise.
+
+But that is a policy choice.
+
+### Cancellation vs timeout
+
+```text
+timeout:
+  deadline exceeded
+
+cancellation:
+  continue or stop decision changed
+```
+
+Timeout frequently triggers cancellation.
+
+### Cancellation vs rollback
+
+```text
+cancel:
+  stop future work
+
+rollback:
+  undo transactional effects
+```
+
+### Abort vs terminate
+
+```text
+abort:
+  cooperative stop request
+
+terminate:
+  stronger lifecycle action
+```
+
+### `AbortSignal` vs custom token
+
+`AbortSignal` is valuable because many standard APIs understand it.
+
+A custom token can still be useful for domain-specific semantics, but interoperability is reduced.
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 Cancellation saves wasted work
+
+Stopping stale:
+
+```text
+network
+CPU
+memory
+```
+
+can improve efficiency.
+
+### 17.2 Cancellation checks have cost
+
+Very frequent checks inside hot loops can add overhead.
+
+Use appropriate granularity.
+
+### 17.3 Listener registration overhead
+
+Each operation may register an abort listener.
+
+At high scale:
+
+```text
+millions of short operations
+```
+
+listener management itself can matter.
+
+### 17.4 Signal fan-out
+
+One signal can control many operations efficiently conceptually, but each operation still needs its own cleanup logic.
+
+### 17.5 Timeout allocation
+
+Repeatedly creating timeout controllers/timers has cost.
+
+Measure before building complex timeout abstractions.
+
+### 17.6 Cancellation reduces downstream load
+
+Cancelling stale requests can save:
+
+- network bandwidth;
+- server CPU;
+- connection pool slots.
+
+### 17.7 Aborted work may still have partial cost
+
+Cancellation is not free.
+
+A request may already have:
+
+```text
+sent bytes
+allocated buffers
+executed server work
+```
+
+before cancellation arrives.
+
+### 17.8 Cleanup latency
+
+A cancelled operation may still require meaningful cleanup.
+
+Therefore:
+
+```text
+cancel requested
+```
+
+does not necessarily mean:
+
+```text
+complete immediately
+```
+
+### 17.9 Concurrency control
+
+Cancellation can prevent queued tasks from consuming worker capacity.
+
+### 17.10 Backpressure synergy
+
+Cancellation and backpressure together reduce wasted work:
+
+```text
+consumer no longer interested
+→ stop producer
+→ release buffers
+```
+
+---
+
+## 18. Memory Considerations
+
+### 18.1 Abort listeners can retain closures
+
+A long-lived signal can retain operations through listener references.
+
+### 18.2 `{ once: true }` is not sufficient for successful operations
+
+If the signal never aborts, the listener may remain.
+
+Remove it when the operation completes normally.
+
+### 18.3 Combined signals
+
+Derived signals can involve references to source signals and registered listeners.
+
+### 18.4 Pending cancellable operations
+
+A pending operation may retain:
+
+- Promise reactions;
+- timers;
+- buffers;
+- sockets;
+- callbacks.
+
+Cancellation should reduce these references where possible.
+
+### 18.5 Cancelled work and cleanup
+
+Cleanup must release:
+
+```text
+timers
+listeners
+buffers
+resources
+queues
+```
+
+### 18.6 Stale UI requests
+
+Old requests may retain response data and closures until aborted/settled.
+
+### 18.7 Long-lived global signals
+
+Global lifecycle signals can accidentally become retention roots for large parts of an application if listeners are not managed carefully.
+
+---
+
+## 19. Security Considerations
+
+### 19.1 Availability
+
+Uncancelled work can become a resource-exhaustion vector.
+
+### 19.2 Request amplification
+
+Attackers can start expensive work and disconnect clients.
+
+Servers should cancel or deprioritize work when safe.
+
+### 19.3 Authorization changes
+
+A request may lose authorization while an async operation is still in progress.
+
+Cancellation and state validation can reduce stale actions.
+
+### 19.4 Stale results
+
+Older asynchronous operations should not overwrite newer security-sensitive state.
+
+### 19.5 Sensitive resources
+
+Cancellation should release:
+
+- credentials;
+- file handles;
+- database connections;
+- sensitive buffers.
+
+### 19.6 Abort reasons
+
+Do not expose internal cancellation reasons blindly to remote clients.
+
+### 19.7 Cancellation races
+
+Security-sensitive operations should define what happens if cancellation races with a privileged side effect.
+
+### 19.8 Denial of service through never-ending work
+
+Long-running cancellable tasks need:
+
+```text
+deadline
+resource limits
+supervision
+```
+
+---
+
+## 20. Production Usage
+
+### 20.1 Browser search
+
+```js
+let currentController = null;
+
+async function search(query) {
+  currentController?.abort();
+
+  const controller = new AbortController();
+  currentController = controller;
+
+  try {
+    const response = await fetch(
+      `/api/search?q=${encodeURIComponent(query)}`,
+      { signal: controller.signal }
+    );
+
+    return await response.json();
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return null;
+    }
+
+    throw error;
+  }
+}
+```
+
+This pattern ties the current operation to the latest query.
+
+### 20.2 Request-scoped cancellation
+
+```text
+incoming request
+   ↓
+request signal
+   ↓
+service
+   ├── database
+   ├── HTTP provider
+   └── cache
+```
+
+The service passes the signal through to operations that can safely stop.
+
+### 20.3 Timeout
+
+```js
+async function fetchWithDeadline(url) {
+  return fetch(url, {
+    signal: AbortSignal.timeout(5000)
+  });
+}
+```
+
+Use an explicit controller when the timeout must be cancelled or combined with complex lifecycle behavior.
+
+### 20.4 User + timeout + shutdown
+
+```js
+const signal = AbortSignal.any([
+  userSignal,
+  timeoutSignal,
+  shutdownSignal
+]);
+```
+
+This creates one effective operation boundary.
+
+### 20.5 Queue workers
+
+A queued task should be cancellable before execution:
+
+```text
+queued
+  ↓
+cancelled
+```
+
+rather than:
+
+```text
+queued
+  ↓
+start expensive work
+  ↓
+notice cancellation
+```
+
+### 20.6 Retry loops
+
+Cancellation-aware retry:
+
+```js
+async function retry(operation, {
+  retries,
+  signal
+}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    signal?.throwIfAborted();
+
+    try {
+      return await operation({ signal });
+    } catch (error) {
+      if (!shouldRetry(error, attempt)) {
+        throw error;
+      }
+
+      await delayWithSignal(backoff(attempt), signal);
+    }
+  }
+}
+```
+
+### 20.7 Graceful shutdown
+
+```text
+SIGTERM
+  ↓
+abort application controller
+  ↓
+stop new work
+  ↓
+cancel/finish in-flight operations
+  ↓
+dispose resources
+  ↓
+exit
+```
+
+### 20.8 Node HTTP server
+
+Tie request lifecycle to downstream work when the framework/API provides a suitable signal.
+
+### 20.9 Database transactions
+
+Cancellation should trigger the transaction's failure policy:
+
+```text
+cancel
+→ stop new work
+→ rollback if required
+→ release connection
+```
+
+### 20.10 Streaming
+
+Cancel when the consumer disappears:
+
+```text
+consumer gone
+→ abort source
+→ stop production
+→ release buffers
+```
+
+### 20.11 Observability
+
+Track:
+
+- cancellation count;
+- cancellation reason;
+- time from start to abort;
+- cleanup duration;
+- work saved;
+- timeout count;
+- stale-request count;
+- cancellation-related retries.
+
+Do not count normal user cancellation as an infrastructure error without classification.
+
+---
+
+## 21. Implementation From Scratch
+
+### Stage 1 — Guided
+
+Build:
+
+```js
+function cancellableDelay(ms, { signal } = {}) {}
+```
+
+Requirements:
+
+- immediate rejection/exit if already aborted;
+- abort listener;
+- timer cleanup;
+- listener cleanup;
+- deterministic settlement.
+
+### Stage 2 — Partially Guided
+
+Build:
+
+```js
+function cancellableOperation(worker, { signal } = {}) {}
+```
+
+Requirements:
+
+- pre-check;
+- mid-operation cancellation points;
+- cleanup;
+- cancellation reason propagation.
+
+### Stage 3 — No Reference
+
+Build:
+
+```js
+class CancellationToken {
+  constructor() {}
+  get signal() {}
+  cancel(reason) {}
+}
+```
+
+Then design an API:
+
+```js
+runTask(task, { signal });
+```
+
+### Stage 4 — Edge-Case Hardened
+
+Add:
+
+- already-aborted signal;
+- double cancellation;
+- completion/cancellation race;
+- cleanup failure;
+- arbitrary abort reasons;
+- listener removal;
+- queued cancellation;
+- cancellation during backoff.
+
+### Stage 5 — Production-Oriented
+
+Implement:
+
+```js
+class TaskSupervisor {
+  start(task, options) {}
+  cancel(id, reason) {}
+  cancelAll(reason) {}
+  getStatus(id) {}
+  async shutdown() {}
+}
+```
+
+Support:
+
+```text
+queued
+running
+completed
+failed
+cancelled
+timed out
+```
+
+Requirements:
+
+- hierarchical ownership;
+- bounded concurrency;
+- cancellation propagation;
+- graceful shutdown;
+- metrics;
+- no leaked listeners;
+- deterministic cleanup.
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Timeout race
+
+```js
+await Promise.race([
+  slowOperation(),
+  timeout(1000)
+]);
+```
+
+Identify:
+
+- what ends;
+- what continues;
+- what resources may remain.
+
+### Exercise 2 — Listener leak
+
+```js
+function operation(signal) {
+  return new Promise(resolve => {
+    signal.addEventListener("abort", () => {
+      // cleanup
+    });
+
+    setTimeout(resolve, 10);
+  });
+}
+```
+
+Call this thousands of times with one long-lived signal.
+
+Identify the retention problem.
+
+### Exercise 3 — Already aborted
+
+```js
+const controller = new AbortController();
+controller.abort();
+
+await operation({ signal: controller.signal });
+```
+
+What should `operation` do before allocating resources?
+
+### Exercise 4 — Cancellation race
+
+Create an operation where:
+
+```text
+completion
+and
+abort
+```
+
+can happen in either order.
+
+Define deterministic behavior.
+
+### Exercise 5 — Stale search
+
+Implement:
+
+```text
+query A
+query B
+query C
+```
+
+where B completes after C.
+
+Ensure B cannot update the current UI state.
+
+### Exercise 6 — Retry cancellation
+
+Cancel during exponential backoff.
+
+Verify that no later attempt starts.
+
+### Exercise 7 — Resource cleanup
+
+Cancel an operation while it owns:
+
+```text
+socket
+timer
+buffer
+listener
+```
+
+Verify all are released.
+
+### Exercise 8 — Parent cancellation
+
+Create:
+
+```text
+parent task
+ ├── child A
+ ├── child B
+ └── child C
+```
+
+Abort parent.
+
+Verify all children stop cooperatively.
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+async function loadData(url) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 5000);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal
+    });
+
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+```
+
+Questions:
+
+- Who owns the controller?
+- Can callers cancel the request?
+- What happens if the caller already has a signal?
+- Is timeout reason distinguishable?
+- What happens on response-body cancellation?
+- Is cancellation propagated through downstream processing?
+- What happens if JSON parsing is expensive?
+- What happens if shutdown occurs?
+- Should the function expose or combine signals?
+
+Then redesign it.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is cancellation?
+2. Why don't Promises provide universal cancellation?
+3. What is `AbortController`?
+4. What is `AbortSignal`?
+5. What does `abort()` do?
+6. What is `signal.aborted`?
+7. What is `signal.reason`?
+8. What is `throwIfAborted()`?
+9. Why is cancellation cooperative?
+10. Why is abort one-shot?
+
+### Intermediate
+
+11. How would you make a custom Promise API cancellable?
+12. Why doesn't `Promise.race()` cancel the losing operation?
+13. What does `AbortSignal.timeout()` do?
+14. What does `AbortSignal.any()` do?
+15. Why should abort listeners be removed?
+16. Why isn't `once: true` always enough?
+17. How do you distinguish timeout from user cancellation?
+18. How should cancellation propagate through service layers?
+19. How should retries respond to cancellation?
+20. How should queued tasks respond to cancellation?
+
+### Advanced
+
+21. Explain cancellation versus Promise rejection.
+22. Explain cancellation versus rollback.
+23. Explain cancellation versus termination.
+24. Explain a completion/abort race.
+25. Explain parent-child cancellation.
+26. Explain combined signals and reason propagation.
+27. Explain cancellation and resource cleanup.
+28. Explain cancellation and worker threads.
+29. Explain cancellation and streams.
+30. Explain cancellation-aware backoff.
+
+### Principal-Level
+
+31. Design hierarchical cancellation for a large service.
+32. Design request-scoped cancellation.
+33. Design shutdown cancellation.
+34. Design a cancellation-aware job queue.
+35. Design stale-request prevention in a frontend.
+36. Design cancellation-aware retries and timeouts.
+37. Design observability for cancellation.
+38. Design cancellation semantics for irreversible side effects.
+39. Decide where cancellation should be ignored versus propagated.
+40. Define an organization-wide cancellation contract for reusable APIs.
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+const controller = new AbortController();
+
+controller.signal.addEventListener("abort", () => {
+  console.log("A");
+});
+
+console.log("B");
+
+controller.abort();
+
+console.log("C");
+```
+
+Predict:
+
+```text
+B
+A
+C
+```
+
+### Exercise B
+
+```js
+const controller = new AbortController();
+
+controller.abort("stop");
+
+console.log(controller.signal.aborted);
+console.log(controller.signal.reason);
+```
+
+Explain the state.
+
+### Exercise C
+
+```js
+const controller = new AbortController();
+
+controller.abort("A");
+controller.abort("B");
+
+console.log(controller.signal.reason);
+```
+
+Which reason wins?
+
+### Exercise D
+
+```js
+const controller = new AbortController();
+
+const signal = controller.signal;
+
+signal.addEventListener("abort", () => {
+  console.log("abort");
+});
+
+Promise.resolve().then(() => {
+  console.log("promise");
+});
+
+controller.abort();
+
+console.log("sync");
+```
+
+Reason about:
+
+```text
+abort state transition
+event dispatch
+synchronous code
+promise job
+```
+
+### Exercise E
+
+```js
+const controller = new AbortController();
+
+controller.signal.addEventListener("abort", () => {
+  console.log("A");
+});
+
+controller.abort();
+
+queueMicrotask(() => {
+  console.log("B");
+});
+
+console.log("C");
+```
+
+Determine the likely ordering and distinguish abort-event dispatch from microtask scheduling.
+
+### Exercise F
+
+```js
+const controller = new AbortController();
+
+const signal = AbortSignal.any([
+  controller.signal,
+  AbortSignal.timeout(1000)
+]);
+
+controller.abort("manual");
+
+console.log(signal.aborted);
+console.log(signal.reason);
+```
+
+Explain why the combined signal becomes aborted and what source remains independently controlled.
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Cancellable delay
+
+Implement:
+
+```js
+delay(ms, { signal })
+```
+
+Requirements:
+
+- already-aborted handling;
+- abort listener;
+- timer cleanup;
+- listener cleanup;
+- reason propagation.
+
+### Exercise 2 — Cancellable fetch wrapper
+
+Implement:
+
+```js
+fetchJson(url, {
+  signal,
+  timeout
+})
+```
+
+Requirements:
+
+- user cancellation;
+- timeout;
+- combined signal;
+- safe error classification;
+- cleanup.
+
+### Exercise 3 — Cancellation tree
+
+Design:
+
+```text
+request
+ ├── user lookup
+ ├── permissions
+ ├── notifications
+ └── audit
+```
+
+Define which children inherit cancellation and which deliberately continue.
+
+### Exercise 4 — Cancellation-aware retry
+
+Implement:
+
+```js
+retry(operation, {
+  retries,
+  backoff,
+  signal
+})
+```
+
+Ensure:
+
+- no retry after cancellation;
+- backoff is cancellable;
+- final reason is preserved.
+
+### Exercise 5 — Stale-result guard
+
+Implement:
+
+```js
+latestOnly(task)
+```
+
+so that only the latest invocation can update state.
+
+Use both:
+
+```text
+cancellation
++
+request identity/version
+```
+
+### Exercise 6 — Cancellable queue
+
+Implement:
+
+```js
+class TaskQueue {
+  add(task, { signal }) {}
+  cancel(id) {}
+  async shutdown() {}
+}
+```
+
+Support:
+
+```text
+cancel while queued
+cancel while running
+shutdown
+```
+
+### Exercise 7 — Resource scope
+
+Combine:
+
+```text
+AbortSignal
++
+DisposableStack
++
+async operation
+```
+
+Guarantee:
+
+```text
+cancel
+→ stop work
+→ dispose resources
+→ settle
+```
+
+### Exercise 8 — Principal design
+
+Design cancellation for:
+
+```text
+HTTP request
+→ service fan-out
+→ database
+→ external API
+→ background retry
+```
+
+Document:
+
+- ownership;
+- deadlines;
+- cancellation;
+- retry;
+- cleanup;
+- rollback;
+- observability;
+- irreversible side effects.
+
+---
+
+## 27. Key Takeaways
+
+1. Cancellation is a lifecycle/control mechanism, not a Promise state.
+2. Promises represent completion; `AbortSignal` represents cancellation intent/state.
+3. `AbortController` initiates abort.
+4. `AbortSignal` communicates abort.
+5. Abort is one-shot.
+6. A signal can carry an arbitrary reason.
+7. `throwIfAborted()` supports early cancellation checks.
+8. Cancellation is cooperative.
+9. An abort signal cannot interrupt arbitrary synchronous JavaScript.
+10. APIs must explicitly support and observe the signal.
+11. Cancellation should normally trigger cleanup.
+12. `Promise.race()` does not cancel underlying work.
+13. `AbortSignal.timeout()` represents a timeout-driven abort signal.
+14. `AbortSignal.any()` combines multiple cancellation sources.
+15. A combined signal does not automatically abort its source controllers.
+16. Cancellation can propagate hierarchically from parent operations to child operations.
+17. Cancellation must account for completion races.
+18. Cancellation does not undo side effects already applied.
+19. Cancellation is not rollback.
+20. Cancellation is not necessarily termination.
+21. Long-lived abort listeners can create memory retention.
+22. `{ once: true }` alone does not remove a listener if the signal never aborts.
+23. Retry, backoff, queueing, streams, workers, and resource cleanup should all have explicit cancellation policy.
+24. User cancellation, timeout, shutdown, supersession, and resource-limit aborts should be classified separately when useful.
+25. The central principle is:
+
+> Cancellation is a request to end work whose lifetime or usefulness has ended; correctness requires cooperative observation, deterministic cleanup, clear ownership, and explicit treatment of races and side effects.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async Functions / `await`
+
+### Builds Toward
+
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 40 — Observables / Reactive
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 58 — Node Architecture
+- Chapter 59 — Node Core APIs
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 78 — Production JS Architecture
+- Chapter 79 — API Design
+- Chapter 82 — API Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 89 — Code Review / Refactoring
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 104 — Production HTTP Client
+- Chapter 105 — Node REST API
+- Chapter 106 — Real-time WebSocket
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- AbortController
+- AbortSignal
+- Cancellation token
+- Timeout
+- Deadline
+- Promise rejection
+- Error handling
+- Resource cleanup
+- DisposableStack
+- AsyncDisposableStack
+- Retry
+- Backoff
+- Jitter
+- Concurrency
+- Backpressure
+- Queueing
+- Structured concurrency
+- Graceful shutdown
+- Rollback
+- Compensation
+- Idempotency
+- Worker termination
+- Streams
+- Observability
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- Promise completion;
+- async/await;
+- event loops;
+- Jobs;
+- errors;
+- resource management;
+- cleanup;
+- concurrency.
+
+### Why This Chapter Matters Later
+
+Production asynchronous systems do not only need to know:
+
+```text
+when work completes
+```
+
+They also need to know:
+
+```text
+when work is no longer wanted
+```
+
+Without cancellation, systems accumulate:
+
+```text
+stale network requests
+unnecessary retries
+orphaned jobs
+wasted CPU
+open resources
+memory retention
+shutdown delays
+```
+
+Cancellation therefore connects asynchronous programming to lifecycle engineering.
+
+The central architecture becomes:
+
+```text
+start
+  ↓
+work
+  ↓
+success / failure / cancellation
+  ↓
+cleanup
+  ↓
+final outcome
+```
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 37 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Define cancellation.
+- [ ] Distinguish cancellation from Promise rejection.
+- [ ] Explain `AbortController`.
+- [ ] Explain `AbortSignal`.
+- [ ] Explain one-shot abort.
+- [ ] Explain `signal.reason`.
+- [ ] Explain abort events.
+- [ ] Explain `throwIfAborted`.
+- [ ] Explain cooperative cancellation.
+- [ ] Explain timeout as cancellation policy.
+- [ ] Explain `AbortSignal.any`.
+- [ ] Explain why cancellation is separate from rollback.
+
+### Predictive Mastery
+
+- [ ] Predict already-aborted behavior.
+- [ ] Predict double-abort behavior.
+- [ ] Predict reason precedence.
+- [ ] Predict abort/event/microtask ordering.
+- [ ] Predict `race` vs actual cancellation.
+- [ ] Predict combined-signal behavior.
+- [ ] Predict cancellation/completion races.
+- [ ] Predict cleanup after cancellation.
+
+### Implementation
+
+- [ ] Implement cancellable delay.
+- [ ] Implement cancellable custom Promise API.
+- [ ] Implement timeout-aware operations.
+- [ ] Implement combined cancellation.
+- [ ] Implement cancellable retries.
+- [ ] Implement cancellation-aware queueing.
+- [ ] Implement hierarchical cancellation.
+- [ ] Integrate cancellation with cleanup.
+
+### Debugging
+
+- [ ] Diagnose uncancelled stale work.
+- [ ] Diagnose timeout/race misconceptions.
+- [ ] Diagnose abort-listener leaks.
+- [ ] Diagnose reused aborted signals.
+- [ ] Diagnose cancellation during backoff.
+- [ ] Diagnose cancellation during queue waiting.
+- [ ] Diagnose resource leaks after cancellation.
+- [ ] Diagnose stale-result races.
+- [ ] Diagnose worker cancellation limitations.
+
+### Production Engineering
+
+- [ ] Design request-scoped cancellation.
+- [ ] Design timeout policy.
+- [ ] Design parent-child propagation.
+- [ ] Design graceful shutdown cancellation.
+- [ ] Design cancellable retries.
+- [ ] Design cancellation-aware queues.
+- [ ] Design cancellation with streams/resources.
+- [ ] Separate cancellation from rollback/compensation.
+- [ ] Define cancellation observability.
+- [ ] Define user vs infrastructure cancellation semantics.
+
+### Interview Readiness
+
+- [ ] Explain why Promise is not cancellable by itself.
+- [ ] Explain AbortController/AbortSignal.
+- [ ] Explain cooperative cancellation.
+- [ ] Explain `Promise.race` limitations.
+- [ ] Explain `AbortSignal.any`.
+- [ ] Explain timeout semantics.
+- [ ] Explain cancellation races.
+- [ ] Design hierarchical cancellation.
+- [ ] Defend cancellation architecture for production systems.
+
+### Track A — Core Theory
+
+- [ ] Understand cancellation as lifecycle control.
+- [ ] Understand AbortSignal semantics.
+- [ ] Understand cooperative termination.
+- [ ] Understand parent/child cancellation.
+- [ ] Understand timeout/deadline semantics.
+- [ ] Understand cleanup interaction.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production cancellation supervisor reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed cancellation debugging.
+- [ ] Completed code review.
+- [ ] Completed cancellation-tree design.
+- [ ] Completed queue/retry cancellation design.
+- [ ] Defended cancellation semantics under side effects and shutdown.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 37 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What is cancellation?
+2. Why is cancellation separate from Promise state?
+3. What does AbortController do?
+4. What does AbortSignal do?
+5. What does `signal.aborted` mean?
+6. What is `signal.reason`?
+7. What does `throwIfAborted()` do?
+8. Why is abort one-shot?
+9. Why is cancellation cooperative?
+10. Why can't abort interrupt an infinite synchronous loop?
+11. Why is `Promise.race()` not cancellation?
+12. What does `AbortSignal.timeout()` represent?
+13. What does `AbortSignal.any()` represent?
+14. Does `AbortSignal.any()` abort the source controllers?
+15. Why should abort listeners be cleaned up?
+16. Why is `{ once: true }` not always enough?
+17. How should cancellation propagate through a service tree?
+18. How should cancellation affect retries?
+19. How should cancellation affect queued work?
+20. How should cancellation affect resource cleanup?
+21. How should cancellation interact with transactions?
+22. How should cancellation interact with irreversible side effects?
+23. How should user cancellation differ from timeout?
+24. How should graceful shutdown use cancellation?
+25. How would you measure cancellation effectiveness?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit AbortController/AbortSignal
+- [ ] Revisit cooperative cancellation
+- [ ] Revisit timeout and combined signals
+- [ ] Revisit Promise.race vs cancellation
+- [ ] Revisit listener lifecycle
+- [ ] Revisit parent-child cancellation
+- [ ] Revisit retry/backoff cancellation
+- [ ] Revisit resource cleanup
+- [ ] Revisit cancellation/side-effect races
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 37 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. WHATWG DOM Standard — `AbortController`, `AbortSignal`, abort algorithms, abort events, reasons, and signal composition.
+2. WHATWG Fetch Standard — integration of AbortSignal with fetching and response-body consumption.
+3. ECMAScript specification — Promise state, async functions, Jobs, rejection, completion semantics, and the JavaScript language layer that cancellation-aware APIs build upon.
+4. MDN / browser documentation — practical `AbortController`, `AbortSignal`, `AbortSignal.timeout()`, `AbortSignal.any()`, compatibility, and lifecycle guidance.
+5. Node.js documentation — Node-specific AbortSignal integration and API contracts.
+6. Application architecture documentation — cancellation ownership, deadlines, retries, shutdown, transactions, compensation, observability, and resource lifecycle.
+
+Current browser documentation describes `AbortController.abort()` as aborting supported asynchronous operations such as fetch requests, response-body consumption, and streams. citeturn586943search3
+
+Current documentation describes `AbortSignal` with `aborted`, `reason`, `throwIfAborted()`, and static helpers such as `abort()`, `any()`, and `timeout()`. citeturn586943search0turn586943search5
+
+Do not confuse:
+
+```text
+ECMAScript Promise semantics
+with
+DOM AbortSignal semantics
+with
+Fetch integration
+with
+Node API support
+with
+application cancellation policy
+```
+
+Verify the exact target runtime/API before relying on cancellation support.
+
+---
+
+# Chapter 37 — Completion Snapshot
+
+```text
+Chapter: 37
+Title: Cancellation and Abort
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 38 — Async Iteration and Streaming
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Explain what asynchronous iteration is and why it exists.
+- Distinguish synchronous iterables/iterators from asynchronous iterables/iterators.
+- Explain the async iterator protocol.
+- Explain `Symbol.asyncIterator`.
+- Explain the shape and meaning of async iterator results.
+- Explain `next()` for asynchronous iterators.
+- Explain why async `next()` results are Promise-like.
+- Explain `for await...of`.
+- Explain async generator integration with asynchronous iteration.
+- Distinguish iteration over a collection from processing a stream of future values.
+- Explain pull-based asynchronous consumption.
+- Explain streaming as incremental data processing rather than whole-result buffering.
+- Explain backpressure and why producer speed must sometimes be constrained by consumer capacity.
+- Distinguish backpressure from cancellation and from throttling.
+- Explain iterator closing and `return()` behavior in async iteration.
+- Explain cleanup when `for await...of` exits early.
+- Understand what happens when an async iterator throws or rejects.
+- Understand how synchronous iterables can participate in `for await...of`.
+- Explain error handling inside and around async iteration.
+- Explain async iteration over network responses, files, queues, sockets, and generated values.
+- Explain the difference between an iterable protocol and a stream abstraction.
+- Understand how Web Streams and Node.js streams relate to async iteration without treating them as identical abstractions.
+- Explain buffering and its memory implications.
+- Explain high-water marks and flow control conceptually.
+- Explain why naive producer/consumer designs can create unbounded memory growth.
+- Implement async iterators and async generators.
+- Implement a pull-based async queue.
+- Implement bounded buffering and backpressure.
+- Implement cancellation-aware async iteration.
+- Design resource-safe streaming pipelines.
+- Diagnose stalled consumers, stalled producers, leaks, premature cleanup, and lost errors.
+- Compare async iteration with callbacks, EventEmitter-style APIs, Promises, Observables, and streams.
+- Understand stream transformation, filtering, batching, and windowing.
+- Design production data pipelines using explicit ownership, cancellation, backpressure, and failure policies.
+- Evaluate streaming systems using latency, throughput, memory, fairness, reliability, cancellation, and observability.
+- Defend asynchronous streaming architecture at senior/principal level.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+## 2. Prerequisites
+
+The learner should understand:
+
+- Iterables and iterators.
+- Generators and async generators.
+- Promises.
+- Async functions and `await`.
+- ECMAScript Jobs and Promise reactions.
+- Browser event-loop fundamentals.
+- Node.js event-loop fundamentals.
+- Cancellation.
+- Resource management and cleanup.
+- Basic binary data and network concepts.
+
+Primary dependencies:
+
+- Chapter 25 — Iterables / Iterators
+- Chapter 26 — Generators / Async Generators
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+
+Later chapters build directly on this chapter:
+
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 40 — Observables / Reactive
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 106 — Real-time WebSocket
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+
+---
+
+## 3. What Is It?
+
+**Asynchronous iteration** provides a protocol for consuming values that become available over time.
+
+A synchronous iterator exposes:
+
+```js
+iterator.next()
+```
+
+and returns a result immediately:
+
+```js
+{
+  value,
+  done
+}
+```
+
+An asynchronous iterator exposes the same conceptual progression, but its `next()` result is Promise-like:
+
+```text
+next()
+  ↓
+Promise
+  ↓
+{
+  value,
+  done
+}
+```
+
+This lets a consumer write:
+
+```js
+for await (const chunk of source) {
+  process(chunk);
+}
+```
+
+instead of manually coordinating callback events.
+
+Async iteration is especially useful for:
+
+- paginated APIs;
+- network streams;
+- files;
+- queues;
+- sockets;
+- generated values;
+- database cursors;
+- event-to-iterator adapters;
+- incremental parsers.
+
+The central idea is:
+
+> Instead of receiving one completed result, consume a sequence of future results through a pull-oriented protocol.
+
+This creates a powerful abstraction:
+
+```text
+consumer asks for next value
+         ↓
+producer eventually provides value
+         ↓
+consumer processes value
+         ↓
+consumer asks for next value
+```
+
+That structure is closely related to backpressure.
+
+---
+
+## 4. Why Does It Exist?
+
+A Promise models one eventual outcome:
+
+```text
+one operation
+→ one eventual settlement
+```
+
+But many real systems produce multiple values:
+
+```text
+network chunks
+database rows
+queue messages
+log records
+sensor values
+events
+pagination pages
+```
+
+A plain Promise cannot naturally express:
+
+```text
+value 1
+value 2
+value 3
+...
+```
+
+An EventEmitter can produce repeated events, but it makes pull-based consumption and lifecycle coordination more difficult:
+
+```js
+emitter.on("data", handler);
+```
+
+The consumer does not directly control when it receives the next value.
+
+Async iteration provides:
+
+```text
+request next
+→ await next
+→ process
+→ request next
+```
+
+This naturally models a consumer whose speed can control how aggressively it asks for more data.
+
+The deeper motivation is:
+
+> Make repeated asynchronous production composable with normal JavaScript control flow.
+
+---
+
+## 5. Mental Model
+
+Think of asynchronous iteration as a stateful conversation between consumer and producer.
+
+```text
+consumer
+   │
+   │ next()
+   ▼
+producer
+   │
+   │ eventually resolves
+   ▼
+{ value, done }
+   │
+   ▼
+consumer processes value
+   │
+   │ next()
+   └───────────────►
+```
+
+For a stream:
+
+```text
+consumer speed
+      ↓
+number of outstanding next() requests
+      ↓
+producer pressure
+      ↓
+buffer size
+```
+
+A well-designed async iterator often supports a controlled relationship:
+
+```text
+consumer asks
+   ↓
+producer provides
+   ↓
+consumer processes
+   ↓
+consumer asks again
+```
+
+This is a pull-oriented model.
+
+Compare an unbounded push producer:
+
+```text
+producer → event → event → event → event → ...
+                         ↓
+                  consumer slower
+                         ↓
+                    buffer grows
+```
+
+The key mental model:
+
+> Async iteration describes how a consumer obtains the next value; streaming architecture determines how production, buffering, backpressure, cancellation, and cleanup behave around that protocol.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Async iterators implement asynchronous progression
+
+They expose:
+
+```js
+next()
+```
+
+whose outcome is awaited.
+
+### Rule 2 — `Symbol.asyncIterator` identifies the async iterable protocol
+
+An object can define:
+
+```js
+[Symbol.asyncIterator]() {
+  return iterator;
+}
+```
+
+### Rule 3 — `for await...of` consumes async iterables
+
+```js
+for await (const value of source) {
+  process(value);
+}
+```
+
+### Rule 4 — Async iterator `next()` results are awaited
+
+The loop waits for each next result before progressing to the next iteration.
+
+### Rule 5 — Async generators automatically implement async iteration
+
+```js
+async function* source() {
+  yield await getValue();
+}
+```
+
+### Rule 6 — `yield` in an async generator produces future iterable values
+
+Each yielded value becomes part of the async iterator protocol.
+
+### Rule 7 — `return()` supports iterator closing
+
+Early exit can trigger cleanup behavior.
+
+### Rule 8 — `throw()` allows an injected failure path for generator-based iterators
+
+Async generators can respond to injected exceptions according to generator semantics.
+
+### Rule 9 — `for await...of` can consume synchronous iterables too
+
+It can adapt a synchronous iterable into asynchronous consumption semantics.
+
+### Rule 10 — Iteration is not automatically buffering-free
+
+The implementation can buffer values, and buffering policy determines memory behavior.
+
+### Rule 11 — Backpressure is not automatic merely because `for await...of` exists
+
+The producer implementation must respect demand where required.
+
+### Rule 12 — Cancellation is separate from iteration completion
+
+An iterator reaching:
+
+```js
+{ done: true }
+```
+
+is normal completion.
+
+Cancellation means the consumer no longer wants the operation to continue.
+
+### Rule 13 — Early loop exit can trigger iterator cleanup
+
+For example:
+
+```js
+break;
+```
+
+should be reasoned about in terms of iterator closing.
+
+### Rule 14 — Errors reject async iteration
+
+A rejected `next()` result causes the consuming flow to fail unless handled.
+
+### Rule 15 — Producer and consumer ownership must be explicit
+
+If an iterator owns a network connection, file, or subscription, its cleanup contract must be defined.
+
+### Rule 16 — A stream can be infinite
+
+Async iterators do not require a final `done: true` value to be useful.
+
+### Rule 17 — Pull does not always mean one item is physically produced at a time
+
+The implementation may prefetch or buffer internally.
+
+### Rule 18 — Backpressure should be measured at the actual resource boundary
+
+A consumer can be slow because of CPU, network, database, or downstream operations.
+
+### Rule 19 — Cleanup must cover early termination
+
+Examples:
+
+```text
+break
+return
+throw
+cancellation
+consumer failure
+```
+
+### Rule 20 — One outstanding request at a time is not mandatory in every abstraction
+
+Some systems intentionally pipeline requests for throughput, but then the backpressure model must be explicit.
+
+---
+
+## 7. Syntax
+
+### Async iterable
+
+```js
+const source = {
+  async *[Symbol.asyncIterator]() {
+    yield 1;
+    yield 2;
+  }
+};
+```
+
+### Async generator
+
+```js
+async function* numbers() {
+  yield 1;
+  yield 2;
+  yield 3;
+}
+```
+
+### `for await...of`
+
+```js
+for await (const value of numbers()) {
+  console.log(value);
+}
+```
+
+### Async iterator manually
+
+```js
+const iterator = {
+  async next() {
+    return {
+      value: 42,
+      done: false
+    };
+  }
+};
+```
+
+### Async iterator with completion
+
+```js
+const iterator = {
+  async next() {
+    return {
+      value: undefined,
+      done: true
+    };
+  }
+};
+```
+
+### Async generator cleanup
+
+```js
+async function* resourceStream(resource) {
+  try {
+    yield* createValues(resource);
+  } finally {
+    await resource.close();
+  }
+}
+```
+
+The exact legality of `yield*` depends on whether the delegated source is synchronous or asynchronous and should be studied together with async-generator semantics.
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Basic async generator
+
+```js
+async function* values() {
+  yield 1;
+  yield 2;
+  yield 3;
+}
+
+for await (const value of values()) {
+  console.log(value);
+}
+```
+
+Output:
+
+```text
+1
+2
+3
+```
+
+### Example 2 — Delayed values
+
+```js
+async function* values() {
+  await delay(100);
+  yield "A";
+
+  await delay(100);
+  yield "B";
+}
+```
+
+The consumer naturally waits between values.
+
+### Example 3 — Manual consumption
+
+```js
+const iterator = values();
+
+console.log(await iterator.next());
+console.log(await iterator.next());
+console.log(await iterator.next());
+console.log(await iterator.next());
+```
+
+A finished iterator eventually reports:
+
+```js
+{
+  value: undefined,
+  done: true
+}
+```
+
+### Example 4 — Early exit
+
+```js
+for await (const value of values()) {
+  if (value === 2) {
+    break;
+  }
+}
+```
+
+The iterator may receive an opportunity to clean up through its closing behavior.
+
+### Example 5 — Async generator with `finally`
+
+```js
+async function* values() {
+  try {
+    yield 1;
+    yield 2;
+  } finally {
+    console.log("cleanup");
+  }
+}
+
+for await (const value of values()) {
+  console.log(value);
+
+  break;
+}
+```
+
+The cleanup path executes when the iterator is closed.
+
+### Example 6 — Pagination
+
+```js
+async function* pages(fetchPage) {
+  let page = 1;
+
+  while (true) {
+    const result = await fetchPage(page);
+
+    yield result.items;
+
+    if (!result.nextPage) {
+      return;
+    }
+
+    page = result.nextPage;
+  }
+}
+```
+
+The consumer sees pages one at a time.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+async function* source() {
+  console.log("start");
+
+  yield 1;
+
+  console.log("between");
+
+  yield 2;
+
+  console.log("end");
+}
+
+async function run() {
+  for await (const value of source()) {
+    console.log("value", value);
+  }
+}
+
+run();
+```
+
+### Step 1
+
+`source()` creates an async generator object.
+
+The generator body does not necessarily execute fully at creation.
+
+### Step 2
+
+`for await...of` obtains the async iterator.
+
+### Step 3
+
+The loop requests:
+
+```js
+iterator.next()
+```
+
+### Step 4
+
+The async generator starts/resumes.
+
+It prints:
+
+```text
+start
+```
+
+### Step 5
+
+It reaches:
+
+```js
+yield 1;
+```
+
+The next operation resolves with:
+
+```js
+{
+  value: 1,
+  done: false
+}
+```
+
+### Step 6
+
+The loop receives the value and prints:
+
+```text
+value 1
+```
+
+### Step 7
+
+The loop asks for the next value.
+
+### Step 8
+
+The generator resumes after `yield 1`.
+
+It prints:
+
+```text
+between
+```
+
+### Step 9
+
+It reaches:
+
+```js
+yield 2;
+```
+
+The loop receives:
+
+```text
+value 2
+```
+
+### Step 10
+
+The loop asks again.
+
+### Step 11
+
+The generator resumes:
+
+```text
+end
+```
+
+The generator finishes.
+
+### Step 12
+
+The iteration completes with:
+
+```js
+{
+  done: true
+}
+```
+
+This demonstrates:
+
+```text
+next()
+→ async resume
+→ yield
+→ Promise result
+→ consumer
+→ next()
+```
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 Async iterator protocol
+
+An async iterable exposes:
+
+```js
+[Symbol.asyncIterator]()
+```
+
+which returns an async iterator.
+
+An async iterator provides methods such as:
+
+```js
+next()
+return()
+throw()
+```
+
+where implemented.
+
+### 10.2 Async iterator result
+
+The result has the familiar iterator shape:
+
+```js
+{
+  value,
+  done
+}
+```
+
+but asynchronous iteration introduces a Promise around the result.
+
+Conceptually:
+
+```text
+next()
+→ Promise<IteratorResult>
+```
+
+### 10.3 Async generator state
+
+An async generator can be modeled as:
+
+```text
+suspended-start
+      ↓
+executing
+      ↓
+suspended-yield
+      ↓
+executing
+      ↓
+completed
+```
+
+Its requests are coordinated asynchronously.
+
+### 10.4 Async generator request queue
+
+Async generators can receive `next`, `return`, and `throw` requests.
+
+Those requests are processed in an ordered manner because only one generator execution can be active at a time.
+
+Conceptually:
+
+```text
+request queue
+   ├── next()
+   ├── next()
+   └── return()
+```
+
+The generator processes them according to its state.
+
+### 10.5 `yield`
+
+When execution reaches:
+
+```js
+yield value;
+```
+
+the generator suspends and the consumer receives the yielded result.
+
+### 10.6 Async yield
+
+In an async generator:
+
+```js
+yield await task();
+```
+
+the generator may:
+
+```text
+await
+→ obtain value
+→ yield
+→ suspend
+```
+
+### 10.7 `return()`
+
+Closing an iterator can invoke:
+
+```js
+return()
+```
+
+This provides the iterator with an opportunity to clean up.
+
+### 10.8 `throw()`
+
+Generator-based iterators can receive an injected exception through:
+
+```js
+throw(error)
+```
+
+The generator can catch the error internally or finish abruptly.
+
+### 10.9 Async generator cleanup
+
+Use:
+
+```js
+try {
+  ...
+} finally {
+  await cleanup();
+}
+```
+
+inside an async generator when cleanup is required.
+
+### 10.10 `for await...of`
+
+The loop:
+
+1. obtains an async iterator;
+2. requests `next()`;
+3. awaits the result;
+4. checks `done`;
+5. binds the value;
+6. executes the loop body;
+7. repeats.
+
+On abrupt loop exit, iterator closing semantics become relevant.
+
+### 10.11 Synchronous iterable adaptation
+
+`for await...of` can consume synchronous iterables using an async-from-sync mechanism.
+
+Conceptually:
+
+```text
+sync iterator
+   ↓ adaptation
+async iteration interface
+   ↓
+await each result
+```
+
+### 10.12 Promise normalization
+
+The value and completion behavior of an async iterator can involve Promise normalization.
+
+This is why custom async iterators should return valid iterator-result objects from asynchronous operations.
+
+### 10.13 Pull-based demand
+
+A basic async iterator does not need to push values until requested.
+
+This creates a natural demand signal:
+
+```text
+next() requested
+→ produce/obtain next value
+```
+
+### 10.14 Prefetch
+
+A production implementation may prefetch:
+
+```text
+next item
+next item
+next item
+```
+
+even though the consumer only requests sequentially.
+
+Prefetch improves throughput but changes memory/resource pressure.
+
+### 10.15 Buffering
+
+A stream adapter can maintain:
+
+```text
+producer
+→ buffer
+→ async iterator consumer
+```
+
+If:
+
+```text
+producer rate > consumer rate
+```
+
+the buffer can grow unless backpressure limits production.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+### 11.1 Async iteration is an ECMAScript protocol
+
+ECMAScript defines:
+
+- `Symbol.asyncIterator`;
+- async iterator protocol;
+- async generator functions;
+- async generator objects;
+- `for await...of`;
+- async-from-sync iterator adaptation;
+- iterator closing behavior.
+
+### 11.2 `for await...of`
+
+The language obtains the asynchronous iterator and repeatedly performs asynchronous `next()` operations.
+
+### 11.3 Async generator functions
+
+An async generator function:
+
+```js
+async function* f() {}
+```
+
+produces an async generator object when called.
+
+Its yielded values participate in Promise/async-iteration semantics.
+
+### 11.4 Async generator queueing
+
+Async generator requests are processed in order.
+
+This prevents two generator bodies from executing simultaneously against the same generator instance.
+
+### 11.5 Async-from-sync iterator
+
+A synchronous iterable can be consumed by `for await...of`.
+
+The language creates an adapter that turns synchronous iterator results into Promise-based asynchronous results.
+
+### 11.6 Iterator closing
+
+When iteration ends abruptly, the language can perform iterator closing through `return()` when appropriate.
+
+This is essential for deterministic cleanup.
+
+### 11.7 Abrupt completion
+
+As in Chapter 29:
+
+```text
+return
+throw
+break
+continue
+```
+
+are abrupt completion pathways.
+
+Async iteration integrates with these control-flow mechanisms.
+
+### 11.8 Async iterator result requirements
+
+A `next()` operation should produce an iterator result object or Promise-like result consistent with the protocol.
+
+The result must communicate:
+
+```text
+value
+done
+```
+
+### 11.9 Async generator yield
+
+A yielded value is integrated with asynchronous completion semantics.
+
+The consumer does not receive the raw value synchronously.
+
+### 11.10 `for await...of` variable binding
+
+The loop binds each delivered value according to normal JavaScript lexical binding rules.
+
+### 11.11 Async iteration does not define network streaming
+
+The language defines the iteration protocol.
+
+Browser and Node stream APIs add host-specific transport, buffering, backpressure, and I/O semantics.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Async generator as a protocol adapter
+
+An async generator can convert:
+
+```text
+callback source
+event source
+pagination API
+stream
+queue
+```
+
+into:
+
+```js
+for await...of
+```
+
+This is a major architectural use case.
+
+### 12.2 Event-to-iterator adapter
+
+Suppose a callback API emits:
+
+```text
+data
+data
+data
+end
+error
+```
+
+You can adapt it into an async iterator:
+
+```text
+event emitter
+     ↓
+buffer/queue
+     ↓
+async iterator
+     ↓
+for await...of
+```
+
+The adapter becomes responsible for:
+
+- buffering;
+- backpressure;
+- cancellation;
+- cleanup;
+- error propagation.
+
+### 12.3 Pulling from a push source
+
+An EventEmitter is push-based.
+
+Async iteration is naturally pull-based.
+
+The adapter must reconcile the mismatch.
+
+### 12.4 Backpressure
+
+Backpressure means:
+
+```text
+consumer cannot process faster
+→ producer must slow down
+```
+
+A correct streaming pipeline can therefore propagate demand backward:
+
+```text
+consumer
+   ↑
+processor
+   ↑
+buffer
+   ↑
+producer
+```
+
+### 12.5 High-water marks
+
+Many stream systems define a threshold such as:
+
+```text
+buffer >= high-water mark
+```
+
+where producers should stop or slow production.
+
+Async iteration itself does not standardize one universal high-water-mark mechanism.
+
+The surrounding stream abstraction determines how this is implemented.
+
+### 12.6 Bounded buffering
+
+A simple queue can enforce:
+
+```text
+buffer size ≤ N
+```
+
+The producer then:
+
+- waits;
+- drops;
+- coalesces;
+- rejects;
+- blocks according to domain policy.
+
+### 12.7 Slow consumer
+
+Suppose:
+
+```text
+producer = 10,000 values/sec
+consumer = 100 values/sec
+```
+
+An unbounded buffer becomes:
+
+```text
+memory ↑ continuously
+```
+
+A production system needs:
+
+```text
+backpressure
+sampling
+dropping
+batching
+bounded queue
+scaling
+```
+
+### 12.8 Fast consumer
+
+If the producer is slower:
+
+```text
+consumer waits for producer
+```
+
+This is normal and does not indicate a backpressure failure.
+
+### 12.9 Batching
+
+An async iterator can yield batches:
+
+```js
+yield [item1, item2, item3];
+```
+
+This reduces per-item scheduling overhead.
+
+### 12.10 Windowing
+
+A stream may be processed in time/count windows:
+
+```text
+100 records
+or
+1 second
+```
+
+This is useful for:
+
+- analytics;
+- aggregation;
+- network batching.
+
+### 12.11 Transformation pipelines
+
+```js
+async function* map(source, fn) {
+  for await (const value of source) {
+    yield await fn(value);
+  }
+}
+```
+
+Then:
+
+```js
+for await (const result of map(source, transform)) {
+  consume(result);
+}
+```
+
+This creates composable async dataflow.
+
+### 12.12 Filtering
+
+```js
+async function* filter(source, predicate) {
+  for await (const value of source) {
+    if (await predicate(value)) {
+      yield value;
+    }
+  }
+}
+```
+
+### 12.13 Flat mapping
+
+A transformation may produce multiple async values:
+
+```text
+source value
+→ async source
+→ flatten output
+```
+
+Ordering and concurrency must be defined.
+
+### 12.14 Sequential transformation
+
+The simplest pipeline:
+
+```text
+read one
+→ transform one
+→ yield one
+→ repeat
+```
+
+provides natural limiting but lower throughput.
+
+### 12.15 Concurrent transformation
+
+For independent CPU/I/O operations:
+
+```text
+read batch
+→ start multiple transforms
+→ await bounded set
+→ yield results
+```
+
+This requires explicit concurrency policy.
+
+### 12.16 Ordered versus unordered output
+
+Suppose:
+
+```text
+item A = slow
+item B = fast
+```
+
+A concurrent pipeline must decide:
+
+```text
+preserve input order?
+or
+yield as completed?
+```
+
+Both are valid designs.
+
+### 12.17 Error boundaries
+
+An async iterator can fail at:
+
+```text
+creation
+next()
+yield transformation
+consumer
+cleanup
+```
+
+Each boundary should have an explicit policy.
+
+### 12.18 Cleanup and `break`
+
+```js
+for await (const item of source) {
+  if (done(item)) {
+    break;
+  }
+}
+```
+
+If the source owns resources, iterator-closing semantics are critical.
+
+### 12.19 Consumer throws
+
+```js
+for await (const item of source) {
+  process(item); // may throw
+}
+```
+
+The iterator may need closing as control exits abruptly.
+
+### 12.20 Producer throws
+
+An error inside an async generator can reject the pending `next()` result.
+
+### 12.21 Cancellation
+
+A cancellation signal may cause:
+
+```text
+next()
+→ reject/abort
+```
+
+or trigger iterator closing logic, depending on the adapter.
+
+The API contract must define this.
+
+### 12.22 Async iterator cancellation helper
+
+A useful pattern:
+
+```js
+async function* cancellable(source, signal) {
+  signal.throwIfAborted();
+
+  for await (const value of source) {
+    signal.throwIfAborted();
+    yield value;
+  }
+}
+```
+
+However, this does not necessarily stop the underlying producer unless the source itself observes the same signal.
+
+### 12.23 Stream resource ownership
+
+An async iterator may hide:
+
+```text
+file
+socket
+database cursor
+HTTP body
+```
+
+The caller must understand whether consuming to completion closes it automatically.
+
+### 12.24 Early break and resource leaks
+
+If the iterator does not implement proper closing/cleanup,:
+
+```js
+break;
+```
+
+can leak the underlying resource.
+
+### 12.25 Infinite iterators
+
+Useful examples:
+
+```text
+message queue
+websocket
+sensor
+tail -f style stream
+```
+
+The consumer requires an explicit cancellation/termination condition.
+
+### 12.26 Error after partial results
+
+Streaming systems often produce:
+
+```text
+A
+B
+C
+error
+```
+
+The consumer must understand that partial output may already have occurred.
+
+This is different from an atomic Promise result.
+
+### 12.27 Exactly-once misconception
+
+Async iteration does not guarantee:
+
+```text
+exactly once processing
+```
+
+Distributed stream processing needs explicit delivery semantics.
+
+### 12.28 Retry and replay
+
+A failed stream consumer may need to resume from:
+
+```text
+checkpoint
+offset
+cursor
+page
+message ID
+```
+
+The iterator protocol alone does not define replay semantics.
+
+### 12.29 Async generator delegation
+
+Async generators can delegate to other iterable sources.
+
+This is useful for composing streaming sources while preserving cleanup semantics.
+
+### 12.30 Web Streams integration
+
+Web Streams define richer concepts:
+
+- readable/writable streams;
+- readers/writers;
+- queuing;
+- backpressure;
+- cancellation;
+- piping;
+- byte streams.
+
+Async iteration can provide a convenient consumption interface, but it is not a replacement for the entire Streams API.
+
+### 12.31 Node streams integration
+
+Node streams provide:
+
+- flowing/paused concepts;
+- backpressure;
+- `highWaterMark`;
+- pipe/pipeline;
+- stream lifecycle events.
+
+Modern Node APIs also offer async iteration over streams.
+
+The two abstraction layers should be understood separately.
+
+### 12.32 Async iterator versus ReadableStream
+
+Async iterator answers:
+
+```text
+“How do I get the next value?”
+```
+
+ReadableStream answers a richer question:
+
+```text
+“How do I manage continuous readable data flow,
+buffering, backpressure, cancellation, and stream ownership?”
+```
+
+### 12.33 Async iterator versus Observable
+
+Async iterator:
+
+```text
+consumer pulls
+```
+
+Observable:
+
+```text
+producer pushes
+```
+
+Bridging them requires buffering and lifecycle policies.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 `next()` returns a rejected Promise
+
+The iteration fails.
+
+### 13.2 `next()` returns malformed data
+
+Invalid iterator results can cause protocol errors.
+
+### 13.3 `done: true` with a value
+
+The iterator is complete; the value's meaning is protocol-specific and should not be assumed to be processed as another loop item.
+
+### 13.4 Empty async iterator
+
+```js
+for await (const value of empty()) {
+  // never runs
+}
+```
+
+### 13.5 Synchronous iterable with `for await`
+
+A synchronous iterable can be adapted and consumed asynchronously.
+
+### 13.6 Async generator `return`
+
+```js
+async function* source() {
+  yield 1;
+  return 99;
+}
+```
+
+The `for await...of` loop does not expose the final return value as an iteration item.
+
+Manual iterator interaction can observe final completion information.
+
+### 13.7 Consumer throws
+
+The iteration can close the iterator.
+
+### 13.8 `break`
+
+The loop ends early and closing semantics matter.
+
+### 13.9 `continue`
+
+The iterator remains active and the next iteration is requested.
+
+### 13.10 `return` from containing function
+
+The iterator may still require closing as the loop exits.
+
+### 13.11 Infinite stream
+
+The consumer must define termination or cancellation.
+
+### 13.12 Slow consumer buffer growth
+
+Without backpressure, memory can grow.
+
+### 13.13 Fast producer cancellation
+
+Stopping consumption does not always stop production.
+
+The source must support cancellation/close.
+
+### 13.14 Multiple consumers
+
+A single async iterator instance is generally a stateful cursor.
+
+Two consumers sharing one iterator may interfere with one another.
+
+If independent consumers are required, create independent iterators or a multicast abstraction.
+
+### 13.15 Reusing completed iterator
+
+A completed iterator stays completed unless the abstraction explicitly supports reset/new iteration.
+
+### 13.16 Concurrent `next()` calls
+
+Some custom async iterators may permit multiple pending requests; async generators queue requests.
+
+Do not assume every iterator supports arbitrary concurrent `next()` calls safely.
+
+### 13.17 Backpressure mismatch
+
+A source can still prefetch aggressively even when the consumer processes sequentially.
+
+Inspect actual buffering behavior.
+
+### 13.18 Cleanup throws
+
+Cleanup itself can fail.
+
+This connects to Chapter 29.
+
+### 13.19 Cancellation while `next()` is pending
+
+The operation must define whether pending work:
+
+```text
+rejects
+resolves
+closes
+continues in background
+```
+
+### 13.20 Consumer stops after partial side effects
+
+A stream can expose partially processed data.
+
+Exactly-once transactional semantics require additional design.
+
+### 13.21 Resource-backed iterator becomes invalid
+
+The underlying resource may close while an async `next()` is pending.
+
+### 13.22 Consumer stalls
+
+If the consumer stops requesting values without closing the iterator, resources can remain active.
+
+### 13.23 Async-from-sync errors
+
+A synchronous iterable can throw during `next()`; async iteration must surface the failure appropriately.
+
+### 13.24 Thenable value
+
+Yielded values can themselves involve Promise-like normalization depending on the async generator semantics.
+
+### 13.25 Nested streams
+
+A value yielded by one iterator may itself represent another stream.
+
+Decide whether to:
+
+```text
+yield stream object
+```
+
+or:
+
+```text
+flatten stream
+```
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “Async iterator means network stream.”
+
+No.
+
+It is a generic language protocol.
+
+### Misconception 2 — “`for await...of` guarantees backpressure.”
+
+It creates a pull-shaped consumption flow, but the producer may still buffer/prefetch.
+
+### Misconception 3 — “Async iterator and stream are the same abstraction.”
+
+No.
+
+A stream usually includes richer buffering, flow control, cancellation, and lifecycle semantics.
+
+### Misconception 4 — “One `next()` call means exactly one physical network packet.”
+
+No.
+
+The iterator may transform, buffer, batch, or decode data.
+
+### Misconception 5 — “Breaking from `for await...of` automatically closes every underlying resource.”
+
+The loop performs iterator closing according to language semantics, but the iterator/resource implementation must actually implement cleanup correctly.
+
+### Misconception 6 — “Cancellation is the same as iterator completion.”
+
+No.
+
+Completion means normal end of sequence.
+
+Cancellation means the consumer no longer wants the operation to continue.
+
+### Misconception 7 — “Async generators are automatically concurrent.”
+
+No.
+
+A single async generator execution is serialized.
+
+### Misconception 8 — “If the consumer is slow, the producer automatically slows.”
+
+Not necessarily.
+
+The adapter/stream must implement backpressure.
+
+### Misconception 9 — “Infinite streams are unsafe.”
+
+They are useful when paired with explicit lifecycle and cancellation semantics.
+
+### Misconception 10 — “Promises are enough for streams.”
+
+A Promise represents one eventual outcome, not an unbounded sequence.
+
+### Misconception 11 — “All consumers can share one async iterator safely.”
+
+A stateful cursor usually represents one progression.
+
+### Misconception 12 — “Async iteration guarantees exactly-once processing.”
+
+No.
+
+Delivery and processing guarantees belong to the surrounding system.
+
+### Misconception 13 — “Breaking the loop stops the producer instantly.”
+
+Only if the source honors closing/cancellation and can actually stop the underlying work.
+
+### Misconception 14 — “Node streams and Web Streams have identical APIs.”
+
+No.
+
+They share conceptual ideas but have different APIs and host-specific semantics.
+
+### Misconception 15 — “Buffering is always bad.”
+
+Buffering can smooth bursts and improve throughput.
+
+The problem is uncontrolled/unbounded buffering.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Building an unbounded event-to-iterator queue
+
+### Mistake 2 — Ignoring backpressure
+
+### Mistake 3 — Forgetting cleanup on `break`
+
+### Mistake 4 — Ignoring consumer cancellation
+
+### Mistake 5 — Starting producers before demand exists
+
+### Mistake 6 — Sharing one stateful iterator among unrelated consumers
+
+### Mistake 7 — Performing unbounded concurrent processing inside the loop
+
+### Mistake 8 — Swallowing stream errors
+
+### Mistake 9 — Retaining entire stream contents instead of processing incrementally
+
+### Mistake 10 — Assuming a timeout cancels the source
+
+### Mistake 11 — Treating an async iterator as a durable queue
+
+### Mistake 12 — Failing to checkpoint resumable streams
+
+### Mistake 13 — Mixing ordering guarantees unintentionally
+
+### Mistake 14 — Closing resources before the consumer completes
+
+### Mistake 15 — Allowing a fast producer to exhaust memory
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Concept | Data model | Direction | Typical lifecycle |
+|---|---|---|---|
+| Promise | One future outcome | Pull/wait | One settlement |
+| Async iterator | Sequence of future values | Pull | Repeated `next()` |
+| Async generator | Programmable async iterator | Pull | Repeated yields + completion |
+| EventEmitter | Events over time | Push | Listener-driven |
+| Observable | Sequence over time | Push-oriented | Subscribe/unsubscribe |
+| Web ReadableStream | Continuous readable data | Pull/push hybrid | Explicit stream lifecycle |
+| Node Readable | Data stream | Push/pull modes | Backpressure + events/iteration |
+| Queue | Pending work/data | Producer/consumer | Explicit storage/lifecycle |
+| Callback API | Event/callback completion | Push | API-specific |
+| Channel | Producer/consumer synchronization | Push/pull | Often bounded |
+
+### Async iterator vs Promise
+
+```text
+Promise:
+one result
+
+Async iterator:
+many results
+```
+
+### Async iterator vs EventEmitter
+
+```text
+iterator:
+consumer asks
+
+EventEmitter:
+producer pushes
+```
+
+### Async iterator vs Observable
+
+Observable systems commonly support multiple emissions and subscriptions, often with richer reactive composition.
+
+Async iteration naturally fits:
+
+```js
+for await...
+```
+
+and sequential consumer logic.
+
+### Async iterator vs Web Streams
+
+Async iteration is often convenient for consumption:
+
+```js
+for await (const chunk of stream) {
+  ...
+}
+```
+
+A Stream abstraction also handles:
+
+```text
+backpressure
+readers/writers
+queuing
+pipe graphs
+cancellation
+locking
+```
+
+### Async iterator vs Node Readable
+
+Node's Readable stream has explicit stream semantics and backpressure controls.
+
+Async iteration can be an interface for consuming the Readable.
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 Incremental processing
+
+Streaming prevents:
+
+```text
+load entire dataset
+→ process entire dataset
+```
+
+and can instead do:
+
+```text
+read
+→ process
+→ discard/release
+→ read next
+```
+
+### 17.2 Reduced peak memory
+
+For large inputs:
+
+```text
+streaming
+≈ bounded working set
+```
+
+when buffering is bounded.
+
+### 17.3 Per-item overhead
+
+Calling:
+
+```js
+await iterator.next()
+```
+
+for every tiny item can create substantial Promise/job overhead.
+
+Batching can help:
+
+```text
+yield 100 items
+```
+
+instead of:
+
+```text
+yield 1 item
+100 times
+```
+
+### 17.4 Async generator overhead
+
+Async generator objects and promise-based request processing introduce bookkeeping.
+
+Usually worth it for composability, but hot paths should be measured.
+
+### 17.5 Buffer size
+
+Larger buffers can improve throughput but increase:
+
+- memory;
+- latency;
+- burst size.
+
+### 17.6 Prefetch
+
+Prefetch can hide producer latency:
+
+```text
+consumer processing item 1
+while producer obtains item 2
+```
+
+But too much prefetch becomes memory pressure.
+
+### 17.7 Concurrency
+
+Sequential iteration:
+
+```js
+for await (const item of source) {
+  await process(item);
+}
+```
+
+is bounded to one processing operation at a time.
+
+A concurrent pipeline can improve throughput:
+
+```text
+read batch
+→ process N concurrently
+→ await results
+```
+
+but must preserve backpressure.
+
+### 17.8 CPU processing
+
+Async iteration does not make CPU processing non-blocking.
+
+A loop doing:
+
+```js
+for await (...)
+  expensiveCPU()
+```
+
+can still block the event loop.
+
+### 17.9 Batching and syscalls
+
+For files/networking, batching can reduce:
+
+- system calls;
+- network round trips;
+- scheduling overhead.
+
+### 17.10 Latency
+
+Streaming can improve time-to-first-result:
+
+```text
+first chunk available
+→ process immediately
+```
+
+rather than waiting for the entire response.
+
+### 17.11 Throughput versus fairness
+
+Large batches can maximize throughput but delay other consumers.
+
+A production scheduler needs fairness policies.
+
+---
+
+## 18. Memory Considerations
+
+### 18.1 Whole-result buffering
+
+Bad:
+
+```js
+const all = [];
+
+for await (const item of source) {
+  all.push(item);
+}
+```
+
+if the source is enormous or infinite.
+
+### 18.2 Unbounded event queue
+
+A push source adapted to async iteration can accumulate unlimited items.
+
+### 18.3 Consumer retention
+
+A slow consumer can retain:
+
+- queued chunks;
+- buffers;
+- closures;
+- resources.
+
+### 18.4 Prefetch memory
+
+Prefetch improves throughput at a memory cost.
+
+### 18.5 Batch size
+
+Large batches reduce per-item overhead but increase working-set size.
+
+### 18.6 Stream chunk lifetime
+
+Process chunks and release references when no longer needed.
+
+### 18.7 Async closures
+
+Transformation functions can retain earlier values.
+
+### 18.8 Pending `next()`
+
+A pending `next()` may retain the iterator and associated state.
+
+### 18.9 Resource-backed iterators
+
+An iterator may hold:
+
+```text
+file handle
+socket
+database cursor
+```
+
+until completion/closure.
+
+### 18.10 Leaked consumers
+
+If a consumer stops reading without closing/cancelling, resources may remain live.
+
+---
+
+## 19. Security Considerations
+
+### 19.1 Unbounded streams as DoS vectors
+
+Attackers can produce data faster than it can be processed.
+
+### 19.2 Memory exhaustion
+
+Unbounded buffering can become a denial-of-service vulnerability.
+
+### 19.3 Resource exhaustion
+
+Long-lived streams can hold:
+
+- sockets;
+- file descriptors;
+- database cursors.
+
+### 19.4 Slow consumers
+
+Slow processing can create backlogs.
+
+### 19.5 Cancellation abuse
+
+Attackers may start many operations and cancel rapidly, forcing repeated setup/cleanup costs.
+
+### 19.6 Partial data and authorization
+
+A stream may continue after authorization context changes.
+
+Revalidate where required.
+
+### 19.7 Injection across chunks
+
+Do not assume each chunk is a complete logical message.
+
+Attackers can split malicious data across boundaries.
+
+### 19.8 Resource lifetime
+
+A cancelled stream must release credentials, sockets, temporary files, and buffers.
+
+### 19.9 Checkpoint integrity
+
+Resumable stream systems must authenticate or validate offsets/cursors to prevent replay or duplication attacks.
+
+### 19.10 Backpressure bypass
+
+A custom adapter that ignores downstream pressure can undermine the security properties of the entire pipeline.
+
+---
+
+## 20. Production Usage
+
+### 20.1 Paginated API
+
+```js
+async function* pages(fetchPage, signal) {
+  let cursor = null;
+
+  while (true) {
+    const page = await fetchPage(cursor, { signal });
+
+    yield page.items;
+
+    if (!page.nextCursor) {
+      return;
+    }
+
+    cursor = page.nextCursor;
+  }
+}
+```
+
+The consumer can stop early.
+
+### 20.2 Streaming file processing
+
+```js
+for await (const chunk of readChunks(file)) {
+  processChunk(chunk);
+}
+```
+
+Process incrementally rather than loading the whole file.
+
+### 20.3 Queue consumer
+
+```js
+for await (const message of messages({
+  signal
+})) {
+  await processMessage(message, { signal });
+}
+```
+
+The queue adapter should define:
+
+- acknowledgment;
+- retry;
+- cancellation;
+- visibility timeout;
+- shutdown.
+
+### 20.4 WebSocket message adapter
+
+```text
+socket
+→ event listener
+→ bounded async queue
+→ async iterator
+→ consumer
+```
+
+The adapter must address:
+
+- message ordering;
+- backpressure;
+- socket close;
+- parse errors;
+- cancellation.
+
+### 20.5 Async transformation pipeline
+
+```js
+async function* map(source, transform) {
+  for await (const value of source) {
+    yield await transform(value);
+  }
+}
+```
+
+### 20.6 Batching pipeline
+
+```js
+async function* batch(source, size) {
+  let buffer = [];
+
+  for await (const value of source) {
+    buffer.push(value);
+
+    if (buffer.length === size) {
+      yield buffer;
+      buffer = [];
+    }
+  }
+
+  if (buffer.length) {
+    yield buffer;
+  }
+}
+```
+
+### 20.7 Bounded concurrent processing
+
+Use a concurrency controller when transformation is independent but expensive.
+
+```text
+read
+→ bounded queue
+→ N processors
+→ ordered/unordered results
+```
+
+### 20.8 Cancellation
+
+```js
+const controller = new AbortController();
+
+for await (const chunk of stream({
+  signal: controller.signal
+})) {
+  if (shouldStop(chunk)) {
+    controller.abort("no longer needed");
+    break;
+  }
+}
+```
+
+The stream must actually honor the signal.
+
+### 20.9 Graceful shutdown
+
+```text
+shutdown signal
+→ stop accepting new messages
+→ stop producer
+→ drain/abort iterator
+→ finish required processing
+→ release resources
+```
+
+### 20.10 Database cursors
+
+Database cursor adapters are natural async iterators.
+
+Important policies:
+
+```text
+fetch batch size
+cursor lifetime
+transaction scope
+cancellation
+connection ownership
+```
+
+### 20.11 HTTP response bodies
+
+Network response bodies can be consumed incrementally.
+
+The application must define:
+
+```text
+read fully?
+stop early?
+cancel body?
+close connection?
+```
+
+### 20.12 Log tailing
+
+Infinite async iterators can model:
+
+```text
+tail log
+```
+
+but require:
+
+```text
+shutdown
+reconnect
+backoff
+offset
+```
+
+### 20.13 ETL pipelines
+
+```text
+source
+→ decode
+→ validate
+→ transform
+→ batch
+→ persist
+```
+
+Each stage should have:
+
+- bounded buffering;
+- retry policy;
+- cancellation;
+- observability.
+
+### 20.14 Observability
+
+Measure:
+
+- items/sec;
+- bytes/sec;
+- time-to-first-item;
+- processing latency;
+- queue depth;
+- buffer size;
+- backpressure duration;
+- retries;
+- cancellations;
+- dropped items;
+- consumer lag.
+
+---
+
+## 21. Implementation From Scratch
+
+### Stage 1 — Guided
+
+Implement a simple async iterator:
+
+```js
+function rangeAsync(count) {
+  let current = 0;
+
+  return {
+    async next() {
+      if (current >= count) {
+        return {
+          value: undefined,
+          done: true
+        };
+      }
+
+      return {
+        value: current++,
+        done: false
+      };
+    },
+
+    [Symbol.asyncIterator]() {
+      return this;
+    }
+  };
+}
+```
+
+Consume it with:
+
+```js
+for await (const value of rangeAsync(3)) {
+  console.log(value);
+}
+```
+
+### Stage 2 — Partially Guided
+
+Implement:
+
+```js
+async function* mapAsync(source, mapper) {}
+```
+
+Requirements:
+
+- preserve order;
+- propagate failures;
+- support early close.
+
+### Stage 3 — No Reference
+
+Implement:
+
+```js
+class AsyncQueue {
+  async next() {}
+  push(value) {}
+  close() {}
+  fail(error) {}
+  cancel(reason) {}
+}
+```
+
+Requirements:
+
+- waiters;
+- buffered values;
+- bounded capacity;
+- completion;
+- failure;
+- cancellation.
+
+### Stage 4 — Edge-Case Hardened
+
+Add:
+
+- multiple pending consumers;
+- producer faster than consumer;
+- bounded buffer;
+- cancellation while waiting;
+- producer failure;
+- consumer failure;
+- cleanup;
+- ordering guarantees.
+
+### Stage 5 — Production Grade
+
+Build:
+
+```js
+class AsyncPipeline {
+  constructor({
+    source,
+    stages,
+    concurrency,
+    bufferSize,
+    signal
+  }) {}
+
+  async run() {}
+
+  metrics() {}
+
+  async close() {}
+}
+```
+
+Support:
+
+```text
+bounded buffering
+bounded concurrency
+cancellation
+backpressure
+retries
+failure isolation
+ordering policy
+graceful shutdown
+metrics
+resource cleanup
+```
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Basic protocol
+
+Manually call:
+
+```js
+const iterator = source[Symbol.asyncIterator]();
+
+await iterator.next();
+await iterator.next();
+```
+
+Inspect each result.
+
+### Exercise 2 — Early break cleanup
+
+Create:
+
+```js
+async function* source() {
+  try {
+    yield 1;
+    yield 2;
+  } finally {
+    console.log("closed");
+  }
+}
+```
+
+Break after the first item.
+
+Verify cleanup.
+
+### Exercise 3 — Consumer failure
+
+Make the consumer throw:
+
+```js
+for await (const item of source()) {
+  throw new Error("consumer failed");
+}
+```
+
+Determine whether the source receives a close opportunity.
+
+### Exercise 4 — Backpressure failure
+
+Create a producer that pushes faster than the consumer.
+
+Measure memory growth.
+
+### Exercise 5 — Bounded queue
+
+Add a maximum buffer size.
+
+Determine what happens when it fills:
+
+```text
+wait
+drop
+coalesce
+reject
+```
+
+Choose one policy.
+
+### Exercise 6 — Cancellation
+
+Cancel a stream while `next()` is pending.
+
+Define expected behavior.
+
+### Exercise 7 — Concurrent processing
+
+Compare:
+
+```js
+for await (...) {
+  await process(item);
+}
+```
+
+with bounded concurrent processing.
+
+Measure:
+
+- throughput;
+- ordering;
+- memory;
+- downstream load.
+
+### Exercise 8 — Multiple consumers
+
+Share one async iterator across two consumers.
+
+Observe how cursor state is distributed.
+
+Then design a proper multicast abstraction.
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+async function consume(messages) {
+  for await (const message of messages) {
+    const result = await process(message);
+
+    await save(result);
+  }
+}
+```
+
+Evaluate:
+
+- backpressure;
+- processing concurrency;
+- retries;
+- message acknowledgment;
+- cancellation;
+- shutdown;
+- partial failure;
+- resource ownership;
+- ordering;
+- throughput;
+- observability.
+
+Then review:
+
+```js
+async function consume(messages) {
+  const jobs = [];
+
+  for await (const message of messages) {
+    jobs.push(process(message));
+  }
+
+  await Promise.all(jobs);
+}
+```
+
+Identify why this may be dangerous for an unbounded stream.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is an async iterator?
+2. What is `Symbol.asyncIterator`?
+3. What does `for await...of` do?
+4. How is an async iterator different from a synchronous iterator?
+5. Why does async iterator `next()` return a Promise?
+6. What is an async generator?
+7. What is `yield` in an async generator?
+8. What does `done` mean?
+9. What is iterator closing?
+10. Why is async iteration useful for streams?
+
+### Intermediate
+
+11. How can `for await...of` consume synchronous iterables?
+12. What happens when an async iterator rejects?
+13. What happens when the consumer throws?
+14. What happens on `break`?
+15. How can async generators perform cleanup?
+16. What is backpressure?
+17. Why does async iteration not automatically guarantee backpressure?
+18. How would you adapt an EventEmitter to an async iterator?
+19. What is buffering?
+20. Why can unbounded buffering cause memory problems?
+
+### Advanced
+
+21. Explain async generator request queueing.
+22. Explain iterator `return()` semantics.
+23. Explain async-from-sync iteration.
+24. Explain pull versus push dataflow.
+25. Explain cancellation versus normal iterator completion.
+26. Explain stream cleanup after early exit.
+27. Explain ordered versus unordered concurrent transformations.
+28. Explain why Promise-based APIs do not naturally model unbounded data streams.
+29. Explain async iterator vs Web Stream.
+30. Explain async iterator vs Node Readable.
+
+### Principal-Level
+
+31. Design an event-to-async-iterator adapter.
+32. Design bounded backpressure.
+33. Design a production ETL pipeline.
+34. Design cancellation for an infinite stream.
+35. Design graceful shutdown for a queue consumer.
+36. Design retry/checkpoint semantics.
+37. Design ordered concurrent stream processing.
+38. Diagnose a memory leak caused by a slow consumer.
+39. Decide when async iteration is better than Observable/EventEmitter/Streams.
+40. Define reliability guarantees for a distributed stream pipeline.
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+async function* source() {
+  yield 1;
+  yield 2;
+}
+
+(async () => {
+  for await (const value of source()) {
+    console.log(value);
+  }
+
+  console.log("done");
+})();
+```
+
+Expected:
+
+```text
+1
+2
+done
+```
+
+### Exercise B
+
+```js
+async function* source() {
+  console.log("A");
+  yield 1;
+  console.log("B");
+  yield 2;
+  console.log("C");
+}
+
+(async () => {
+  console.log("D");
+
+  for await (const value of source()) {
+    console.log("value", value);
+
+    if (value === 1) {
+      break;
+    }
+  }
+
+  console.log("E");
+})();
+```
+
+Predict the ordering and explain the closing path.
+
+### Exercise C
+
+```js
+async function* source() {
+  try {
+    yield 1;
+    yield 2;
+  } finally {
+    console.log("cleanup");
+  }
+}
+
+(async () => {
+  for await (const value of source()) {
+    console.log(value);
+    break;
+  }
+})();
+```
+
+Predict:
+
+```text
+1
+cleanup
+```
+
+### Exercise D
+
+```js
+async function* source() {
+  yield 1;
+  throw new Error("boom");
+}
+
+(async () => {
+  try {
+    for await (const value of source()) {
+      console.log(value);
+    }
+  } catch (error) {
+    console.log(error.message);
+  }
+})();
+```
+
+Predict:
+
+```text
+1
+boom
+```
+
+### Exercise E
+
+```js
+async function* source() {
+  yield Promise.resolve("A");
+  yield Promise.resolve("B");
+}
+```
+
+Explain how yielded values are observed through async iteration.
+
+### Exercise F
+
+```js
+const iterator = {
+  count: 0,
+
+  async next() {
+    this.count++;
+
+    if (this.count <= 2) {
+      return {
+        value: this.count,
+        done: false
+      };
+    }
+
+    return {
+      value: undefined,
+      done: true
+    };
+  },
+
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+};
+
+(async () => {
+  for await (const value of iterator) {
+    console.log(value);
+  }
+
+  console.log("done");
+})();
+```
+
+Predict the output.
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Async range
+
+Implement:
+
+```js
+rangeAsync(start, end, delay)
+```
+
+with deterministic asynchronous values.
+
+### Exercise 2 — Pagination iterator
+
+Implement:
+
+```js
+paginate(fetchPage, options)
+```
+
+Requirements:
+
+- cursor handling;
+- cancellation;
+- retry;
+- early termination;
+- no unnecessary page prefetch.
+
+### Exercise 3 — Event-to-iterator adapter
+
+Convert:
+
+```text
+data
+error
+close
+```
+
+events into an async iterator.
+
+Requirements:
+
+- bounded queue;
+- error propagation;
+- close handling;
+- cancellation;
+- cleanup.
+
+### Exercise 4 — Backpressure queue
+
+Implement:
+
+```js
+BoundedAsyncQueue(capacity)
+```
+
+Support:
+
+```text
+push
+next
+close
+fail
+cancel
+```
+
+Define producer behavior when the queue is full.
+
+### Exercise 5 — Transform pipeline
+
+Build:
+
+```text
+source
+→ decode
+→ validate
+→ transform
+→ batch
+→ persist
+```
+
+with bounded buffers.
+
+### Exercise 6 — Concurrent transform
+
+Implement:
+
+```js
+mapConcurrent(source, {
+  concurrency,
+  preserveOrder
+})
+```
+
+Compare ordered and unordered output.
+
+### Exercise 7 — Checkpointable consumer
+
+Build:
+
+```js
+consumeFrom(offset)
+```
+
+so processing can resume after failure.
+
+### Exercise 8 — Infinite stream supervisor
+
+Design:
+
+```text
+start
+pause
+resume
+cancel
+shutdown
+```
+
+for a long-lived async iterator.
+
+### Exercise 9 — Resource-safe iterator
+
+Create an async iterator backed by:
+
+```text
+socket
+```
+
+and guarantee cleanup on:
+
+```text
+normal completion
+break
+throw
+cancellation
+shutdown
+```
+
+### Exercise 10 — Principal architecture
+
+Design a production streaming pipeline with:
+
+```text
+10,000 messages/sec
+consumer 2,000 messages/sec
+```
+
+Choose:
+
+- buffer size;
+- backpressure;
+- scaling strategy;
+- batching;
+- concurrency;
+- retry;
+- checkpoint;
+- cancellation;
+- shutdown;
+- observability.
+
+Defend every number and policy.
+
+---
+
+## 27. Key Takeaways
+
+1. Async iteration provides a protocol for consuming sequences of future values.
+2. `Symbol.asyncIterator` identifies an async iterable.
+3. Async iterators expose asynchronous `next()` behavior.
+4. `for await...of` provides structured asynchronous iteration.
+5. Async generators provide a convenient programmable async iterator implementation.
+6. Async generator execution is suspended/resumed rather than continuously running.
+7. Async iteration naturally expresses pull-oriented consumption.
+8. Pull-oriented consumption can help coordinate demand, but it does not automatically guarantee backpressure.
+9. Push sources adapted to async iteration require buffering and flow-control policy.
+10. Backpressure prevents producers from overwhelming consumers.
+11. Unbounded buffers are a major memory and availability risk.
+12. `return()` and iterator closing are important for cleanup on early termination.
+13. Consumer failures and cancellation must be part of lifecycle design.
+14. Completion (`done: true`) is different from cancellation.
+15. Async iteration can consume synchronous iterables through async-from-sync adaptation.
+16. Async iteration is not identical to Web Streams or Node streams.
+17. Streams add richer concerns such as buffering, backpressure, readers/writers, piping, and cancellation.
+18. Async iterators are powerful adapters between push and pull abstractions.
+19. Stream processing can improve time-to-first-result and reduce peak memory.
+20. Sequential async iteration is naturally bounded but can reduce throughput.
+21. Concurrent stream processing increases throughput but requires explicit ordering, buffering, and concurrency policy.
+22. Infinite streams require explicit cancellation/shutdown.
+23. Partial results can already have side effects before a later stream error.
+24. Exactly-once processing is not provided by the language iterator protocol.
+25. The central principle is:
+
+> Async iteration defines how a consumer obtains the next future value; production-grade streaming additionally requires explicit backpressure, buffering, cancellation, ownership, error handling, and shutdown semantics.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 25 — Iterables / Iterators
+- Chapter 26 — Generators / Async Generators
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+
+### Builds Toward
+
+- Chapter 39 — Concurrency / Parallelism
+- Chapter 40 — Observables / Reactive
+- Chapter 45 — Memory / GC
+- Chapter 49 — DOM Architecture
+- Chapter 51 — Browser APIs
+- Chapter 52 — Web Workers / Concurrency
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 58 — Node Architecture
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 78 — Production JS Architecture
+- Chapter 82 — API Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 104 — Production HTTP Client
+- Chapter 106 — Real-time WebSocket
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- Async iterator
+- Async iterable
+- `Symbol.asyncIterator`
+- Async generator
+- `for await...of`
+- Iterator closing
+- Backpressure
+- Buffering
+- Queueing
+- Streams
+- Web Streams
+- Node Streams
+- EventEmitter
+- Observable
+- Promise
+- Cancellation
+- Resource ownership
+- Batching
+- Windowing
+- Concurrency
+- Checkpointing
+- Retry
+- Graceful shutdown
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- iterators;
+- generators;
+- Promises;
+- async/await;
+- cancellation;
+- resource cleanup;
+- event loops;
+- errors;
+- concurrency;
+- memory.
+
+### Why This Chapter Matters Later
+
+Most real production data does not arrive as one giant value.
+
+It arrives as:
+
+```text
+rows
+chunks
+messages
+events
+pages
+records
+logs
+frames
+```
+
+Async iteration gives the language a clean way to express:
+
+```text
+consume the next available piece
+```
+
+But production streaming is much larger than the iterator protocol.
+
+The architecture must answer:
+
+```text
+How fast can data arrive?
+How fast can it be processed?
+How much can be buffered?
+What happens when the consumer is slow?
+How is cancellation propagated?
+What happens after partial failure?
+How is progress checkpointed?
+Who owns the underlying resource?
+How does shutdown work?
+```
+
+The central principle is:
+
+> A stream is not merely a sequence of values; it is a lifecycle and flow-control system.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 38 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Define async iterable.
+- [ ] Define async iterator.
+- [ ] Explain `Symbol.asyncIterator`.
+- [ ] Explain `next()` result semantics.
+- [ ] Explain `for await...of`.
+- [ ] Explain async generators.
+- [ ] Explain iterator closing.
+- [ ] Explain async-from-sync iteration.
+- [ ] Explain backpressure.
+- [ ] Explain buffering.
+- [ ] Explain cancellation vs completion.
+- [ ] Explain async iterator vs stream.
+
+### Predictive Mastery
+
+- [ ] Predict async generator execution.
+- [ ] Predict `for await...of` flow.
+- [ ] Predict cleanup on `break`.
+- [ ] Predict consumer failure.
+- [ ] Predict producer failure.
+- [ ] Predict end-of-stream.
+- [ ] Predict buffering growth.
+- [ ] Predict cancellation behavior.
+- [ ] Predict ordered vs unordered processing.
+
+### Implementation
+
+- [ ] Implement an async iterator.
+- [ ] Implement an async generator pipeline.
+- [ ] Implement event-to-iterator adapter.
+- [ ] Implement bounded async queue.
+- [ ] Implement backpressure.
+- [ ] Implement concurrent transforms.
+- [ ] Implement cancellation.
+- [ ] Implement cleanup.
+- [ ] Implement checkpoint/resume behavior.
+
+### Debugging
+
+- [ ] Diagnose unbounded buffering.
+- [ ] Diagnose slow-consumer memory growth.
+- [ ] Diagnose missing iterator cleanup.
+- [ ] Diagnose cancellation leaks.
+- [ ] Diagnose concurrent ordering bugs.
+- [ ] Diagnose producer/consumer mismatch.
+- [ ] Diagnose resource lifetime errors.
+- [ ] Diagnose partial-result failures.
+- [ ] Diagnose stalled streams.
+
+### Production Engineering
+
+- [ ] Design a streaming pipeline.
+- [ ] Define buffer bounds.
+- [ ] Define backpressure policy.
+- [ ] Define concurrency.
+- [ ] Define ordering.
+- [ ] Define cancellation.
+- [ ] Define retry.
+- [ ] Define checkpointing.
+- [ ] Define shutdown.
+- [ ] Define observability.
+- [ ] Define resource ownership.
+
+### Interview Readiness
+
+- [ ] Explain async iterator protocol.
+- [ ] Explain `for await...of`.
+- [ ] Explain async generator cleanup.
+- [ ] Explain backpressure.
+- [ ] Explain push-to-pull adapters.
+- [ ] Compare async iterators and streams.
+- [ ] Design bounded streaming.
+- [ ] Design cancellation.
+- [ ] Defend reliability semantics.
+
+### Track A — Core Theory
+
+- [ ] Understand async iteration protocol.
+- [ ] Understand async generators.
+- [ ] Understand iterator closing.
+- [ ] Understand pull vs push.
+- [ ] Understand backpressure.
+- [ ] Understand stream lifecycle.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production-oriented pipeline reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed stream debugging.
+- [ ] Completed code review.
+- [ ] Completed backpressure design.
+- [ ] Completed cancellation design.
+- [ ] Completed principal streaming architecture.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 38 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What is an async iterable?
+2. What is an async iterator?
+3. What is `Symbol.asyncIterator`?
+4. Why does async `next()` return a Promise-like result?
+5. What does `for await...of` do?
+6. What is an async generator?
+7. What happens on `break` from `for await...of`?
+8. What is iterator closing?
+9. What is async-from-sync iteration?
+10. What is backpressure?
+11. Why doesn't async iteration automatically guarantee bounded buffering?
+12. How do you adapt an EventEmitter into an async iterator?
+13. How can an async iterator own a resource?
+14. Why is cancellation different from `done: true`?
+15. How should cancellation affect an infinite stream?
+16. What happens when the consumer throws?
+17. What happens when the producer throws?
+18. How would you implement bounded buffering?
+19. How would you implement concurrent processing?
+20. How would you preserve output ordering?
+21. How would you checkpoint stream progress?
+22. When is an async iterator better than an Observable?
+23. When is a Web/Node Stream better than an async iterator?
+24. How would you diagnose memory growth in a streaming pipeline?
+25. How would you design graceful shutdown for an async stream?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit async iterator protocol
+- [ ] Revisit for-await-of
+- [ ] Revisit async generator cleanup
+- [ ] Revisit iterator closing
+- [ ] Revisit backpressure
+- [ ] Revisit bounded buffering
+- [ ] Revisit cancellation
+- [ ] Revisit concurrency/order
+- [ ] Revisit checkpointing
+- [ ] Revisit stream ownership
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 38 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. ECMAScript specification — async iteration protocols, `Symbol.asyncIterator`, `for await...of`, async generators, async-from-sync iteration, and iterator closing.
+2. WHATWG Streams Standard — ReadableStream, queuing strategies, backpressure, cancellation, piping, readers/writers, and byte streams.
+3. WHATWG Fetch Standard — streaming response bodies and cancellation integration.
+4. Node.js official documentation — async iteration over Node streams, stream backpressure, pipeline APIs, and Node-specific lifecycle behavior.
+5. MDN / browser documentation — developer-facing async iteration, async generators, `for await...of`, Web Streams, and browser compatibility.
+6. Application architecture documentation — queue semantics, buffering, retry, checkpointing, ordering, ownership, concurrency, and shutdown.
+
+Always distinguish:
+
+```text
+ECMAScript async-iteration semantics
+vs
+Web Streams semantics
+vs
+Node Streams semantics
+vs
+network/storage behavior
+vs
+application streaming policy
+```
+
+Do not claim that the language iterator protocol itself defines:
+
+```text
+highWaterMark
+backpressure
+exactly-once delivery
+durability
+retry
+checkpointing
+```
+
+Those are properties of the surrounding stream or application architecture.
+
+Do not assume that consuming a stream with `for await...of` automatically cancels or closes every underlying host resource; verify the specific stream/iterator contract.
+
+---
+
+# Chapter 38 — Completion Snapshot
+
+```text
+Chapter: 38
+Title: Async Iteration and Streaming
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 39 — Concurrency and Parallelism
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Define concurrency precisely.
+- Define parallelism precisely.
+- Explain why concurrency does not require multiple CPU cores.
+- Explain why parallelism requires multiple independent execution resources.
+- Distinguish concurrency from asynchronous programming.
+- Distinguish concurrency from multitasking, interleaving, and scheduling.
+- Explain cooperative concurrency in JavaScript.
+- Explain how multiple asynchronous operations can overlap while JavaScript execution on one agent remains serialized.
+- Understand concurrency limits as an application-level resource policy.
+- Explain why `Promise.all()` can create concurrency but is not itself a general concurrency scheduler.
+- Explain sequential, fully concurrent, and bounded-concurrent execution.
+- Explain the throughput/latency/resource-utilization trade-off of concurrency.
+- Explain why more concurrency can initially improve throughput and eventually reduce it.
+- Understand queueing, contention, saturation, and the “knee” of a throughput/latency curve.
+- Explain Little's Law at a practical level and use it to reason about concurrency, throughput, and latency.
+- Distinguish CPU-bound, I/O-bound, memory-bound, lock-bound, and dependency-bound workloads.
+- Choose between event-loop concurrency, bounded asynchronous concurrency, worker threads, child processes, and external job queues.
+- Explain structured concurrency as a design principle involving ownership, lifetime, failure propagation, and cancellation.
+- Understand work queues, semaphores, pools, task groups, and executors.
+- Implement bounded concurrency.
+- Implement a semaphore and async task pool.
+- Implement a worker queue with backpressure.
+- Implement cancellation-aware concurrency control.
+- Understand fairness and starvation.
+- Understand head-of-line blocking.
+- Understand work stealing at a conceptual level.
+- Understand admission control and overload protection.
+- Explain why unbounded concurrency can create memory leaks, rate-limit failures, database saturation, socket exhaustion, and cascading failure.
+- Explain how concurrency interacts with retries, timeouts, cancellation, backpressure, and resource ownership.
+- Explain how parallelism can improve CPU throughput while introducing synchronization and data-transfer costs.
+- Understand worker-thread and process isolation trade-offs.
+- Diagnose concurrency bugs including races, lost updates, duplicate work, starvation, deadlocks, live locks, queue growth, and oversubscription.
+- Measure concurrency using active work, queue depth, throughput, latency, utilization, and saturation signals.
+- Design production concurrency budgets for APIs, batch processing, streams, databases, and background jobs.
+- Evaluate concurrency decisions through correctness, performance, memory, security, reliability, observability, maintainability, and operational complexity.
+- Defend concurrency architecture at senior/principal level.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+## 2. Prerequisites
+
+The learner should understand:
+
+- Functions and control flow.
+- Execution contexts.
+- Promises.
+- Async/await.
+- ECMAScript Jobs and Promise Reaction Jobs.
+- Browser event loop.
+- Node event loop and libuv.
+- Cancellation.
+- Async iteration and streaming.
+- Resource management and cleanup.
+- Basic performance measurement.
+
+Primary dependencies:
+
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+
+Related background:
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 45 — Memory / GC
+
+Later chapters build directly on this chapter:
+
+- Chapter 40 — Observables / Reactive
+- Chapter 52 — Web Workers / Concurrency
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 78 — Production JS Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+---
+
+## 3. What Is It?
+
+**Concurrency** is the capability to have multiple units of work in progress during the same overall period, even if the actual execution of their instructions is interleaved rather than simultaneous.
+
+**Parallelism** means multiple units of computation are executing at the same time on independent execution resources.
+
+A single JavaScript execution agent can therefore support concurrency:
+
+```text
+Task A starts
+Task A waits
+
+Task B starts
+Task B waits
+
+Task C starts
+Task C waits
+
+A completes
+B completes
+C completes
+```
+
+The work overlaps in time even though JavaScript code executes one segment at a time on that agent.
+
+Parallelism looks different:
+
+```text
+CPU core 1 → work A
+CPU core 2 → work B
+CPU core 3 → work C
+```
+
+The central distinction:
+
+```text
+Concurrency:
+  multiple activities are in progress
+
+Parallelism:
+  multiple activities execute simultaneously
+```
+
+JavaScript applications use concurrency constantly:
+
+```js
+const a = fetchA();
+const b = fetchB();
+
+await Promise.all([a, b]);
+```
+
+This can overlap I/O.
+
+For CPU-heavy work, parallelism may require:
+
+- Web Workers;
+- Node worker threads;
+- child processes;
+- native extensions;
+- WebAssembly;
+- external workers.
+
+The critical engineering question is:
+
+> How many units of work should be active at once, and on how many execution resources?
+
+---
+
+## 4. Why Does It Exist?
+
+Real systems contain independent work:
+
+```text
+request A
+request B
+request C
+database query
+network request
+file read
+background job
+CPU transformation
+```
+
+Serializing all work:
+
+```text
+A → B → C → D
+```
+
+can waste available resources.
+
+But unlimited concurrency:
+
+```text
+A B C D E F G H ... millions
+```
+
+can overload:
+
+- memory;
+- databases;
+- remote services;
+- sockets;
+- CPU;
+- thread pools;
+- queues.
+
+Therefore production systems need **controlled concurrency**.
+
+The goal is not:
+
+> Maximum possible concurrency.
+
+The goal is:
+
+> The highest useful concurrency that remains within correctness, capacity, latency, and resource constraints.
+
+Concurrency exists as an architectural tool for utilization.
+
+Concurrency control exists because resources are finite.
+
+---
+
+## 5. Mental Model
+
+Think in terms of:
+
+```text
+work
+  ↓
+admission
+  ↓
+queue
+  ↓
+active concurrency
+  ↓
+resource
+  ↓
+completion
+```
+
+Example:
+
+```text
+1000 tasks arrive
+       ↓
+admission control
+       ↓
+queue of waiting tasks
+       ↓
+10 active tasks
+       ↓
+results return
+       ↓
+next tasks admitted
+```
+
+The active concurrency is:
+
+```text
+10
+```
+
+The queue size is:
+
+```text
+990
+```
+
+This is often safer than launching 1000 operations simultaneously.
+
+A second model:
+
+```text
+                     workload
+                        │
+                        ▼
+                  concurrency
+                        │
+           ┌────────────┼────────────┐
+           ▼            ▼            ▼
+         CPU           I/O       dependency
+           │            │            │
+           ▼            ▼            ▼
+       cores/workers   sockets   remote capacity
+```
+
+Concurrency must match the bottleneck.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Concurrency is not parallelism
+
+Multiple operations can be in progress without simultaneously executing JavaScript instructions.
+
+### Rule 2 — Async is not the same as concurrency
+
+An async program can still be fully sequential:
+
+```js
+await A();
+await B();
+await C();
+```
+
+### Rule 3 — Parallelism is not free
+
+Parallel execution introduces:
+
+- synchronization;
+- data transfer;
+- scheduling;
+- memory overhead;
+- coordination complexity.
+
+### Rule 4 — `Promise.all()` is aggregation, not a full scheduler
+
+It waits on multiple Promises, but does not provide:
+
+- queueing;
+- bounded admission;
+- fairness;
+- backpressure;
+- cancellation;
+- priority.
+
+### Rule 5 — More concurrency can increase throughput only until a bottleneck saturates
+
+After saturation, additional concurrency can increase:
+
+```text
+queueing
+latency
+memory
+timeouts
+retries
+```
+
+without increasing useful throughput.
+
+### Rule 6 — Every resource has a concurrency capacity
+
+Examples:
+
+```text
+CPU cores
+database connections
+remote API rate limit
+file descriptors
+memory
+worker pool
+```
+
+### Rule 7 — Concurrency should usually be bounded
+
+The bound should be derived from measured capacity and workload characteristics.
+
+### Rule 8 — Queueing is part of concurrency control
+
+When active capacity is exhausted:
+
+```text
+new work → queue
+```
+
+or:
+
+```text
+reject / drop / defer
+```
+
+according to policy.
+
+### Rule 9 — Cancellation should remove unnecessary work from the system
+
+Queued work should ideally be cancellable before it consumes execution resources.
+
+### Rule 10 — Backpressure prevents producer overload
+
+If consumers cannot keep up:
+
+```text
+slow producer
+or
+bounded queue
+or
+drop/coalesce
+```
+
+must be considered.
+
+### Rule 11 — Work should have an owner
+
+Each active task needs:
+
+```text
+caller
+scope
+resource
+completion
+cancellation
+```
+
+### Rule 12 — Completion order is not start order
+
+Concurrent tasks may finish in any order.
+
+### Rule 13 — Result order and execution order are separate
+
+```js
+Promise.all([
+  slow(),
+  fast()
+]);
+```
+
+returns results in input order even if execution completes differently.
+
+### Rule 14 — Concurrency creates race opportunities
+
+Shared mutable state becomes more difficult to reason about when operations interleave.
+
+### Rule 15 — More workers can create oversubscription
+
+If the machine has limited CPU resources:
+
+```text
+too many active CPU workers
+→ context switching
+→ cache pressure
+→ lower throughput
+```
+
+### Rule 16 — CPU concurrency and I/O concurrency have different optimal values
+
+Do not use one universal limit for every workload.
+
+### Rule 17 — Fairness matters
+
+One tenant or queue should not necessarily monopolize all available capacity.
+
+### Rule 18 — Admission control is part of reliability
+
+Rejecting work early can be safer than accepting work that cannot finish within useful deadlines.
+
+### Rule 19 — Concurrency and retries multiply load
+
+If concurrency is 100 and each failed request retries three times, effective pressure can become far larger than expected.
+
+### Rule 20 — Observability is required to tune concurrency
+
+Measure before tuning.
+
+---
+
+## 7. Syntax
+
+### Sequential
+
+```js
+const a = await taskA();
+const b = await taskB();
+```
+
+### Concurrent initiation
+
+```js
+const aPromise = taskA();
+const bPromise = taskB();
+
+const [a, b] = await Promise.all([
+  aPromise,
+  bPromise
+]);
+```
+
+### Bounded concurrency pattern
+
+```js
+async function mapLimited(items, limit, worker) {
+  // concurrency controller
+}
+```
+
+### Semaphore-style API
+
+```js
+const semaphore = new Semaphore(10);
+
+const release = await semaphore.acquire();
+
+try {
+  await work();
+} finally {
+  release();
+}
+```
+
+### Queue
+
+```js
+const queue = new TaskQueue({
+  concurrency: 10
+});
+
+queue.add(() => work());
+```
+
+### Worker threads
+
+Node-style conceptual usage:
+
+```js
+new Worker("./worker.js");
+```
+
+### Browser worker
+
+```js
+const worker = new Worker("worker.js");
+```
+
+The worker provides a separate execution agent.
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Sequential
+
+```js
+console.time("sequential");
+
+await taskA();
+await taskB();
+await taskC();
+
+console.timeEnd("sequential");
+```
+
+### Example 2 — Concurrent
+
+```js
+console.time("concurrent");
+
+await Promise.all([
+  taskA(),
+  taskB(),
+  taskC()
+]);
+
+console.timeEnd("concurrent");
+```
+
+### Example 3 — Bounded
+
+```js
+const limit = 5;
+
+await mapLimited(items, limit, processItem);
+```
+
+Only five items are active at a time.
+
+### Example 4 — Semaphore
+
+```js
+const semaphore = new Semaphore(2);
+
+async function protectedOperation() {
+  const release = await semaphore.acquire();
+
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+```
+
+### Example 5 — CPU parallelism
+
+```text
+main thread
+   ↓
+worker A
+worker B
+worker C
+```
+
+Independent CPU-heavy work can execute on multiple worker execution resources.
+
+### Example 6 — Shared downstream limit
+
+```js
+const databaseSemaphore = new Semaphore(20);
+
+async function query(sql) {
+  const release = await databaseSemaphore.acquire();
+
+  try {
+    return await db.query(sql);
+  } finally {
+    release();
+  }
+}
+```
+
+This prevents the application from opening unlimited simultaneous database work.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```js
+const results = await Promise.all([
+  fetchA(),
+  fetchB(),
+  fetchC()
+]);
+```
+
+### Step 1
+
+The first call expression begins:
+
+```js
+fetchA()
+```
+
+### Step 2
+
+The second begins:
+
+```js
+fetchB()
+```
+
+### Step 3
+
+The third begins:
+
+```js
+fetchC()
+```
+
+The important point is that all three operations are initiated before the outer `await` waits for the aggregate.
+
+### Step 4
+
+Suppose completion occurs:
+
+```text
+B
+C
+A
+```
+
+### Step 5
+
+`Promise.all()` still produces:
+
+```text
+[A-result, B-result, C-result]
+```
+
+because result positions follow the input ordering.
+
+### Step 6
+
+The async function resumes when the aggregate Promise fulfills.
+
+Now consider bounded concurrency:
+
+```js
+await mapLimited(items, 2, process);
+```
+
+Suppose the items are:
+
+```text
+A B C D
+```
+
+The scheduler may produce:
+
+```text
+start A
+start B
+
+A finishes
+start C
+
+B finishes
+start D
+
+C finishes
+D finishes
+```
+
+At every point:
+
+```text
+active <= 2
+```
+
+This is the fundamental behavior of bounded concurrency.
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 Concurrency is a scheduling property
+
+A Promise does not itself decide:
+
+```text
+how many operations may exist simultaneously
+```
+
+The application or host determines that.
+
+### 10.2 Semaphore
+
+A semaphore maintains permits:
+
+```text
+capacity = N
+```
+
+Acquire:
+
+```text
+available permit?
+→ take one
+
+none?
+→ wait
+```
+
+Release:
+
+```text
+permit returned
+→ wake waiting task
+```
+
+### 10.3 Queue
+
+A bounded executor commonly contains:
+
+```text
+task queue
++
+active counter
++
+completion handlers
++
+cancellation
+```
+
+### 10.4 Pool
+
+A pool creates a fixed number of reusable execution/resource slots:
+
+```text
+worker 1
+worker 2
+worker 3
+worker 4
+```
+
+Tasks enter the queue and are assigned to available workers.
+
+### 10.5 Event-loop concurrency
+
+In browser/Node JavaScript:
+
+```text
+multiple I/O operations
+```
+
+can be in progress while:
+
+```text
+JavaScript callback execution
+```
+
+remains serialized on one agent.
+
+### 10.6 Worker parallelism
+
+A worker thread or Web Worker provides another execution agent.
+
+Now:
+
+```text
+worker A → CPU computation
+worker B → CPU computation
+```
+
+can execute simultaneously on separate underlying execution resources when the platform schedules them in parallel.
+
+### 10.7 Queueing
+
+Suppose:
+
+```text
+arrival rate = λ
+service rate = μ
+```
+
+If arrivals consistently exceed processing capacity:
+
+```text
+queue length → grows
+```
+
+No amount of Promise syntax fixes an overloaded system.
+
+### 10.8 Little's Law
+
+For a stable system:
+
+```text
+L = λW
+```
+
+where:
+
+```text
+L = average work/items in system
+λ = throughput
+W = average time in system
+```
+
+This helps reason about concurrency.
+
+Example:
+
+```text
+throughput = 100 requests/sec
+average latency = 0.2 sec
+```
+
+Then the average in-flight work is approximately:
+
+```text
+100 × 0.2 = 20
+```
+
+This does not automatically tell you the ideal concurrency limit, but it gives a powerful sanity check.
+
+### 10.9 Saturation
+
+A resource has a useful capacity.
+
+For example:
+
+```text
+database pool = 20
+```
+
+Launching:
+
+```text
+200 database operations
+```
+
+does not create 200 simultaneous database connections.
+
+It creates contention/queueing around the limited resource.
+
+### 10.10 Head-of-line blocking
+
+Suppose:
+
+```text
+worker 1 → slow task
+worker 2 → slow task
+worker 3 → slow task
+worker 4 → fast tasks
+```
+
+A queue design may cause fast work to wait behind slow work.
+
+### 10.11 Fair scheduling
+
+A production scheduler may need per-tenant or per-class limits:
+
+```text
+tenant A → 10
+tenant B → 10
+tenant C → 10
+```
+
+rather than one global pool consumed by whichever tasks arrive first.
+
+### 10.12 Priority
+
+Work can be:
+
+```text
+high priority
+normal
+background
+```
+
+But priority creates complexity:
+
+```text
+starvation
+priority inversion
+fairness
+```
+
+### 10.13 Work stealing
+
+Thread pools can distribute tasks dynamically when workers become available.
+
+The concept:
+
+```text
+idle worker
+→ take work from another worker's queue
+```
+
+This can improve utilization but requires synchronization and careful runtime design.
+
+### 10.14 Oversubscription
+
+Suppose:
+
+```text
+8 CPU cores
+64 CPU-heavy workers
+```
+
+The system may spend substantial time switching among work rather than computing.
+
+### 10.15 I/O concurrency
+
+I/O can tolerate higher concurrency than CPU work when:
+
+- the operation mostly waits;
+- downstream systems can handle it;
+- memory remains bounded.
+
+### 10.16 Memory-based concurrency
+
+Sometimes the true limit is memory:
+
+```text
+one task = 50 MB
+available budget = 500 MB
+```
+
+A concurrency limit much above 10 may be unsafe.
+
+### 10.17 External quota-based concurrency
+
+An API may allow:
+
+```text
+100 requests/sec
+```
+
+The concurrency limit should account for:
+
+```text
+request latency
+rate limit
+burst allowance
+retry behavior
+```
+
+### 10.18 Connection-pool concurrency
+
+A database may have:
+
+```text
+20 connections
+```
+
+The application should not pretend it can execute 1000 database transactions simultaneously without queueing.
+
+### 10.19 Structured concurrency
+
+A useful conceptual model:
+
+```text
+parent scope
+  ├── child A
+  ├── child B
+  └── child C
+
+parent owns:
+  lifetime
+  cancellation
+  failure policy
+```
+
+The parent waits for or explicitly supervises child work.
+
+### 10.20 Detached concurrency
+
+Detached work:
+
+```text
+parent starts task
+parent returns
+task continues
+```
+
+can be valid but needs a separate owner/supervisor.
+
+### 10.21 Failure propagation
+
+A task group must define:
+
+```text
+one child fails
+→ cancel siblings?
+→ continue siblings?
+→ fail parent?
+```
+
+There is no universal correct answer.
+
+### 10.22 Concurrency collapse
+
+Repeated failures can trigger retries:
+
+```text
+load high
+→ timeout
+→ retry
+→ load higher
+→ more timeouts
+```
+
+This creates a positive feedback loop.
+
+### 10.23 Bulkheads
+
+A bulkhead isolates capacity:
+
+```text
+critical requests → pool A
+background jobs   → pool B
+```
+
+One workload cannot consume all resources.
+
+### 10.24 Circuit breakers
+
+When a dependency is failing:
+
+```text
+stop sending work temporarily
+```
+
+This reduces load and protects the rest of the system.
+
+### 10.25 Admission control
+
+When capacity is exhausted:
+
+```text
+reject
+shed
+queue
+degrade
+```
+
+rather than accepting unlimited work.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+Concurrency is partly a language/runtime concern and partly an application architecture concern.
+
+### 11.1 ECMAScript
+
+ECMAScript provides:
+
+- Jobs;
+- Promises;
+- async functions;
+- async iterators;
+- shared-memory primitives such as `Atomics` in relevant environments.
+
+It does not define a universal:
+
+```text
+“maximum Promise concurrency”
+```
+
+mechanism.
+
+### 11.2 Promise combinators
+
+`Promise.all`, `race`, `any`, and `allSettled` define aggregate settlement semantics.
+
+They do not define resource-aware scheduling policy.
+
+### 11.3 Agents
+
+ECMAScript execution agents provide the basis for separate execution contexts.
+
+Multiple agents can support parallel execution in host environments.
+
+### 11.4 SharedArrayBuffer and Atomics
+
+Shared memory enables coordination among agents.
+
+This introduces true concurrency concerns:
+
+- races;
+- atomicity;
+- memory ordering;
+- deadlock;
+- livelock.
+
+Later engine/runtime chapters cover this more deeply.
+
+### 11.5 Host/runtime
+
+Browsers and Node provide:
+
+- workers;
+- worker threads;
+- processes;
+- I/O facilities;
+- queues;
+- thread pools.
+
+### 11.6 Application layer
+
+Applications define:
+
+- concurrency limits;
+- priorities;
+- fairness;
+- retries;
+- backpressure;
+- overload behavior;
+- ownership.
+
+The source discipline is:
+
+```text
+language semantics
+→ runtime mechanisms
+→ application policy
+```
+
+Do not present a production semaphore implementation as an ECMAScript language feature.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Sequential execution
+
+```js
+for (const item of items) {
+  await process(item);
+}
+```
+
+Concurrency:
+
+```text
+1
+```
+
+This can be desirable for:
+
+- ordering;
+- rate limits;
+- transactional workflows.
+
+### 12.2 Full fan-out
+
+```js
+await Promise.all(
+  items.map(process)
+);
+```
+
+Conceptually:
+
+```text
+concurrency ≈ number of items
+```
+
+This can be dangerous.
+
+### 12.3 Bounded concurrency
+
+```text
+N active
+rest queued
+```
+
+This is usually the right architecture for large batches.
+
+### 12.4 Sliding-window concurrency
+
+A scheduler can keep:
+
+```text
+N active operations
+```
+
+while continuously replacing completed tasks.
+
+### 12.5 Batch concurrency
+
+Process:
+
+```text
+batch 1
+→ wait
+→ batch 2
+```
+
+This is simpler but can leave capacity idle near batch boundaries.
+
+### 12.6 Dynamic concurrency
+
+A production scheduler may adapt based on:
+
+```text
+latency
+error rate
+CPU
+memory
+downstream saturation
+```
+
+For example:
+
+```text
+healthy dependency → increase concurrency
+timeouts increase  → decrease concurrency
+```
+
+This resembles adaptive load control.
+
+### 12.7 Fixed concurrency versus rate limiting
+
+Concurrency controls:
+
+```text
+how many are active
+```
+
+Rate limiting controls:
+
+```text
+how many start per unit time
+```
+
+They are not equivalent.
+
+### 12.8 Both concurrency and rate may be required
+
+Example:
+
+```text
+max active = 20
+max starts = 100/sec
+```
+
+### 12.9 Concurrency + timeout
+
+Without timeout:
+
+```text
+one stuck task
+→ occupies slot forever
+→ effective capacity falls
+```
+
+Timeout releases capacity when appropriate.
+
+### 12.10 Cancellation + queue
+
+A cancelled queued task should ideally be removed or marked inactive:
+
+```text
+queued
+  ↓ cancel
+cancelled
+```
+
+It should not consume an active slot.
+
+### 12.11 Concurrency + retry
+
+Retrying failed tasks consumes concurrency slots.
+
+Retry policies must be included in capacity calculations.
+
+### 12.12 Exponential backoff
+
+A common policy:
+
+```text
+delay = base × 2^attempt
+```
+
+plus jitter.
+
+Backoff reduces synchronized retry storms.
+
+### 12.13 Fan-out/fan-in
+
+Common architecture:
+
+```text
+one request
+   ↓
+fan out
+ ┌─┼─┐
+ A B C
+ └─┼─┘
+   ↓
+fan in
+```
+
+The fan-out must be bounded.
+
+### 12.14 Failure domains
+
+If:
+
+```text
+A fails
+```
+
+should B and C continue?
+
+Possible policies:
+
+```text
+fail-fast
+best-effort
+partial success
+cancel siblings
+```
+
+### 12.15 Partial results
+
+Streaming and batch systems may produce partial progress before failure.
+
+Concurrency design should define whether partial progress is committed.
+
+### 12.16 Idempotency
+
+Retries and concurrent duplication can produce:
+
+```text
+same operation twice
+```
+
+External side effects should be designed for idempotency where retries are possible.
+
+### 12.17 Duplicate work
+
+A concurrency bug can cause:
+
+```text
+same job
+→ worker A
+→ worker B
+```
+
+Deduplication may require:
+
+- idempotency keys;
+- locks;
+- leases;
+- unique constraints.
+
+### 12.18 Race conditions
+
+Example:
+
+```js
+let balance = 100;
+
+async function spend(amount) {
+  const current = await loadBalance();
+  await delay(10);
+  await saveBalance(current - amount);
+}
+```
+
+Two calls can read the same balance and overwrite one another.
+
+### 12.19 Lost update
+
+Concurrency at the application layer must respect transactional guarantees at the database layer.
+
+### 12.20 Lock contention
+
+Parallel work may compete for:
+
+- mutexes;
+- database locks;
+- file locks;
+- memory bandwidth.
+
+Higher concurrency can reduce useful throughput.
+
+### 12.21 Deadlock
+
+If two workers wait for resources in opposite order:
+
+```text
+A holds lock 1 → waits lock 2
+B holds lock 2 → waits lock 1
+```
+
+neither progresses.
+
+### 12.22 Livelock
+
+Tasks remain active and change state but make no useful progress.
+
+### 12.23 Starvation
+
+A task may wait indefinitely because other work continually receives resources first.
+
+### 12.24 Priority inversion
+
+A high-priority task can wait for a resource held by low-priority work while medium-priority tasks consume the CPU.
+
+### 12.25 Fairness
+
+Per-tenant quotas and weighted scheduling can prevent one workload from monopolizing resources.
+
+### 12.26 Work conservation
+
+A scheduler should avoid idle capacity when runnable work exists, unless deliberate reservation/fairness policies require it.
+
+### 12.27 Queue discipline
+
+Possible policies:
+
+```text
+FIFO
+LIFO
+priority
+deadline
+tenant-aware
+weighted fair
+```
+
+Each changes behavior.
+
+### 12.28 Deadline-aware concurrency
+
+A task with a near deadline may be prioritized over a long-running background task.
+
+### 12.29 Bulkheads
+
+Separate pools can protect critical workloads:
+
+```text
+customer API pool
+internal maintenance pool
+analytics pool
+```
+
+### 12.30 External job queues
+
+When work exceeds the lifetime/capacity of one process:
+
+```text
+API
+ ↓
+durable queue
+ ↓
+workers
+```
+
+This creates stronger lifecycle and scaling boundaries.
+
+### 12.31 Worker threads vs async I/O
+
+Use async I/O when the bottleneck is waiting.
+
+Use workers/processes when CPU work must execute in parallel or be isolated.
+
+### 12.32 Browser workers
+
+A browser worker can move CPU-heavy work away from the page's primary execution agent.
+
+But:
+
+```text
+communication
+data transfer
+serialization
+memory
+```
+
+still have costs.
+
+### 12.33 Node worker threads
+
+Worker threads provide separate JavaScript execution environments.
+
+Shared memory or message passing can coordinate them.
+
+### 12.34 Child processes
+
+Processes provide stronger isolation:
+
+```text
+separate memory
+separate failure domain
+separate runtime
+```
+
+but with greater communication overhead.
+
+### 12.35 External workers
+
+A distributed queue provides:
+
+```text
+durability
+horizontal scaling
+retries
+isolation
+```
+
+at the cost of operational complexity.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 Empty workload
+
+```js
+await Promise.all([]);
+```
+
+completes immediately according to Promise combinator semantics.
+
+### 13.2 Limit zero
+
+A bounded-concurrency scheduler with:
+
+```text
+limit = 0
+```
+
+must reject configuration or define a special paused state.
+
+Do not let it deadlock silently.
+
+### 13.3 Limit greater than workload
+
+If:
+
+```text
+limit = 100
+items = 5
+```
+
+only five tasks should run.
+
+### 13.4 Worker throws synchronously
+
+A scheduler must treat synchronous worker throws as failures.
+
+### 13.5 Worker rejects asynchronously
+
+A scheduler must release its slot after rejection.
+
+### 13.6 Forgotten release
+
+Semaphore misuse:
+
+```js
+const release = await semaphore.acquire();
+
+await work();
+
+// forgot release()
+```
+
+can permanently reduce capacity.
+
+### 13.7 Double release
+
+Releasing twice can corrupt the semaphore accounting.
+
+### 13.8 Cancellation while waiting for a permit
+
+A waiting task should stop waiting if its signal aborts.
+
+### 13.9 Cancellation after acquiring permit
+
+The active task must still release the permit.
+
+### 13.10 Task completes during cancellation
+
+Completion and cancellation can race.
+
+The scheduler needs a single final state.
+
+### 13.11 Retry creates more work
+
+A retry mechanism can accidentally exceed concurrency limits if retries are not counted against capacity.
+
+### 13.12 Queue growth
+
+A bounded active pool with an unbounded waiting queue can still exhaust memory.
+
+### 13.13 Large task payloads
+
+Each queued task may retain large objects.
+
+### 13.14 Slow task
+
+One slow task can hold a slot for a long time.
+
+### 13.15 Head-of-line blocking
+
+FIFO ordering can delay short tasks behind long ones.
+
+### 13.16 Starvation under priority
+
+High-priority work can starve background work forever.
+
+### 13.17 Rate/concurrency mismatch
+
+A workload can respect concurrency but still violate a remote rate limit.
+
+### 13.18 Retry storm
+
+Multiple clients timing out together may all retry simultaneously.
+
+### 13.19 Thundering herd
+
+A large group of workers may wake at once and hit one dependency.
+
+### 13.20 Worker startup cost
+
+Creating a new worker per task may be much more expensive than maintaining a pool.
+
+### 13.21 Oversubscription
+
+Creating:
+
+```text
+100 CPU workers
+```
+
+on a machine with:
+
+```text
+4 cores
+```
+
+may reduce performance.
+
+### 13.22 Shared memory race
+
+Shared mutable memory between agents requires atomics/synchronization.
+
+### 13.23 Data-transfer cost
+
+Sending huge objects to workers may erase the benefit of parallelism.
+
+### 13.24 Queue durability
+
+An in-memory queue disappears when the process crashes.
+
+### 13.25 Process restart duplication
+
+A job may be executed again after a crash.
+
+Exactly-once semantics require additional system design.
+
+### 13.26 Database bottleneck
+
+Increasing application concurrency cannot exceed the useful capacity of the database.
+
+### 13.27 Connection pool exhaustion
+
+Requests may wait on the pool even though the event loop is responsive.
+
+### 13.28 Memory bandwidth saturation
+
+CPU workers can compete for memory bandwidth before cores are fully saturated.
+
+### 13.29 Garbage-collection pressure
+
+High concurrent allocation rates can increase GC work.
+
+### 13.30 Cancellation of irreversible work
+
+A cancellation request cannot necessarily undo side effects already performed.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “Concurrency means multiple threads.”
+
+No.
+
+Concurrency can exist on one JavaScript execution agent.
+
+### Misconception 2 — “Parallelism means async.”
+
+No.
+
+Parallel work can be synchronous within separate execution resources.
+
+### Misconception 3 — “`Promise.all` controls concurrency.”
+
+No.
+
+It aggregates Promise outcomes.
+
+### Misconception 4 — “More concurrency always means more throughput.”
+
+No.
+
+After saturation, throughput may flatten or fall.
+
+### Misconception 5 — “A Promise represents a worker.”
+
+No.
+
+### Misconception 6 — “If the event loop is responsive, the system is not overloaded.”
+
+Worker pools, databases, remote services, memory, and queues can be saturated independently.
+
+### Misconception 7 — “Concurrency limit equals rate limit.”
+
+No.
+
+### Misconception 8 — “A concurrency limit of 100 is universally good.”
+
+No.
+
+It depends on:
+
+```text
+CPU
+memory
+latency
+downstream capacity
+work size
+```
+
+### Misconception 9 — “Parallel CPU work is always faster.”
+
+Synchronization and transfer overhead can dominate.
+
+### Misconception 10 — “Workers share all state automatically.”
+
+No.
+
+Workers have separate execution environments; sharing requires defined mechanisms.
+
+### Misconception 11 — “Retries are independent from concurrency.”
+
+No.
+
+Retries consume capacity.
+
+### Misconception 12 — “Cancellation automatically removes queued work.”
+
+Only if the scheduler supports it.
+
+### Misconception 13 — “Queueing is free.”
+
+Queued work consumes memory and increases latency.
+
+### Misconception 14 — “FIFO is always fair.”
+
+FIFO can still disadvantage workloads with different task lengths or priorities.
+
+### Misconception 15 — “If a database supports many connections, use as many as possible.”
+
+More connections can increase contention and reduce useful throughput.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Unbounded `Promise.all`
+
+### Mistake 2 — One global concurrency limit for unrelated resources
+
+### Mistake 3 — Missing semaphore release
+
+### Mistake 4 — Double semaphore release
+
+### Mistake 5 — No cancellation while queued
+
+### Mistake 6 — Retrying without counting retries against capacity
+
+### Mistake 7 — Ignoring downstream rate limits
+
+### Mistake 8 — Ignoring queue memory
+
+### Mistake 9 — Creating one worker per task
+
+### Mistake 10 — Oversubscribing CPU workers
+
+### Mistake 11 — Ignoring data-transfer costs to workers
+
+### Mistake 12 — Using parallelism for tightly coupled sequential logic
+
+### Mistake 13 — Sharing mutable state without synchronization
+
+### Mistake 14 — No fairness across tenants
+
+### Mistake 15 — No timeout on tasks
+
+### Mistake 16 — No overload policy
+
+### Mistake 17 — Assuming cancellation undoes side effects
+
+### Mistake 18 — Measuring only throughput
+
+### Mistake 19 — Tuning concurrency without measuring downstream saturation
+
+### Mistake 20 — Detached child tasks with no supervisor
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Concept | What it controls | Typical use |
+|---|---|---|
+| Concurrency | Number of active/in-progress tasks | I/O fan-out, job processing |
+| Parallelism | Simultaneous execution | CPU-heavy work |
+| Async | Future completion coordination | Network, timers, I/O |
+| Semaphore | Concurrent capacity | Protect finite resource |
+| Queue | Waiting work | Admission and buffering |
+| Pool | Reusable finite workers/resources | DB connections, workers |
+| Rate limiter | Starts per time unit | API quotas |
+| Backpressure | Producer rate relative to consumer | Streams |
+| Retry | Re-execution after failure | Transient failures |
+| Circuit breaker | Dependency admission | Protect failing dependency |
+| Bulkhead | Capacity isolation | Separate workloads |
+| Worker | Separate execution agent | CPU isolation |
+| Child process | Separate process | Strong isolation |
+| Job queue | Durable/distributed work | Long-running background work |
+| Structured concurrency | Parent-owned child lifetime | Task groups |
+| EventEmitter | Push notifications | Events |
+| Observable | Multi-value reactive flow | Reactive systems |
+
+### Concurrency vs parallelism
+
+```text
+concurrency:
+A and B are both in progress
+
+parallelism:
+A and B are executing at the same time
+```
+
+### Concurrency vs rate limiting
+
+```text
+concurrency:
+how many active
+
+rate:
+how many starts per time
+```
+
+### Concurrency vs backpressure
+
+```text
+concurrency:
+capacity of active work
+
+backpressure:
+how production responds when consumption cannot keep up
+```
+
+### Semaphore vs queue
+
+Semaphore:
+
+```text
+how many may run
+```
+
+Queue:
+
+```text
+what waits
+```
+
+Production schedulers often need both.
+
+### Worker pool vs external queue
+
+Worker pool:
+
+```text
+same process/runtime
+```
+
+External queue:
+
+```text
+durable/distributed boundary
+```
+
+### Structured concurrency vs detached work
+
+Structured:
+
+```text
+parent owns child
+```
+
+Detached:
+
+```text
+child has another owner
+```
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 Throughput curve
+
+A typical system can behave like:
+
+```text
+concurrency
+    ↑
+throughput
+    ┌────────────
+   /
+  /
+ /
+```
+
+At some point:
+
+```text
+resource saturates
+```
+
+and additional concurrency adds little useful throughput.
+
+### 17.2 Latency curve
+
+As saturation increases:
+
+```text
+queueing ↑
+latency ↑
+```
+
+This is why a system can have:
+
+```text
+same throughput
++
+much worse latency
+```
+
+after increasing concurrency.
+
+### 17.3 Little's Law
+
+Use:
+
+```text
+L = λW
+```
+
+as a sanity check.
+
+Example:
+
+```text
+100 ops/sec
+250ms average latency
+
+L ≈ 25 in-flight
+```
+
+If instrumentation reports:
+
+```text
+1000 active
+```
+
+there may be substantial queueing or long-lived work.
+
+### 17.4 Optimal CPU parallelism
+
+CPU-bound work often benefits from parallelism near the available execution capacity, but the optimum depends on:
+
+- CPU architecture;
+- memory bandwidth;
+- task granularity;
+- synchronization;
+- runtime overhead.
+
+### 17.5 I/O concurrency
+
+I/O workloads may tolerate higher concurrency because much of the wall-clock time is waiting.
+
+But downstream quotas can still be the limiting factor.
+
+### 17.6 Context switching
+
+Too many runnable workers can reduce CPU efficiency.
+
+### 17.7 Cache locality
+
+Parallel workers can compete for cache and memory bandwidth.
+
+### 17.8 Serialization cost
+
+Worker messaging and structured cloning can dominate small tasks.
+
+### 17.9 Batching
+
+Batching can reduce scheduling overhead:
+
+```text
+100 tiny tasks
+→ 10 batches
+```
+
+### 17.10 Queue memory
+
+At:
+
+```text
+1,000,000 queued tasks
+```
+
+even tiny metadata can consume significant memory.
+
+### 17.11 Retry amplification
+
+If failure probability increases with load:
+
+```text
+more concurrency
+→ more timeouts
+→ more retries
+→ even more load
+```
+
+This can destabilize the system.
+
+### 17.12 Tail latency
+
+Average latency may look fine while P95/P99 grows dramatically.
+
+Concurrency tuning should consider tail latency.
+
+### 17.13 Fairness overhead
+
+Tenant-aware scheduling is more complex but can protect critical workloads.
+
+### 17.14 Adaptive limits
+
+Adaptive concurrency can improve utilization if feedback signals are reliable.
+
+But unstable control loops can oscillate:
+
+```text
+increase
+→ overload
+→ decrease
+→ underutilize
+→ increase
+→ ...
+```
+
+### 17.15 Measurement
+
+Monitor:
+
+```text
+active concurrency
+queue depth
+queue delay
+throughput
+P50/P95/P99 latency
+error rate
+timeouts
+CPU
+memory
+downstream saturation
+retry rate
+```
+
+---
+
+## 18. Memory Considerations
+
+### 18.1 Concurrency increases live state
+
+More active tasks generally means more:
+
+- Promises;
+- closures;
+- buffers;
+- request objects;
+- database results.
+
+### 18.2 Queue memory
+
+A queue of pending work can become the largest memory consumer.
+
+### 18.3 Large task payloads
+
+Avoid storing unnecessary full request bodies in queued tasks.
+
+### 18.4 Worker memory
+
+Each worker can have its own runtime/object memory.
+
+### 18.5 Process memory
+
+Child processes have separate memory footprints.
+
+### 18.6 Shared memory
+
+Shared buffers reduce copying in some architectures but introduce synchronization complexity.
+
+### 18.7 GC pressure
+
+More active allocations can increase garbage-collection frequency and pause/CPU costs.
+
+### 18.8 Backpressure
+
+Bounded buffering limits memory growth.
+
+### 18.9 Resource retention
+
+A queued closure can retain:
+
+```text
+request
+credentials
+database objects
+buffers
+```
+
+for longer than expected.
+
+### 18.10 Concurrency as a memory budget
+
+A useful mental model:
+
+```text
+memory per task × active tasks
++
+queued task memory
++
+runtime overhead
+≤ safe budget
+```
+
+---
+
+## 19. Security Considerations
+
+### 19.1 Resource-exhaustion attacks
+
+Attackers can exploit unbounded concurrency to exhaust:
+
+- CPU;
+- memory;
+- sockets;
+- database connections;
+- remote API quotas.
+
+### 19.2 Tenant isolation
+
+One tenant should not necessarily consume the whole concurrency budget.
+
+### 19.3 Retry storms
+
+Retries can amplify an attack or outage.
+
+### 19.4 Queue poisoning
+
+A malicious workload can fill queues with expensive tasks.
+
+### 19.5 Priority abuse
+
+If clients can influence priority, they may starve other traffic.
+
+### 19.6 Worker isolation
+
+Sensitive or untrusted CPU work may benefit from process isolation rather than sharing one runtime.
+
+### 19.7 Shared memory races
+
+Shared memory can create correctness/security vulnerabilities if synchronization is incorrect.
+
+### 19.8 Deadlocks
+
+Locks can create availability failures.
+
+### 19.9 Stale authorization
+
+Concurrent tasks may continue using permissions after authorization state changes.
+
+### 19.10 Cancellation abuse
+
+Attackers may repeatedly start and cancel expensive work, making setup/cleanup itself costly.
+
+### 19.11 Amplification through fan-out
+
+One external request can trigger:
+
+```text
+100 downstream requests
+```
+
+creating an amplification factor.
+
+Bound fan-out.
+
+---
+
+## 20. Production Usage
+
+### 20.1 HTTP API fan-out
+
+Suppose one request needs:
+
+```text
+profile
+permissions
+recommendations
+inventory
+```
+
+Use concurrency when dependencies are independent, but set a budget:
+
+```text
+max downstream fan-out = N
+```
+
+### 20.2 Database access
+
+A database connection pool defines a physical resource boundary.
+
+Application concurrency should account for:
+
+```text
+pool size
+query latency
+transaction duration
+database CPU
+lock contention
+```
+
+### 20.3 Batch processing
+
+For:
+
+```text
+1 million records
+```
+
+use:
+
+```text
+bounded queue
++
+bounded workers
++
+checkpointing
+```
+
+instead of:
+
+```js
+Promise.all(allMillion)
+```
+
+### 20.4 API rate-limited integration
+
+Combine:
+
+```text
+concurrency limit
++
+rate limit
++
+timeout
++
+retry/backoff
++
+circuit breaker
+```
+
+### 20.5 Worker-thread CPU pool
+
+For expensive CPU tasks:
+
+```text
+main process
+→ worker pool
+→ results
+```
+
+Choose pool size based on measured CPU utilization and task behavior.
+
+### 20.6 Browser application
+
+For large client-side computations:
+
+```text
+UI agent
+→ worker pool
+```
+
+Keep UI execution responsive.
+
+### 20.7 Queue consumer
+
+A production consumer often needs:
+
+```text
+max active jobs
+max queue wait
+visibility timeout
+retry count
+dead-letter policy
+cancellation
+shutdown
+```
+
+### 20.8 Stream processing
+
+Combine:
+
+```text
+async iterator
++
+bounded buffering
++
+concurrency limit
++
+backpressure
++
+cancellation
+```
+
+### 20.9 Tenant-aware concurrency
+
+Example:
+
+```text
+global = 100
+tenant A = 20
+tenant B = 20
+tenant C = 20
+```
+
+This prevents one tenant from monopolizing global capacity.
+
+### 20.10 Graceful shutdown
+
+On shutdown:
+
+```text
+stop admission
+→ stop producers
+→ stop queue growth
+→ drain or cancel active work
+→ release resources
+→ terminate workers
+```
+
+### 20.11 Adaptive concurrency
+
+A mature system may dynamically change limits using:
+
+```text
+latency
+error rate
+resource saturation
+```
+
+This should be introduced only when fixed limits are demonstrably insufficient.
+
+### 20.12 Bulkheads
+
+Separate:
+
+```text
+interactive traffic
+background traffic
+maintenance traffic
+```
+
+so background work cannot consume all capacity.
+
+### 20.13 Observability
+
+Expose:
+
+```text
+active
+queued
+completed
+failed
+cancelled
+timed out
+retried
+```
+
+and:
+
+```text
+queue age
+P95/P99 latency
+resource saturation
+```
+
+### 20.14 SLO-aware concurrency
+
+Concurrency should preserve:
+
+```text
+availability
+latency SLO
+error budget
+```
+
+rather than optimize throughput alone.
+
+---
+
+## 21. Implementation From Scratch
+
+### Stage 1 — Guided semaphore
+
+Implement:
+
+```js
+class Semaphore {
+  constructor(limit) {
+    this.limit = limit;
+    this.active = 0;
+    this.waiters = [];
+  }
+
+  async acquire() {
+    // return release function
+  }
+}
+```
+
+Requirements:
+
+- maximum active count;
+- queue waiters;
+- release capacity;
+- reject invalid limits.
+
+### Stage 2 — Partially Guided
+
+Implement:
+
+```js
+async function mapLimited(items, limit, worker) {}
+```
+
+Requirements:
+
+- preserve result ordering;
+- bound active work;
+- support synchronous worker throws;
+- support rejected worker Promises.
+
+### Stage 3 — No Reference
+
+Build:
+
+```js
+class TaskPool {
+  constructor({
+    concurrency,
+    signal
+  }) {}
+
+  submit(task) {}
+
+  async close() {}
+
+  stats() {}
+}
+```
+
+Track:
+
+```text
+queued
+active
+completed
+failed
+cancelled
+```
+
+### Stage 4 — Edge-Case Hardened
+
+Add:
+
+- cancellation while queued;
+- cancellation while running;
+- timeout;
+- retries;
+- backoff;
+- fairness;
+- priority;
+- queue limit;
+- shutdown;
+- task ownership.
+
+### Stage 5 — Production Grade
+
+Build:
+
+```js
+class AdaptiveConcurrencyController {
+  constructor({
+    min,
+    max,
+    initial,
+    targetLatency,
+    signal
+  }) {}
+
+  async run(task) {}
+
+  recordSuccess(metrics) {}
+
+  recordFailure(metrics) {}
+
+  metrics() {}
+
+  async shutdown() {}
+}
+```
+
+Design an explicit control loop.
+
+Do not let adaptation oscillate uncontrollably.
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Unbounded fan-out
+
+```js
+await Promise.all(
+  millionItems.map(processItem)
+);
+```
+
+Find:
+
+- memory risk;
+- downstream overload;
+- error aggregation issues;
+- cancellation problems.
+
+### Exercise 2 — Semaphore leak
+
+```js
+const release = await semaphore.acquire();
+
+try {
+  await work();
+} catch (error) {
+  throw error;
+}
+// release forgotten
+```
+
+What happens to future tasks?
+
+### Exercise 3 — Double release
+
+Call:
+
+```js
+release();
+release();
+```
+
+What invariant does this violate?
+
+### Exercise 4 — Queue growth
+
+Create:
+
+```text
+producer = 10,000/sec
+consumer = 2,000/sec
+```
+
+Measure memory growth.
+
+### Exercise 5 — Retry amplification
+
+Simulate:
+
+```text
+100 active
+20% timeout
+3 retries
+```
+
+Estimate how retry volume changes load.
+
+### Exercise 6 — Head-of-line blocking
+
+Create:
+
+```text
+one 10-second task
++
+100 10-millisecond tasks
+```
+
+Compare FIFO and shortest-first/priority-style scheduling.
+
+### Exercise 7 — Oversubscription
+
+Compare CPU performance for:
+
+```text
+2 workers
+4 workers
+8 workers
+16 workers
+32 workers
+```
+
+on a controlled workload.
+
+### Exercise 8 — Worker transfer cost
+
+Measure:
+
+```text
+small payload
+large payload
+transferable payload
+```
+
+across worker boundaries.
+
+### Exercise 9 — Race condition
+
+Create a lost-update bug using two concurrent balance modifications.
+
+Fix it using a proper transactional/locking strategy.
+
+### Exercise 10 — Shutdown
+
+Start 100 tasks, then cancel/shutdown.
+
+Verify:
+
+```text
+queued tasks stop
+active tasks clean up
+resources release
+final metrics accurate
+```
+
+---
+
+## 23. Code Review Exercise
+
+Review:
+
+```js
+async function processBatch(items) {
+  return Promise.all(
+    items.map(async item => {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          return await callRemoteService(item);
+        } catch (error) {
+          await delay(100 * 2 ** attempt);
+        }
+      }
+
+      throw new Error("failed");
+    })
+  );
+}
+```
+
+Identify issues involving:
+
+- unbounded concurrency;
+- retry amplification;
+- backoff synchronization;
+- cancellation;
+- timeout;
+- queueing;
+- rate limits;
+- failure classification;
+- error causes;
+- observability;
+- shutdown;
+- partial progress.
+
+Redesign it using:
+
+```text
+bounded concurrency
++
+retry policy
++
+jitter
++
+timeout
++
+cancellation
++
+metrics
+```
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is concurrency?
+2. What is parallelism?
+3. Can concurrency exist on one JavaScript thread?
+4. Is async the same as concurrency?
+5. Is Promise.all a concurrency scheduler?
+6. What is a semaphore?
+7. What is a worker pool?
+8. What is backpressure?
+9. What is a queue?
+10. Why should concurrency usually be bounded?
+
+### Intermediate
+
+11. Why can more concurrency reduce performance?
+12. What is saturation?
+13. What is queueing?
+14. What is Little's Law?
+15. How do you choose a concurrency limit?
+16. What is the difference between rate limiting and concurrency limiting?
+17. Why do retries affect concurrency?
+18. What is head-of-line blocking?
+19. What is fairness?
+20. What is a bulkhead?
+
+### Advanced
+
+21. Compare event-loop concurrency and worker parallelism.
+22. Explain structured concurrency.
+23. Explain detached work.
+24. Explain cancellation in a task pool.
+25. Explain worker transfer costs.
+26. Explain CPU oversubscription.
+27. Explain shared-memory races.
+28. Explain deadlock, livelock, and starvation.
+29. Explain retry storms.
+30. Explain adaptive concurrency.
+
+### Principal-Level
+
+31. Design a concurrency model for a high-throughput API.
+32. Design per-tenant concurrency isolation.
+33. Design an adaptive concurrency controller.
+34. Design overload protection for a downstream dependency.
+35. Design a retry policy that does not amplify outages.
+36. Design a graceful shutdown for a large worker pool.
+37. Decide between async I/O, worker threads, processes, and external queues.
+38. Diagnose a service whose throughput stayed flat while concurrency doubled and P99 latency tripled.
+39. Design fair scheduling across workloads with different task sizes.
+40. Define the concurrency budget for a production service and defend every constraint.
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A
+
+```js
+const a = Promise.resolve("A");
+const b = Promise.resolve("B");
+
+console.log("start");
+
+await Promise.all([a, b]);
+
+console.log("done");
+```
+
+Inside an async context, reason about the suspension point even though both inputs are already fulfilled.
+
+### Exercise B
+
+```js
+const tasks = [1, 2, 3];
+
+for (const task of tasks) {
+  await work(task);
+}
+
+console.log("done");
+```
+
+What is the maximum concurrency?
+
+### Exercise C
+
+```js
+const tasks = [1, 2, 3];
+
+await Promise.all(
+  tasks.map(task => work(task))
+);
+
+console.log("done");
+```
+
+What is the maximum intended concurrency?
+
+### Exercise D
+
+```js
+async function worker(id) {
+  console.log("start", id);
+  await delay(id === 1 ? 30 : 0);
+  console.log("end", id);
+}
+
+await Promise.all([
+  worker(1),
+  worker(2)
+]);
+```
+
+Predict the execution/completion ordering.
+
+### Exercise E
+
+```js
+async function limited(items) {
+  const semaphore = new Semaphore(2);
+
+  return Promise.all(
+    items.map(async item => {
+      const release = await semaphore.acquire();
+
+      try {
+        return await process(item);
+      } finally {
+        release();
+      }
+    })
+  );
+}
+```
+
+Why can no more than two `process()` operations be active at once?
+
+### Exercise F
+
+```js
+let active = 0;
+let maximum = 0;
+
+async function tracked() {
+  active++;
+  maximum = Math.max(maximum, active);
+
+  await delay(10);
+
+  active--;
+}
+
+await Promise.all(
+  Array.from({ length: 100 }, tracked)
+);
+
+console.log(maximum);
+```
+
+What does this measure, and what is the expected maximum for this unbounded fan-out?
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Semaphore
+
+Implement:
+
+```js
+Semaphore(limit)
+```
+
+with:
+
+- FIFO waiters;
+- cancellation;
+- timeout;
+- safe release;
+- metrics.
+
+### Exercise 2 — Bounded map
+
+Implement:
+
+```js
+mapLimited(items, limit, worker, options)
+```
+
+Support:
+
+- ordered results;
+- cancellation;
+- timeout;
+- retries;
+- queue bound.
+
+### Exercise 3 — Multi-resource scheduler
+
+Build:
+
+```text
+CPU limit = 4
+database limit = 10
+API limit = 20
+```
+
+A task may require multiple resources.
+
+Ensure resource acquisition does not create deadlocks.
+
+### Exercise 4 — Tenant isolation
+
+Build:
+
+```text
+global limit = 100
+per tenant = 10
+```
+
+with fair scheduling.
+
+### Exercise 5 — Rate + concurrency control
+
+Implement both:
+
+```text
+max active = 20
+max starts = 100/sec
+```
+
+### Exercise 6 — Retry-aware scheduler
+
+Ensure retries:
+
+- return to the scheduling queue;
+- honor concurrency;
+- honor rate limits;
+- respect cancellation;
+- apply backoff/jitter.
+
+### Exercise 7 — CPU worker pool
+
+Build a worker-thread/process pool for CPU-heavy tasks.
+
+Compare:
+
+```text
+main-thread
+worker
+process
+```
+
+on:
+
+- throughput;
+- latency;
+- memory;
+- startup;
+- communication cost.
+
+### Exercise 8 — Adaptive concurrency
+
+Implement a controller that modifies:
+
+```text
+concurrency limit
+```
+
+based on:
+
+```text
+latency target
+error rate
+resource saturation
+```
+
+Add hysteresis to reduce oscillation.
+
+### Exercise 9 — Graceful shutdown
+
+Build:
+
+```js
+pool.shutdown({
+  mode: "drain"
+});
+```
+
+and:
+
+```js
+pool.shutdown({
+  mode: "cancel"
+});
+```
+
+Define exact semantics for:
+
+```text
+queued
+running
+retrying
+waiting
+```
+
+### Exercise 10 — Principal concurrency model
+
+Design concurrency for:
+
+```text
+10,000 incoming requests/sec
+database pool = 100
+remote API quota = 500 req/sec
+CPU budget = 8 cores
+P99 target = 250ms
+```
+
+Define:
+
+- admission;
+- queue size;
+- concurrency;
+- rate;
+- timeout;
+- retry;
+- bulkheads;
+- cancellation;
+- fairness;
+- shutdown;
+- observability.
+
+Defend every decision.
+
+---
+
+## 27. Key Takeaways
+
+1. Concurrency means multiple activities are in progress.
+2. Parallelism means multiple activities execute simultaneously on independent resources.
+3. Concurrency does not require multiple JavaScript threads.
+4. Async programming is not identical to concurrency.
+5. `Promise.all()` aggregates asynchronous outcomes but is not a resource-aware scheduler.
+6. Concurrency should normally be bounded.
+7. The correct concurrency limit depends on the bottleneck.
+8. CPU, I/O, memory, database, network, and external API workloads have different capacities.
+9. More concurrency can improve throughput until saturation.
+10. Beyond saturation, queueing and latency can increase dramatically.
+11. Little's Law provides a useful relationship among throughput, latency, and in-flight work.
+12. Concurrency and rate limiting solve different problems.
+13. Backpressure controls producer behavior when consumers cannot keep up.
+14. Semaphores control active capacity.
+15. Queues hold work that cannot currently execute.
+16. Pools provide finite reusable capacity.
+17. Structured concurrency aligns child lifetime, cancellation, failure, and ownership with a parent scope.
+18. Detached work requires another explicit owner and supervisor.
+19. Concurrency introduces race conditions and shared-state hazards.
+20. Retries consume concurrency and can amplify load.
+21. Timeouts protect capacity from stuck work.
+22. Cancellation should remove unnecessary queued and active work where safe.
+23. Fairness prevents one workload from monopolizing shared capacity.
+24. Bulkheads isolate critical workloads.
+25. Worker threads/processes can provide parallelism for CPU-heavy work.
+26. Worker communication and startup costs must be included in the performance model.
+27. Oversubscription can reduce CPU efficiency.
+28. Durable external queues provide stronger scaling and lifecycle boundaries than in-memory pools.
+29. Production concurrency should be measured using active work, queue depth, latency, throughput, errors, and resource saturation.
+30. The central principle is:
+
+> Concurrency is not about doing as much work as possible at once; it is about admitting the right amount of work into finite resources while preserving correctness, latency, fairness, and recoverability.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 12 — Execution Contexts / Execution Model
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+
+### Builds Toward
+
+- Chapter 40 — Observables / Reactive
+- Chapter 45 — Memory / GC
+- Chapter 46 — Weak Refs / Finalization
+- Chapter 52 — Web Workers / Concurrency
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 58 — Node Architecture
+- Chapter 60 — Node Streams
+- Chapter 61 — Worker Threads / Child Processes / Cluster
+- Chapter 62 — Process Lifecycle
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 78 — Production JS Architecture
+- Chapter 79 — API Design
+- Chapter 82 — API Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 89 — Code Review / Refactoring
+- Chapter 98 — Anti-patterns / Failure Modes
+- Chapter 100 — Cost Model / Tradeoffs
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 104 — Production HTTP Client
+- Chapter 105 — Node REST API
+- Chapter 106 — Real-time WebSocket
+- Chapter 107 — Job Queue
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- Concurrency
+- Parallelism
+- Scheduling
+- Semaphore
+- Queue
+- Pool
+- Executor
+- Worker
+- Worker thread
+- Child process
+- Rate limiting
+- Backpressure
+- Admission control
+- Bulkhead
+- Circuit breaker
+- Retry
+- Backoff
+- Jitter
+- Fairness
+- Starvation
+- Deadlock
+- Livelock
+- Head-of-line blocking
+- Oversubscription
+- Structured concurrency
+- Task supervision
+- Little's Law
+- Saturation
+- Queueing
+- Tail latency
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- promises;
+- async/await;
+- Jobs;
+- event loops;
+- cancellation;
+- resource management;
+- async iteration;
+- backpressure;
+- error handling.
+
+### Why This Chapter Matters Later
+
+Concurrency is the point where asynchronous programming becomes systems engineering.
+
+The code:
+
+```js
+Promise.all(tasks)
+```
+
+is easy.
+
+The difficult questions are:
+
+```text
+How many tasks?
+Why this number?
+What resource limits it?
+What if tasks stall?
+What if they fail?
+What if they retry?
+What if the user cancels?
+What if the dependency is overloaded?
+What if one tenant sends 100× more traffic?
+What happens during shutdown?
+```
+
+Those are production architecture questions.
+
+This chapter therefore transforms the async curriculum from:
+
+```text
+“How does asynchronous code work?”
+```
+
+into:
+
+```text
+“How should a system admit, execute, coordinate, and terminate concurrent work?”
+```
+
+The central principle is:
+
+> Concurrency is a resource-allocation problem disguised as a programming convenience.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 39 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Define concurrency.
+- [ ] Define parallelism.
+- [ ] Explain concurrency without threads.
+- [ ] Explain async vs concurrency.
+- [ ] Explain bounded concurrency.
+- [ ] Explain semaphore.
+- [ ] Explain queue.
+- [ ] Explain pool.
+- [ ] Explain rate limiting.
+- [ ] Explain backpressure.
+- [ ] Explain saturation.
+- [ ] Explain Little's Law.
+- [ ] Explain structured concurrency.
+- [ ] Explain bulkheads and admission control.
+
+### Predictive Mastery
+
+- [ ] Predict sequential concurrency.
+- [ ] Predict unbounded fan-out.
+- [ ] Predict bounded-pool execution.
+- [ ] Predict completion vs input order.
+- [ ] Predict queue growth.
+- [ ] Predict retry amplification.
+- [ ] Predict semaphore leaks.
+- [ ] Predict cancellation behavior.
+- [ ] Predict CPU oversubscription effects.
+
+### Implementation
+
+- [ ] Implement a semaphore.
+- [ ] Implement bounded map.
+- [ ] Implement async task pool.
+- [ ] Implement cancellation-aware queueing.
+- [ ] Implement retry-aware scheduling.
+- [ ] Implement rate + concurrency control.
+- [ ] Implement tenant-aware fairness.
+- [ ] Implement worker pool.
+- [ ] Implement graceful shutdown.
+- [ ] Implement adaptive concurrency.
+
+### Debugging
+
+- [ ] Diagnose unbounded concurrency.
+- [ ] Diagnose queue growth.
+- [ ] Diagnose semaphore leaks.
+- [ ] Diagnose head-of-line blocking.
+- [ ] Diagnose starvation.
+- [ ] Diagnose retry storms.
+- [ ] Diagnose downstream saturation.
+- [ ] Diagnose race conditions.
+- [ ] Diagnose oversubscription.
+- [ ] Diagnose worker-transfer overhead.
+
+### Production Engineering
+
+- [ ] Define concurrency budgets.
+- [ ] Define queue capacity.
+- [ ] Define rate limits.
+- [ ] Define timeout.
+- [ ] Define retry.
+- [ ] Define cancellation.
+- [ ] Define fairness.
+- [ ] Define overload behavior.
+- [ ] Define bulkheads.
+- [ ] Define shutdown.
+- [ ] Define observability.
+- [ ] Define worker/process architecture.
+
+### Interview Readiness
+
+- [ ] Explain concurrency vs parallelism.
+- [ ] Explain bounded concurrency.
+- [ ] Explain saturation.
+- [ ] Use Little's Law in reasoning.
+- [ ] Design a semaphore/pool.
+- [ ] Design retry + concurrency safely.
+- [ ] Design tenant isolation.
+- [ ] Choose async I/O vs workers vs processes vs queues.
+- [ ] Diagnose throughput/latency trade-offs.
+- [ ] Defend a production concurrency budget.
+
+### Track A — Core Theory
+
+- [ ] Understand concurrency and parallelism.
+- [ ] Understand queueing and saturation.
+- [ ] Understand resource capacity.
+- [ ] Understand structured concurrency.
+- [ ] Understand admission control.
+- [ ] Understand fairness and failure amplification.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production-oriented concurrency controller reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed concurrency debugging.
+- [ ] Completed code review.
+- [ ] Completed concurrency budgeting.
+- [ ] Completed overload-protection design.
+- [ ] Completed worker architecture trade-off analysis.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 39 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What is concurrency?
+2. What is parallelism?
+3. Can concurrency exist on one JavaScript execution agent?
+4. Why is async not the same as concurrency?
+5. Why is `Promise.all` not a concurrency scheduler?
+6. What is a semaphore?
+7. What is a bounded worker pool?
+8. What is saturation?
+9. What is Little's Law?
+10. How do throughput, latency, and in-flight work relate?
+11. How is concurrency limiting different from rate limiting?
+12. What is backpressure?
+13. Why can more concurrency increase latency?
+14. What is head-of-line blocking?
+15. What is starvation?
+16. What is deadlock?
+17. What is livelock?
+18. What is oversubscription?
+19. Why do retries affect concurrency?
+20. What is structured concurrency?
+21. Why does cancellation matter in a task queue?
+22. Why does queue memory matter?
+23. How would you select a database concurrency limit?
+24. How would you select a remote API concurrency limit?
+25. When should CPU work use workers or processes?
+26. When should work move to an external queue?
+27. How would you protect one tenant from monopolizing capacity?
+28. How would you design graceful shutdown?
+29. How would you detect retry storms?
+30. How would you tune concurrency from production data?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit concurrency vs parallelism
+- [ ] Revisit bounded concurrency
+- [ ] Revisit semaphores and pools
+- [ ] Revisit Little's Law
+- [ ] Revisit rate vs concurrency
+- [ ] Revisit backpressure
+- [ ] Revisit fairness
+- [ ] Revisit retry amplification
+- [ ] Revisit structured concurrency
+- [ ] Revisit workers/processes/queues
+- [ ] Revisit graceful shutdown
+- [ ] Revisit adaptive concurrency
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 39 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. ECMAScript specification — Jobs, Promises, async functions, agents, SharedArrayBuffer/Atomics, and language-level asynchronous semantics.
+2. WHATWG / browser standards — Web Workers, scheduling, streams, and browser-specific concurrency mechanisms.
+3. Node.js official documentation — worker threads, child processes, streams, timers, diagnostics, and runtime concurrency behavior.
+4. libuv documentation — event-loop and worker-pool implementation details.
+5. Operating-system/runtime documentation — process/thread scheduling and platform concurrency mechanisms.
+6. Queueing/performance literature — Little's Law, saturation, latency/throughput relationships, and scheduling theory.
+7. Application architecture documentation — concurrency budgets, admission control, rate limiting, fairness, retries, bulkheads, circuit breakers, and shutdown.
+
+Always distinguish:
+
+```text
+ECMAScript language semantics
+vs
+host/runtime concurrency
+vs
+OS-level parallelism
+vs
+application scheduling policy
+```
+
+Do not claim that JavaScript Promises provide a universal concurrency limit.
+
+Do not claim that `Promise.all()` creates a worker pool.
+
+Do not claim that parallelism automatically improves performance.
+
+Do not treat a single concurrency number as portable across CPU, database, filesystem, network, and external API workloads.
+
+---
+
+# Chapter 39 — Completion Snapshot
+
+```text
+Chapter: 39
+Title: Concurrency and Parallelism
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
+
+# Chapter 40 — Observables and Reactive Programming
+
+## 1. Learning Objectives
+
+By the end of this chapter, the learner must be able to:
+
+- Define reactive programming precisely.
+- Define an Observable as a conceptual abstraction.
+- Distinguish Observables from Promises.
+- Distinguish Observables from async iterators.
+- Distinguish Observables from EventEmitters.
+- Distinguish push-based and pull-based data flow.
+- Explain why Promises represent one eventual result while Observables can represent sequences over time.
+- Explain cold and hot Observables.
+- Explain unicast and multicast behavior.
+- Understand subscriptions and subscription lifetime.
+- Understand `next`, `error`, and `complete` notification channels.
+- Explain why Observable contracts are different from Promise settlement.
+- Understand lazy versus eager execution.
+- Understand operators and stream composition.
+- Understand transformation, filtering, combination, flattening, buffering, throttling, debouncing, and windowing.
+- Explain higher-order Observables.
+- Understand flattening strategies conceptually: merge, concat, switch, and exhaust behavior.
+- Understand cancellation and unsubscription.
+- Understand teardown and resource cleanup.
+- Explain backpressure challenges in push-based systems.
+- Understand buffering policies.
+- Understand event storms and rate-control strategies.
+- Understand multicasting and replay.
+- Understand subject-like constructs and their trade-offs.
+- Understand synchronous versus asynchronous emission.
+- Understand reentrancy hazards.
+- Understand error propagation through reactive pipelines.
+- Understand completion semantics.
+- Understand subscription leaks.
+- Understand shared-resource ownership.
+- Understand operator fusion as a conceptual optimization.
+- Understand scheduler abstractions conceptually.
+- Distinguish language-standard JavaScript features from library-provided Observable APIs.
+- Understand that Observable behavior is not a universal ECMAScript language primitive.
+- Implement a minimal Observable abstraction from scratch.
+- Implement unsubscribe/teardown correctly.
+- Implement basic operators.
+- Implement subscription composition.
+- Implement a bounded buffering strategy.
+- Build a cancellation-aware reactive pipeline.
+- Diagnose memory leaks caused by long-lived subscriptions.
+- Diagnose event storms, dropped events, duplicated subscriptions, and stale subscriptions.
+- Reason about ordering guarantees.
+- Reason about concurrency inside reactive pipelines.
+- Compare reactive approaches with Promises, async iterators, EventEmitters, Web Streams, and queues.
+- Design production reactive flows for UI events, server events, telemetry, messaging, and live data.
+- Choose reactive programming only when its temporal/compositional model adds value.
+- Defend reactive architecture at senior/principal level.
+
+### Mastery Gate
+
+The chapter is mastered only when the learner can:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+## 2. Prerequisites
+
+Required:
+
+- Chapter 25 — Iterables / Iterators
+- Chapter 26 — Generators / Async Generators
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+
+Strongly related:
+
+- Chapter 22 — Arrays
+- Chapter 24 — Objects / Map / Set / WeakMap / WeakSet
+- Chapter 28 — JSON / Serialization / Structured Clone
+- Chapter 45 — Memory / GC
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 60 — Node Streams
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+
+---
+
+## 3. What Is It?
+
+Reactive programming is a programming model organized around values, events, and state changes arriving over time.
+
+An Observable is a commonly used abstraction for a potentially unbounded sequence of notifications:
+
+```text
+next(value)
+next(value)
+next(value)
+...
+error(error)
+```
+
+or:
+
+```text
+next(value)
+next(value)
+next(value)
+...
+complete()
+```
+
+A conceptual Observable has:
+
+```text
+producer
+   ↓
+Observable
+   ↓
+subscription
+   ↓
+observer
+```
+
+The observer can conceptually receive:
+
+```text
+next
+error
+complete
+```
+
+Unlike a Promise:
+
+```text
+Promise
+   ↓
+one eventual result
+```
+
+an Observable can represent:
+
+```text
+many values over time
+```
+
+Examples:
+
+```text
+mouse movements
+keyboard input
+WebSocket messages
+market data
+telemetry
+application state changes
+filesystem events
+server-sent events
+```
+
+The abstraction is especially useful when the core problem is:
+
+> “How should a program compose values that arrive over time?”
+
+---
+
+## 4. Why Does It Exist?
+
+Callbacks become difficult to compose when many temporal operations interact:
+
+```text
+event
+→ filter
+→ debounce
+→ map
+→ asynchronous request
+→ cancel stale request
+→ combine with another stream
+→ recover from failure
+→ cleanup
+```
+
+Reactive abstractions provide a vocabulary for these operations.
+
+Instead of manually wiring:
+
+```js
+source.addEventListener(...);
+timer(...);
+unsubscribe(...);
+cancel(...);
+```
+
+a reactive pipeline can conceptually express:
+
+```text
+source
+→ filter
+→ debounce
+→ map
+→ switch-latest
+→ observe
+```
+
+The central value is not that Observables make code “more async”.
+
+The value is that they model **time-varying streams compositionally**.
+
+---
+
+## 5. Mental Model
+
+Think of an Observable as:
+
+```text
+a recipe for producing a sequence
+```
+
+and a subscription as:
+
+```text
+an activation of that recipe
+```
+
+The distinction matters.
+
+```text
+Observable creation
+        ↓
+       idle
+        ↓
+   subscribe()
+        ↓
+    execution starts
+        ↓
+ next / error / complete
+        ↓
+     teardown
+```
+
+This commonly leads to the concept of a **cold Observable**.
+
+A hot source is different:
+
+```text
+source exists independently
+        ↓
+events already happen
+        ↓
+subscriber attaches
+```
+
+Example:
+
+```text
+WebSocket
+   ↓
+shared event source
+   ├── subscriber A
+   ├── subscriber B
+   └── subscriber C
+```
+
+A late subscriber may miss earlier values.
+
+---
+
+## 6. Core Rules
+
+### Rule 1 — Observable is not a universal ECMAScript language primitive
+
+Observable behavior is usually supplied by a library or host/application abstraction.
+
+### Rule 2 — Promise and Observable model different temporal cardinalities
+
+Promise:
+
+```text
+zero/one eventual settlement
+```
+
+Observable:
+
+```text
+zero/many notifications over time
+```
+
+### Rule 3 — Subscription activates the computation in lazy designs
+
+Creating an Observable need not start execution.
+
+### Rule 4 — Unsubscription is a lifetime boundary
+
+A subscription should stop unnecessary work and release resources when possible.
+
+### Rule 5 — Errors are part of the stream contract
+
+Reactive pipelines need explicit error semantics.
+
+### Rule 6 — Completion is different from cancellation
+
+Completion:
+
+```text
+producer finished normally
+```
+
+Cancellation/unsubscription:
+
+```text
+subscriber no longer wants the work
+```
+
+### Rule 7 — A stream can be infinite
+
+For example:
+
+```text
+clicks
+WebSocket messages
+telemetry
+```
+
+must not depend on natural completion.
+
+### Rule 8 — Push sources can overwhelm consumers
+
+Without buffering, dropping, sampling, throttling, or flow control, event rates can exceed processing capacity.
+
+### Rule 9 — Multicasting changes ownership semantics
+
+One producer shared by many subscribers differs from independent producer executions.
+
+### Rule 10 — Replay changes what late subscribers observe
+
+A replaying source may emit historical values to new subscribers.
+
+### Rule 11 — Ordering must be explicit
+
+Concurrent inner operations may complete out of order.
+
+### Rule 12 — Flattening operators encode concurrency policy
+
+Merge-like behavior permits overlap.
+
+Concat-like behavior serializes.
+
+Switch-like behavior favors the latest.
+
+Exhaust-like behavior ignores new work while busy.
+
+### Rule 13 — Operators should preserve understandable contracts
+
+A custom operator that leaks subscriptions or changes error semantics silently is production-dangerous.
+
+### Rule 14 — Reactive systems are lifecycle systems
+
+Every long-lived subscription needs an ownership and teardown story.
+
+### Rule 15 — More abstraction does not remove resource costs
+
+Every subscription, buffer, timer, closure, and inner operation still consumes resources.
+
+---
+
+## 7. Syntax
+
+Because Observables are generally library-level abstractions rather than one universal ECMAScript syntax, exact APIs vary.
+
+A conceptual API:
+
+```js
+const source = new Observable(observer => {
+  observer.next(1);
+  observer.next(2);
+  observer.complete();
+
+  return () => {
+    // teardown
+  };
+});
+
+const subscription = source.subscribe({
+  next(value) {
+    console.log(value);
+  },
+  error(error) {
+    console.error(error);
+  },
+  complete() {
+    console.log("done");
+  }
+});
+
+subscription.unsubscribe();
+```
+
+Conceptual operator composition:
+
+```js
+const result = source
+  .pipe(
+    map(value => transform(value)),
+    filter(value => isValid(value)),
+    debounce(...)
+  );
+```
+
+Exact operator names and signatures depend on the Observable implementation.
+
+---
+
+## 8. Basic Examples
+
+### Example 1 — Simple finite Observable
+
+```js
+const numbers = new Observable(observer => {
+  observer.next(1);
+  observer.next(2);
+  observer.next(3);
+  observer.complete();
+});
+
+numbers.subscribe({
+  next: value => console.log(value),
+  complete: () => console.log("done")
+});
+```
+
+Expected sequence:
+
+```text
+1
+2
+3
+done
+```
+
+### Example 2 — Infinite event source
+
+```js
+const clicks = fromEvent(button, "click");
+
+const subscription = clicks.subscribe({
+  next: event => console.log(event)
+});
+```
+
+Teardown:
+
+```js
+subscription.unsubscribe();
+```
+
+### Example 3 — Transformation
+
+```text
+source
+  → map(x => x * 2)
+  → filter(x => x > 10)
+  → subscriber
+```
+
+### Example 4 — Debouncing
+
+Input:
+
+```text
+a
+ab
+abc
+abcd
+```
+
+Rapid emissions can be collapsed so that only a stabilized value is processed.
+
+### Example 5 — Throttling
+
+Input:
+
+```text
+1 2 3 4 5 6 7
+```
+
+A throttle can limit how frequently downstream work executes.
+
+### Example 6 — Combining streams
+
+Conceptually:
+
+```text
+user
++
+settings
++
+permissions
+→ derived state
+```
+
+### Example 7 — Higher-order stream
+
+```text
+search query stream
+       ↓
+request Observable for each query
+       ↓
+flatten
+```
+
+The flattening policy determines whether:
+
+- all requests remain active;
+- requests queue;
+- previous request is cancelled;
+- new requests are ignored while busy.
+
+---
+
+## 9. Execution Walkthrough
+
+Consider:
+
+```text
+clicks
+→ map(extractId)
+→ switchLatest(fetchData)
+→ render
+```
+
+### Step 1
+
+A click arrives.
+
+```text
+click #1
+```
+
+### Step 2
+
+The ID is transformed.
+
+```text
+id = 10
+```
+
+### Step 3
+
+A request Observable is created.
+
+```text
+request(10)
+```
+
+### Step 4
+
+The inner request becomes active.
+
+### Step 5
+
+Another click arrives before request #1 finishes.
+
+```text
+click #2
+id = 20
+```
+
+### Step 6
+
+The latest-value switching policy unsubscribes the old inner subscription where the abstraction supports cancellation.
+
+### Step 7
+
+Request #2 becomes active.
+
+### Step 8
+
+Request #2 emits its response.
+
+### Step 9
+
+The response reaches:
+
+```text
+render
+```
+
+The important concept is:
+
+> The flattening policy expresses concurrency and cancellation semantics.
+
+A merge policy would allow both requests to remain active.
+
+A concat policy would wait for request #1.
+
+An exhaust policy could ignore click #2 while request #1 is active.
+
+---
+
+## 10. Internal Mechanics
+
+### 10.1 Subscription
+
+Conceptually:
+
+```text
+subscribe(observer)
+```
+
+creates an execution relationship:
+
+```text
+producer ↔ observer
+```
+
+and returns a handle that can terminate that relationship.
+
+### 10.2 Observer
+
+Conceptually:
+
+```js
+{
+  next(value) {},
+  error(error) {},
+  complete() {}
+}
+```
+
+### 10.3 Teardown
+
+The producer may allocate:
+
+```text
+event listener
+timer
+socket
+worker
+resource
+```
+
+and return cleanup logic.
+
+### 10.4 Subscription state
+
+A robust subscription needs states such as:
+
+```text
+active
+closed
+```
+
+and sometimes additional internal state.
+
+### 10.5 Terminal notifications
+
+A stream typically treats:
+
+```text
+error
+complete
+```
+
+as terminal.
+
+After termination:
+
+```text
+next
+```
+
+should no longer be delivered through that subscription.
+
+### 10.6 Unsubscription
+
+Unsubscription should prevent future downstream delivery and attempt to stop underlying work where the source supports it.
+
+### 10.7 Cold execution
+
+A simple model:
+
+```text
+subscribe A → producer instance A
+subscribe B → producer instance B
+```
+
+Each subscriber may get an independent producer execution.
+
+### 10.8 Hot execution
+
+A shared producer:
+
+```text
+producer
+   ↓
+shared source
+   ├── A
+   ├── B
+   └── C
+```
+
+### 10.9 Multicast
+
+The producer executes once while many observers receive values.
+
+### 10.10 Replay
+
+A replay-capable subject/source may retain:
+
+```text
+latest value
+or
+N historical values
+```
+
+for future subscribers.
+
+This creates memory and lifecycle implications.
+
+### 10.11 Operator composition
+
+An operator typically creates a new Observable:
+
+```text
+source
+ ↓
+operator
+ ↓
+new Observable
+```
+
+The operator subscribes upstream and forwards transformed notifications downstream.
+
+### 10.12 Operator chains
+
+For:
+
+```text
+A → map → filter → debounce → B
+```
+
+one can model:
+
+```text
+B subscribes
+→ debounce subscribes
+→ filter subscribes
+→ map subscribes
+→ source subscribes
+```
+
+The subscription often propagates backwards through the chain.
+
+### 10.13 Teardown propagation
+
+Unsubscribing downstream can propagate upstream:
+
+```text
+subscriber unsubscribes
+       ↓
+operator teardown
+       ↓
+upstream unsubscribe
+       ↓
+producer cleanup
+```
+
+This is essential for resource safety.
+
+### 10.14 Push model
+
+Producer decides when values arrive:
+
+```text
+producer → consumer
+```
+
+### 10.15 Pull model
+
+Consumer requests the next value:
+
+```text
+consumer → producer
+```
+
+Async iterators are more naturally pull-oriented.
+
+### 10.16 Push-pull hybrids
+
+A reactive system can combine:
+
+```text
+push notifications
++
+buffer
++
+demand/capacity control
+```
+
+to approximate backpressure.
+
+### 10.17 Buffer
+
+A buffer stores values temporarily:
+
+```text
+producer → [queue] → consumer
+```
+
+### 10.18 Buffer overflow policies
+
+Possible policies:
+
+```text
+block producer
+drop newest
+drop oldest
+drop all but latest
+fail
+sample
+```
+
+The correct policy depends on semantics.
+
+### 10.19 Rate control
+
+Operators such as debounce/throttle/sample conceptually alter the temporal shape of a stream.
+
+### 10.20 Debounce
+
+Keep waiting for inactivity:
+
+```text
+A
+AB
+ABC
+ABCD
+   ↓ quiet period
+ABCD
+```
+
+### 10.21 Throttle
+
+Allow at most one event within a time window.
+
+### 10.22 Sample
+
+Observe only the latest value at selected intervals.
+
+### 10.23 Windowing
+
+Group values by:
+
+```text
+count
+time
+other boundaries
+```
+
+### 10.24 Flattening
+
+Suppose:
+
+```text
+source emits A, B, C
+```
+
+and each creates an inner Observable.
+
+Flattening determines how those inner streams coexist.
+
+### 10.25 Merge-style
+
+```text
+A ───────
+B ────
+C ──────────
+```
+
+all can overlap.
+
+### 10.26 Concat-style
+
+```text
+A complete
+    ↓
+B complete
+    ↓
+C
+```
+
+strict ordering.
+
+### 10.27 Switch-style
+
+```text
+A starts
+B arrives
+→ stop/ignore A where cancellation is supported
+B becomes current
+```
+
+### 10.28 Exhaust-style
+
+```text
+A active
+B arrives → ignored
+C arrives → ignored
+A completes
+D arrives → accepted
+```
+
+### 10.29 Synchronous emission
+
+An Observable may emit immediately during subscription:
+
+```js
+subscribe();
+```
+
+and call:
+
+```text
+next
+```
+
+before `subscribe()` returns.
+
+This creates reentrancy considerations.
+
+### 10.30 Asynchronous emission
+
+Other sources schedule work:
+
+```text
+timer
+network
+event
+queue
+worker
+```
+
+### 10.31 Scheduler abstraction
+
+Libraries may provide scheduler concepts to control when work is executed.
+
+Possible categories include:
+
+```text
+immediate
+queued
+microtask-like
+timer-like
+animation-like
+```
+
+Exact behavior is library/host-specific.
+
+### 10.32 Reentrancy
+
+A subscriber may synchronously trigger another event:
+
+```text
+next(A)
+ → subscriber
+ → source emits B
+ → subscriber
+```
+
+Without careful design, state assumptions may break.
+
+### 10.33 Error propagation
+
+A pipeline may choose:
+
+```text
+error → terminate stream
+```
+
+or recover using an alternate source.
+
+Recovery must be explicit.
+
+### 10.34 Completion propagation
+
+Finite upstream completion often propagates downstream after pending work according to operator semantics.
+
+### 10.35 Subscription leaks
+
+Long-lived sources can retain:
+
+```text
+observer
+closures
+DOM nodes
+application state
+```
+
+if subscriptions are never torn down.
+
+### 10.36 Shared source lifecycle
+
+A shared connection may need:
+
+```text
+first subscriber → connect
+last subscriber  → disconnect
+```
+
+This is often called reference-count-style lifecycle management conceptually.
+
+### 10.37 Resource ownership
+
+The application should know:
+
+```text
+who owns this subscription?
+when should it end?
+what resource does it hold?
+```
+
+### 10.38 Idempotent teardown
+
+Calling cleanup more than once should ideally be safe.
+
+### 10.39 Operator implementation invariants
+
+A correct operator should preserve:
+
+- terminal semantics;
+- teardown;
+- ordering where promised;
+- error behavior;
+- subscription lifetime.
+
+---
+
+## 11. ECMAScript / Specification Semantics
+
+### 11.1 Observable is not part of core historical Promise semantics
+
+Do not confuse a library's Observable abstraction with:
+
+```text
+Promise
+async function
+await
+```
+
+which have ECMAScript language-level semantics.
+
+### 11.2 No universal Observable execution model in ECMAScript
+
+There is no single language-defined rule that says:
+
+```text
+all Observables are lazy
+```
+
+or:
+
+```text
+all Observables are asynchronous
+```
+
+or:
+
+```text
+all Observables have a standard scheduler
+```
+
+These are characteristics of particular libraries/designs.
+
+### 11.3 Events and hosts
+
+Browsers and Node expose event-oriented mechanisms that can be adapted into reactive abstractions.
+
+### 11.4 Async iterators
+
+Async iterators provide a language-level protocol for asynchronous pull-style iteration:
+
+```text
+next() → Promise<IteratorResult>
+```
+
+Observables are conceptually more push-oriented.
+
+### 11.5 Jobs and scheduling
+
+Observable callbacks ultimately execute through the host/language scheduling mechanisms used by the implementation.
+
+Do not assume a particular library operator always maps to one ECMAScript Job.
+
+### 11.6 Cancellation
+
+Unsubscription is an Observable abstraction.
+
+It can be connected to:
+
+```text
+AbortSignal
+```
+
+or other cancellation systems, but there is no universal language rule making every Observable automatically abortable.
+
+---
+
+## 12. Advanced Behavior
+
+### 12.1 Cold vs hot is not binary in all systems
+
+A source may be:
+
+```text
+cold by default
+shared after transformation
+```
+
+### 12.2 Unicast vs multicast
+
+Unicast:
+
+```text
+subscriber A → own execution
+subscriber B → own execution
+```
+
+Multicast:
+
+```text
+one execution → A + B
+```
+
+### 12.3 State versus events
+
+A stream of events:
+
+```text
+increment
+increment
+decrement
+```
+
+is different from a stream of state snapshots:
+
+```text
+1
+2
+3
+```
+
+Both can be modeled reactively, but semantics differ.
+
+### 12.4 Replay versus current state
+
+Replay buffers historical values.
+
+A current-state abstraction typically needs a clear definition of what a new subscriber should receive.
+
+### 12.5 Hot source loss
+
+A late subscriber may miss events:
+
+```text
+event 1
+event 2
+subscribe
+event 3
+```
+
+### 12.6 Multicast race
+
+Subscriber A and B may attach at slightly different times and observe different event sets.
+
+### 12.7 Shared errors
+
+A shared source may terminate or recover in ways that affect every subscriber.
+
+### 12.8 Sharing and side effects
+
+Consider:
+
+```js
+source.map(saveToDatabase)
+```
+
+With cold independent subscriptions:
+
+```text
+subscribe A → save
+subscribe B → save
+```
+
+the side effect may happen twice.
+
+### 12.9 Referential transparency
+
+Reactive composition is easier to reason about when operators are pure transformations.
+
+### 12.10 Side-effect isolation
+
+Keep side effects at clear boundaries:
+
+```text
+source
+→ pure transformations
+→ side effect boundary
+```
+
+### 12.11 Flattening and resource ownership
+
+If each outer value creates a network request:
+
+```text
+outer stream
+→ request stream
+```
+
+flattening controls which requests remain alive.
+
+### 12.12 Merge concurrency limit
+
+Merge-style behavior can be bounded:
+
+```text
+max inner streams = N
+```
+
+This connects directly to Chapter 39.
+
+### 12.13 Concat queue growth
+
+Concat semantics preserve ordering but can accumulate waiting inner work if outer arrivals are faster than completions.
+
+### 12.14 Switch cancellation race
+
+A previous request may still finish at the physical/network layer even after downstream unsubscription.
+
+The important invariant is:
+
+```text
+stale result must not update current state
+```
+
+### 12.15 Exhaust starvation
+
+An endless or very slow active stream can prevent later work from ever being accepted.
+
+### 12.16 Backpressure gap
+
+A push producer may not honor consumer demand.
+
+Therefore:
+
+```text
+producer rate > consumer capacity
+```
+
+requires a policy.
+
+### 12.17 Buffer memory
+
+An unbounded buffer converts overload into memory growth.
+
+### 12.18 Sampling versus correctness
+
+Dropping values is correct only when intermediate observations are nonessential.
+
+For financial ledger events:
+
+```text
+drop events
+```
+
+may be unacceptable.
+
+For pointer movement:
+
+```text
+sampling
+```
+
+may be entirely appropriate.
+
+### 12.19 Debounce semantic loss
+
+Debounce intentionally discards intermediate activity.
+
+### 12.20 Ordering
+
+A reactive pipeline should state:
+
+```text
+Does downstream observe source order?
+```
+
+Some concurrency operators preserve order, some do not.
+
+### 12.21 Time semantics
+
+Timers and scheduler timing are host-dependent.
+
+Do not treat a debounce duration as a precise real-time guarantee.
+
+### 12.22 Reentrancy versus serialization
+
+A synchronous source may cause nested subscriber execution.
+
+A queued scheduler can flatten that behavior.
+
+### 12.23 Recursive emissions
+
+```text
+subscriber
+→ causes source emission
+→ subscriber
+→ causes source emission
+```
+
+can create deep recursion or infinite feedback loops.
+
+### 12.24 Feedback systems
+
+Reactive state can form:
+
+```text
+output
+ ↓
+feeds source
+ ↓
+new output
+```
+
+Feedback requires loop-breaking or convergence conditions.
+
+### 12.25 Infinite streams
+
+Operators like:
+
+```text
+buffer
+reduce
+toArray
+```
+
+can never complete on an infinite source unless explicitly bounded.
+
+### 12.26 Memory retention through replay
+
+Replay size and lifetime must be controlled.
+
+### 12.27 Error recovery loops
+
+A recovery operator can accidentally create:
+
+```text
+error
+→ fallback
+→ same failing source
+→ error
+→ ...
+```
+
+### 12.28 Retry storms
+
+Retrying every subscriber independently can multiply downstream load.
+
+### 12.29 Per-subscriber side effects
+
+A cold source with expensive setup can multiply work as subscriptions increase.
+
+### 12.30 Shared connection
+
+A multicast WebSocket can reduce duplicate network connections.
+
+But now:
+
+```text
+one connection
+shared ownership
+shared failure semantics
+```
+
+must be designed.
+
+### 12.31 Reference counting
+
+Conceptually:
+
+```text
+0 subscribers → disconnected
+1 subscriber  → connected
+2 subscribers → same connection
+1 subscriber  → remain connected
+0 subscribers → disconnected
+```
+
+### 12.32 Buffering during reconnect
+
+A reconnecting stream must define whether messages are:
+
+```text
+dropped
+buffered
+replayed
+recovered from durable source
+```
+
+### 12.33 Duplicate delivery
+
+Reconnects can cause duplicate events.
+
+Consumers may need idempotency.
+
+### 12.34 Ordering across reconnects
+
+Network reconnect may break global ordering guarantees.
+
+### 12.35 Exactly-once misconceptions
+
+Reactive libraries cannot automatically create distributed exactly-once semantics.
+
+---
+
+## 13. Edge Cases
+
+### 13.1 Subscriber throws
+
+An implementation must define how a thrown observer callback is handled.
+
+### 13.2 Producer throws during subscription
+
+The subscription should transition to a safe terminal/failure state.
+
+### 13.3 `next` after complete
+
+Should not be delivered to a closed subscription.
+
+### 13.4 `next` after error
+
+Should not be delivered.
+
+### 13.5 Complete twice
+
+Terminal notifications should be effectively one-shot per subscription.
+
+### 13.6 Error twice
+
+Second terminal notification should not create another terminal state.
+
+### 13.7 Unsubscribe before first emission
+
+No post-unsubscribe values should reach the subscriber.
+
+### 13.8 Unsubscribe during `next`
+
+The pipeline must safely transition without leaking further notifications.
+
+### 13.9 Synchronous completion
+
+A stream may emit all values and complete before `subscribe()` returns.
+
+### 13.10 Synchronous error
+
+Errors may also occur immediately during subscription.
+
+### 13.11 Reentrant unsubscribe
+
+A subscriber may unsubscribe itself inside `next`.
+
+### 13.12 Reentrant subscribe
+
+A subscriber may subscribe another observer from inside a callback.
+
+### 13.13 Infinite replay buffer
+
+A replay implementation without size/time limits can leak memory indefinitely.
+
+### 13.14 Infinite stream + accumulation
+
+A global array collecting every event becomes an unbounded memory consumer.
+
+### 13.15 Multiple subscriptions
+
+One source may accidentally execute expensive side effects once per subscriber.
+
+### 13.16 Duplicate event handling
+
+A component may subscribe repeatedly without disposing older subscriptions.
+
+### 13.17 Stale subscription
+
+A UI view can continue receiving events after the view is gone.
+
+### 13.18 Async race
+
+Two inner streams may complete out of order.
+
+### 13.19 Slow consumer
+
+A push source can outpace downstream processing.
+
+### 13.20 Slow producer
+
+Combining or scheduling logic must not assume constant producer rate.
+
+### 13.21 Clock/timer drift
+
+Time-based operators rely on runtime scheduling behavior.
+
+### 13.22 Cancellation race
+
+Unsubscribe may occur immediately before a producer emits.
+
+### 13.23 Cleanup race
+
+Resource cleanup may overlap with completion/error paths.
+
+### 13.24 Network reconnect
+
+Reconnect logic may create duplicate connections if old connections are not fully torn down.
+
+### 13.25 Shared error
+
+One subscriber's assumptions may conflict with global source termination.
+
+---
+
+## 14. Common Misconceptions
+
+### Misconception 1 — “Observable is just a Promise with multiple values.”
+
+No.
+
+The subscription, cancellation, completion, hot/cold, push, and multicasting models are materially different.
+
+### Misconception 2 — “Every Observable is asynchronous.”
+
+No.
+
+An Observable can emit synchronously.
+
+### Misconception 3 — “Every Observable is lazy.”
+
+No.
+
+That depends on the abstraction.
+
+### Misconception 4 — “Unsubscribe physically stops every underlying operation.”
+
+Not necessarily.
+
+It depends on whether the source can cancel the underlying work.
+
+### Misconception 5 — “All reactive libraries implement operators identically.”
+
+No.
+
+API names and subtle semantics vary.
+
+### Misconception 6 — “Reactive automatically means better architecture.”
+
+No.
+
+It can increase conceptual and debugging complexity.
+
+### Misconception 7 — “Push means no backpressure problem.”
+
+The opposite may be true.
+
+### Misconception 8 — “Replay is free.”
+
+Replay retains memory and may increase startup work.
+
+### Misconception 9 — “Switch cancellation guarantees the HTTP request is physically cancelled.”
+
+Not automatically.
+
+It guarantees the downstream subscription stops receiving the old result according to the implementation's semantics.
+
+### Misconception 10 — “Merge means parallel CPU execution.”
+
+No.
+
+It means concurrent inner streams at the abstraction level.
+
+### Misconception 11 — “Completion and cancellation are the same.”
+
+No.
+
+### Misconception 12 — “A shared Observable always executes once globally.”
+
+Sharing scope and lifecycle are implementation-specific.
+
+### Misconception 13 — “Reactive code has no races.”
+
+Reactive code can contain concurrency and ordering races.
+
+### Misconception 14 — “A stream can always be converted to an array.”
+
+Infinite streams make this impossible.
+
+### Misconception 15 — “Debounce only changes performance.”
+
+It changes semantics by discarding intermediate events.
+
+---
+
+## 15. Common Mistakes
+
+### Mistake 1 — Forgetting to unsubscribe long-lived sources
+
+### Mistake 2 — Creating duplicate subscriptions
+
+### Mistake 3 — Using merge-style flattening for work that must remain ordered
+
+### Mistake 4 — Using concat-style flattening when latency matters more than strict order
+
+### Mistake 5 — Using switch-style cancellation where every event must be processed
+
+### Mistake 6 — Using exhaust-style behavior where events cannot be dropped
+
+### Mistake 7 — Unbounded buffering
+
+### Mistake 8 — Unbounded retry
+
+### Mistake 9 — Ignoring downstream capacity
+
+### Mistake 10 — Assuming cancellation undoes side effects
+
+### Mistake 11 — Hiding side effects inside reusable operators
+
+### Mistake 12 — Sharing a source without documenting lifecycle
+
+### Mistake 13 — Replay buffers without bounds
+
+### Mistake 14 — Ignoring reentrancy
+
+### Mistake 15 — Treating timing operators as precise clocks
+
+### Mistake 16 — Converting infinite streams into finite collections without bounds
+
+### Mistake 17 — Building custom operators without teardown propagation
+
+### Mistake 18 — Mixing push and pull semantics without a clear contract
+
+### Mistake 19 — Ignoring error ownership in shared streams
+
+### Mistake 20 — Choosing reactive programming merely because it is fashionable
+
+---
+
+## 16. Comparison With Related Concepts
+
+| Concept | Cardinality | Direction | Cancellation | Typical shape |
+|---|---|---|---|---|
+| Promise | One settlement | Push/eventual | External/cooperative | One result |
+| Observable | Zero/many over time | Push-oriented | Unsubscribe | Stream |
+| Async Iterator | Zero/many | Pull-oriented | `return()`/external signal patterns | Sequential consumption |
+| EventEmitter | Many events | Push | Listener removal | Event notifications |
+| Web Stream | Chunks | Pull/push hybrid | Abort/cancel | Data flow |
+| Queue | Many work items | Producer/consumer | Policy-dependent | Work buffering |
+| Callback | Usually one invocation | Push | Ad hoc | Function notification |
+
+### Observable vs Promise
+
+Use Promise when:
+
+```text
+one result
+one completion
+```
+
+Use Observable when:
+
+```text
+many values
+ongoing lifetime
+temporal operators
+cancellation
+```
+
+### Observable vs Async Iterator
+
+Observable:
+
+```text
+producer pushes
+```
+
+Async Iterator:
+
+```text
+consumer pulls
+```
+
+### Observable vs EventEmitter
+
+EventEmitter provides event dispatch.
+
+An Observable abstraction adds compositional semantics such as:
+
+```text
+map
+filter
+flatten
+combine
+buffer
+retry
+```
+
+### Observable vs Web Streams
+
+Web Streams are designed around streaming data and explicit stream lifecycle/backpressure concerns.
+
+Observables are often more general event/value composition abstractions.
+
+### Observable vs Queue
+
+Queue semantics focus on work transfer and buffering.
+
+Reactive semantics focus on value/event composition over time.
+
+### Hot vs Cold
+
+```text
+cold:
+each subscriber activates its own producer
+
+hot:
+producer exists independently of subscriber
+```
+
+---
+
+## 17. Performance Considerations
+
+### 17.1 Operator overhead
+
+Each abstraction layer may introduce:
+
+- closures;
+- subscriptions;
+- allocations;
+- function calls;
+- scheduling.
+
+### 17.2 Operator fusion
+
+Some implementations can combine operations to reduce intermediate overhead.
+
+Conceptually:
+
+```text
+map
++
+filter
++
+map
+```
+
+may be optimized into fewer execution steps.
+
+Do not assume fusion exists unless documented/measured.
+
+### 17.3 Allocation pressure
+
+High-frequency streams can allocate per event:
+
+```text
+event object
+closure
+wrapper
+operator state
+```
+
+### 17.4 Event storms
+
+A source emitting:
+
+```text
+100,000 events/sec
+```
+
+can overwhelm downstream processing.
+
+### 17.5 Debounce/throttle/sample
+
+These operators can reduce downstream work but intentionally change event semantics.
+
+### 17.6 Buffering
+
+Buffering absorbs bursts but trades:
+
+```text
+memory
++
+latency
+```
+
+for stability.
+
+### 17.7 Merge concurrency
+
+Unbounded inner concurrency can recreate the problems from Chapter 39.
+
+### 17.8 Scheduler overhead
+
+Repeated task scheduling can itself become significant at very high event rates.
+
+### 17.9 Multicast efficiency
+
+Sharing one producer can eliminate duplicate work:
+
+```text
+one network connection
+instead of
+N connections
+```
+
+### 17.10 Replay cost
+
+Replay increases memory usage and may create bursts when subscribers join.
+
+### 17.11 Context switching
+
+Frequent scheduling can increase overhead.
+
+### 17.12 Latency
+
+Additional buffering and scheduling can increase end-to-end latency.
+
+### 17.13 CPU-heavy operators
+
+Reactive composition does not make CPU-heavy transformations parallel.
+
+Use workers/parallel execution where justified.
+
+### 17.14 Batching
+
+Batching events can reduce per-event overhead.
+
+### 17.15 Backpressure
+
+Unbounded push should be treated as a potential performance hazard.
+
+### 17.16 Measure
+
+Useful metrics:
+
+```text
+events/sec
+subscription count
+active inner streams
+buffer depth
+dropped events
+processing latency
+P95/P99 latency
+CPU
+memory
+retry rate
+error rate
+```
+
+---
+
+## 18. Memory Considerations
+
+### 18.1 Subscription retention
+
+A subscription may retain:
+
+```text
+observer
+closure
+DOM nodes
+application state
+```
+
+### 18.2 Replay
+
+Replay buffers retain prior values.
+
+### 18.3 Buffers
+
+Queues retain every pending event until consumed/dropped.
+
+### 18.4 Infinite accumulation
+
+Avoid:
+
+```js
+const values = [];
+
+source.subscribe(value => {
+  values.push(value);
+});
+```
+
+for unbounded streams.
+
+### 18.5 Shared state retention
+
+A shared stream can accidentally retain a large graph through its observers.
+
+### 18.6 Closure capture
+
+Operators can capture:
+
+```text
+request
+component
+configuration
+cache
+```
+
+for the lifetime of the subscription.
+
+### 18.7 Inner stream retention
+
+Flattening operators can hold active inner subscriptions.
+
+### 18.8 Reconnect loops
+
+Reconnect timers can accumulate if old attempts are not cleaned up.
+
+### 18.9 Resource lifetime
+
+Always connect:
+
+```text
+subscription lifetime
+→ resource lifetime
+```
+
+### 18.10 Memory budget
+
+A useful model:
+
+```text
+replay memory
++
+buffer memory
++
+active subscription state
++
+inner task memory
++
+runtime overhead
+≤ safe budget
+```
+
+---
+
+## 19. Security Considerations
+
+### 19.1 Event-flood attacks
+
+Untrusted event sources can overwhelm processing.
+
+### 19.2 Memory exhaustion
+
+Unbounded buffering/replay can become denial-of-service vectors.
+
+### 19.3 Subscription amplification
+
+One malicious input may create many subscriptions or downstream operations.
+
+### 19.4 Fan-out amplification
+
+A single event can trigger:
+
+```text
+N downstream requests
+```
+
+Bound it.
+
+### 19.5 Retry amplification
+
+Reactive retry logic can intensify dependency overload.
+
+### 19.6 Shared state leaks
+
+A multicast stream can accidentally expose values to subscribers that should not receive them.
+
+### 19.7 Authorization changes
+
+Long-lived subscriptions should respond correctly when permissions change.
+
+### 19.8 Stale data
+
+A subscription may continue showing data after its authorization scope expires.
+
+### 19.9 Cross-tenant mixing
+
+Shared streams must preserve tenant isolation.
+
+### 19.10 Resource exhaustion through subscriptions
+
+Attackers may create many long-lived subscriptions.
+
+Apply:
+
+```text
+connection limits
+subscription limits
+timeouts
+quotas
+```
+
+### 19.11 Error information
+
+Shared error channels should avoid exposing sensitive internal details.
+
+### 19.12 Untrusted operators
+
+Dynamic or user-provided reactive definitions require strong validation.
+
+---
+
+## 20. Production Usage
+
+### 20.1 UI search
+
+A common pattern:
+
+```text
+keystrokes
+→ debounce
+→ validate
+→ request
+→ switch latest
+→ render
+```
+
+This is appropriate when stale requests should no longer update the UI.
+
+### 20.2 Live dashboards
+
+```text
+WebSocket
+→ parse
+→ validate
+→ aggregate
+→ throttle
+→ render
+```
+
+### 20.3 Telemetry
+
+```text
+events
+→ batch
+→ enrich
+→ send
+```
+
+### 20.4 Server events
+
+```text
+client connections
+→ event stream
+→ authorization
+→ filtering
+→ broadcast
+```
+
+### 20.5 Real-time collaboration
+
+Reactive streams can represent:
+
+```text
+remote edits
+presence
+cursor movement
+notifications
+```
+
+### 20.6 Event-driven backend
+
+```text
+message source
+→ validation
+→ transformation
+→ routing
+→ side effects
+```
+
+### 20.7 Monitoring
+
+Metrics can themselves be reactive:
+
+```text
+metric events
+→ windows
+→ aggregation
+→ alerts
+```
+
+### 20.8 UI lifecycle
+
+Associate subscriptions with component/page lifecycle:
+
+```text
+mount
+→ subscribe
+
+unmount
+→ unsubscribe
+```
+
+### 20.9 Database/change streams
+
+Reactive abstractions can model change notifications from database or messaging sources, but durability and delivery guarantees belong to the underlying system.
+
+### 20.10 WebSocket management
+
+Define:
+
+```text
+connect
+reconnect
+backoff
+heartbeat
+disconnect
+authorization
+duplicate handling
+```
+
+### 20.11 Production retry
+
+Prefer:
+
+```text
+bounded retry
++
+backoff
++
+jitter
++
+cancellation
+```
+
+### 20.12 Production buffering
+
+Always define:
+
+```text
+maximum buffer
+overflow policy
+drop semantics
+shutdown behavior
+```
+
+### 20.13 Observability
+
+Expose:
+
+```text
+active subscriptions
+subscription age
+source rates
+buffer depth
+dropped events
+inner concurrency
+errors
+completion counts
+```
+
+### 20.14 Testing
+
+Test:
+
+```text
+ordering
+cancellation
+completion
+errors
+timeouts
+retries
+buffer overflow
+subscription cleanup
+```
+
+### 20.15 Architecture boundary
+
+Use reactive abstractions at temporal/event boundaries.
+
+Do not force every internal business function into stream form.
+
+---
+
+## 21. Implementation From Scratch
+
+### Stage 1 — Guided minimal Observable
+
+Implement:
+
+```js
+class Observable {
+  constructor(subscribe) {
+    this._subscribe = subscribe;
+  }
+
+  subscribe(observer) {
+    // normalize observer
+    // call producer
+    // return subscription
+  }
+}
+```
+
+Subscription requirements:
+
+```js
+{
+  unsubscribe(),
+  get closed() {}
+}
+```
+
+### Stage 2 — Terminal-state handling
+
+Enforce:
+
+```text
+active
+→ complete
+
+active
+→ error
+
+active
+→ unsubscribe
+```
+
+and reject repeated terminal delivery.
+
+### Stage 3 — Teardown composition
+
+Support:
+
+```text
+function teardown
++
+subscription teardown
++
+nested teardown
+```
+
+Ensure cleanup runs exactly once.
+
+### Stage 4 — Operators
+
+Implement:
+
+```text
+map
+filter
+take
+tap
+```
+
+Requirements:
+
+- correct forwarding;
+- correct error propagation;
+- correct completion;
+- correct teardown.
+
+### Stage 5 — Time operators
+
+Implement conceptually:
+
+```text
+debounce
+throttle
+```
+
+Use explicit timer cleanup.
+
+### Stage 6 — Flattening
+
+Implement:
+
+```text
+mergeMap-like
+concatMap-like
+switchMap-like
+exhaustMap-like
+```
+
+Start with one active inner stream, then generalize.
+
+### Stage 7 — Bounded concurrency
+
+Extend merge-style flattening:
+
+```text
+maxConcurrency = N
+```
+
+This connects directly to Chapter 39.
+
+### Stage 8 — Multicast
+
+Implement a basic shared source:
+
+```text
+one producer
+many observers
+```
+
+### Stage 9 — Replay
+
+Implement bounded replay:
+
+```text
+bufferSize = N
+```
+
+Never allow unbounded history accidentally.
+
+### Stage 10 — Production Grade
+
+Add:
+
+- cancellation;
+- error isolation;
+- teardown composition;
+- bounded buffers;
+- metrics;
+- concurrency limits;
+- reconnect;
+- backoff;
+- fairness;
+- lifecycle management;
+- deterministic tests.
+
+---
+
+## 22. Debugging Exercises
+
+### Exercise 1 — Subscription leak
+
+A UI subscribes every time it mounts but never unsubscribes.
+
+Find:
+
+```text
+duplicate updates
+memory retention
+duplicate network calls
+```
+
+### Exercise 2 — Wrong flattening
+
+A search input uses merge-style request handling and displays stale responses.
+
+Replace it with a latest-value cancellation strategy.
+
+### Exercise 3 — Dropped events
+
+A system uses exhaust-style behavior for payment events.
+
+Determine why this is unsafe.
+
+### Exercise 4 — Queue explosion
+
+A push source emits faster than the consumer can process.
+
+Measure:
+
+```text
+producer rate
+consumer rate
+buffer depth
+memory
+```
+
+### Exercise 5 — Replay leak
+
+A replay buffer retains every event forever.
+
+Add a bounded policy.
+
+### Exercise 6 — Shared side effect duplication
+
+A cold source sends a notification every time it is subscribed.
+
+Find why three subscribers create three network operations.
+
+### Exercise 7 — Reentrancy
+
+Create a synchronous Observable whose subscriber causes another emission.
+
+Observe nested execution and make the behavior safe.
+
+### Exercise 8 — Error swallowing
+
+An operator catches an error and returns an empty source.
+
+Determine whether critical failures are being hidden.
+
+### Exercise 9 — Retry storm
+
+Several subscribers independently retry a failing service.
+
+Design shared retry policy with bounded concurrency.
+
+### Exercise 10 — Cleanup race
+
+Unsubscribe during a timer callback and verify no leaked timer remains.
+
+---
+
+## 23. Code Review Exercise
+
+Review conceptually:
+
+```js
+function searchStream(input) {
+  return fromEvent(input, "input").pipe(
+    map(event => event.target.value),
+    debounce(300),
+    map(query => fetch(`/search?q=${query}`)),
+    mergeAll()
+  );
+}
+```
+
+Identify:
+
+- lack of validation;
+- potential request overlap;
+- stale-response risk;
+- unbounded inner concurrency;
+- cancellation policy;
+- error handling;
+- timeout;
+- resource cleanup;
+- observability;
+- rate limiting.
+
+Redesign the pipeline for:
+
+```text
+latest-query semantics
++
+bounded input rate
++
+cancellation
++
+timeout
++
+error handling
+```
+
+Then explain why a different flattening strategy would be required if every submitted query must be processed.
+
+---
+
+## 24. Interview Questions
+
+### Foundational
+
+1. What is reactive programming?
+2. What is an Observable?
+3. How is an Observable different from a Promise?
+4. How is an Observable different from an async iterator?
+5. What is push versus pull?
+6. What are `next`, `error`, and `complete`?
+7. What is a subscription?
+8. What is teardown?
+9. What is a cold Observable?
+10. What is a hot Observable?
+
+### Intermediate
+
+11. What is multicasting?
+12. What is replay?
+13. What is backpressure?
+14. What does debounce do?
+15. What does throttle do?
+16. What is flattening?
+17. Compare merge, concat, switch, and exhaust semantics.
+18. Why are subscription leaks dangerous?
+19. What is reentrancy?
+20. Why does cancellation matter?
+
+### Advanced
+
+21. How would you implement Observable from scratch?
+22. How do you propagate teardown through operators?
+23. How do you bound inner concurrency?
+24. How do you handle a slow consumer?
+25. How do you prevent replay-buffer memory leaks?
+26. How do you reason about hot versus cold sources?
+27. How do you design reconnect logic?
+28. How do retries amplify load?
+29. How do shared streams affect error semantics?
+30. How do synchronous emissions create reentrancy hazards?
+
+### Principal-Level
+
+31. When should a system use Observables rather than async iterators?
+32. When should a system use Promises instead?
+33. How would you model millions of event notifications safely?
+34. How would you design per-tenant reactive isolation?
+35. How would you design bounded backpressure for a push source?
+36. How would you guarantee stale UI requests cannot mutate state?
+37. How would you design a shared WebSocket stream?
+38. How would you define replay policy for a production system?
+39. How would you debug a subscription leak in production?
+40. How would you decide whether reactive abstraction reduces or increases system complexity?
+
+---
+
+## 25. Predict-the-Output Exercises
+
+### Exercise A — Synchronous emission
+
+```js
+console.log("before");
+
+const source = new Observable(observer => {
+  observer.next(1);
+  observer.next(2);
+  observer.complete();
+});
+
+source.subscribe({
+  next(value) {
+    console.log(value);
+  },
+  complete() {
+    console.log("complete");
+  }
+});
+
+console.log("after");
+```
+
+Predict the ordering.
+
+### Exercise B — Unsubscribe
+
+```js
+const subscription = source.subscribe({
+  next(value) {
+    console.log(value);
+  }
+});
+
+subscription.unsubscribe();
+```
+
+Reason about which future notifications should be observed.
+
+### Exercise C — Cold source
+
+```js
+const source = new Observable(observer => {
+  console.log("producer");
+  observer.next(Math.random());
+});
+
+source.subscribe(log);
+source.subscribe(log);
+```
+
+How many producer executions occur in a simple cold design?
+
+### Exercise D — Hot source
+
+Conceptually compare:
+
+```text
+one producer
++
+two subscribers
+```
+
+against two independent subscriptions.
+
+### Exercise E — Merge semantics
+
+```text
+outer: A, B
+
+A inner: --A--
+B inner: -B-
+```
+
+Predict the possible merged sequence.
+
+### Exercise F — Concat semantics
+
+Same streams as Exercise E.
+
+Predict the ordering.
+
+### Exercise G — Switch semantics
+
+```text
+A starts
+B starts before A completes
+```
+
+Determine which result can reach the downstream subscriber under latest-value cancellation semantics.
+
+### Exercise H — Exhaust semantics
+
+```text
+A starts
+B arrives
+A completes
+C arrives
+```
+
+Determine which values are accepted.
+
+---
+
+## 26. Mastery Exercises
+
+### Exercise 1 — Minimal Observable
+
+Build:
+
+```js
+Observable
+Subscription
+Observer
+```
+
+with correct terminal semantics.
+
+### Exercise 2 — Operator library
+
+Implement:
+
+```text
+map
+filter
+tap
+take
+```
+
+### Exercise 3 — Subscription composition
+
+Ensure:
+
+```text
+downstream unsubscribe
+→ all upstream teardowns
+```
+
+### Exercise 4 — Timer operators
+
+Implement:
+
+```text
+debounce
+throttle
+sample
+```
+
+### Exercise 5 — Flattening operators
+
+Implement:
+
+```text
+merge
+concat
+switch
+exhaust
+```
+
+### Exercise 6 — Bounded flattening
+
+Add:
+
+```text
+maxConcurrency
+```
+
+### Exercise 7 — Hot shared source
+
+Implement:
+
+```text
+multicast
+```
+
+with:
+
+```text
+connect
+disconnect
+subscriber management
+```
+
+### Exercise 8 — Replay
+
+Implement:
+
+```text
+replay(N)
+```
+
+and enforce:
+
+```text
+bounded memory
+```
+
+### Exercise 9 — Backpressure experiment
+
+Create a producer faster than a consumer.
+
+Measure:
+
+```text
+queue depth
+memory
+latency
+drop count
+```
+
+Compare:
+
+```text
+unbounded
+drop-oldest
+drop-newest
+sample-latest
+```
+
+### Exercise 10 — Production reactive system
+
+Build:
+
+```text
+event source
+→ validation
+→ transformation
+→ bounded concurrency
+→ retry/backoff
+→ timeout
+→ metrics
+→ graceful teardown
+```
+
+Document:
+
+- cardinality;
+- ownership;
+- ordering;
+- failure;
+- cancellation;
+- backpressure;
+- resource limits.
+
+---
+
+## 27. Key Takeaways
+
+1. Reactive programming models values and events over time.
+2. Observables commonly represent zero, one, or many notifications across a subscription lifetime.
+3. Observable abstractions are generally library/application level rather than one universal ECMAScript primitive.
+4. Promises and Observables solve different temporal problems.
+5. Async iterators are naturally pull-oriented; Observables are often push-oriented.
+6. Subscriptions establish execution and ownership relationships.
+7. Teardown is essential for resource safety.
+8. Cold sources may create independent producer executions per subscriber.
+9. Hot sources can exist independently of individual subscribers.
+10. Multicasting can avoid duplicate producer work.
+11. Replay trades memory for late-subscriber visibility.
+12. `next`, `error`, and `complete` represent distinct notification channels.
+13. Completion is not the same as cancellation.
+14. Push systems can overwhelm consumers.
+15. Buffers must have explicit memory and overflow policies.
+16. Debounce/throttle/sample alter temporal semantics, not merely performance.
+17. Flattening operators encode concurrency and ordering policy.
+18. Merge permits overlap, concat preserves sequential ordering, switch favors the latest, and exhaust ignores new work while active.
+19. Unbounded reactive concurrency recreates the problems from Chapter 39.
+20. Reactive systems can have races and reentrancy hazards.
+21. Long-lived subscriptions can retain memory and resources.
+22. Reactive abstraction should be used when temporal composition genuinely improves the design.
+23. The central principle is:
+
+> Reactive programming is a model for composing values, events, time, cancellation, and resource lifetime—not merely a different spelling of asynchronous JavaScript.
+
+---
+
+## 28. Concept Connections
+
+### Depends On
+
+- Chapter 25 — Iterables / Iterators
+- Chapter 26 — Generators / Async Generators
+- Chapter 29 — Errors / Error Handling
+- Chapter 30 — Resource Management / Cleanup
+- Chapter 31 — Asynchronous JavaScript Fundamentals
+- Chapter 32 — ECMAScript Jobs / Promise Reactions
+- Chapter 33 — Browser Event Loop
+- Chapter 34 — Node Event Loop / libuv
+- Chapter 35 — Promises
+- Chapter 36 — Async/Await
+- Chapter 37 — Cancellation / Abort
+- Chapter 38 — Async Iteration / Streaming
+- Chapter 39 — Concurrency / Parallelism
+
+### Builds Toward
+
+- Chapter 40 — Observables / Reactive Programming
+- Chapter 45 — Memory / GC
+- Chapter 52 — Web Workers / Concurrency
+- Chapter 53 — Web Streams / Data Flow
+- Chapter 55 — Fetch / HTTP Networking
+- Chapter 58 — Node Architecture
+- Chapter 60 — Node Streams
+- Chapter 63 — Async Context / Diagnostics
+- Chapter 78 — Production JS Architecture
+- Chapter 83 — Observability
+- Chapter 84 — Reliability
+- Chapter 85 — Performance
+- Chapter 86 — Testing
+- Chapter 87 — Deterministic Async Testing
+- Chapter 88 — Debugging Methodology
+- Chapter 98 — Anti-patterns / Failure Modes
+- Chapter 100 — Cost Model / Tradeoffs
+- Chapter 101 — Real-world Production Scenarios
+- Chapter 106 — Real-time WebSocket
+- Chapter 107 — Job Queue
+- Chapter 109 — Event-driven App
+- Chapter 110 — Production JS Backend
+- Chapter 111 — Large-scale JS Platform
+- Chapter 121 — System Design
+- Chapter 122 — Final Principal JS Project
+
+### Related Concepts
+
+- Promises
+- Async iterators
+- EventEmitter
+- Web Streams
+- Push / Pull
+- Hot / Cold
+- Unicast / Multicast
+- Replay
+- Subscription
+- Teardown
+- Backpressure
+- Buffering
+- Debounce
+- Throttle
+- Sampling
+- Windowing
+- Flattening
+- Merge
+- Concat
+- Switch
+- Exhaust
+- Scheduling
+- Cancellation
+- Reentrancy
+- Retry
+- Timeouts
+- Resource lifetime
+
+### Concepts Revisited
+
+This chapter revisits:
+
+- asynchronous execution;
+- Promise semantics;
+- cancellation;
+- async iteration;
+- streaming;
+- concurrency;
+- backpressure;
+- error handling;
+- resource cleanup.
+
+### Why This Chapter Matters Later
+
+Reactive programming connects asynchronous JavaScript to systems where values do not arrive once, but continuously:
+
+```text
+events
+signals
+messages
+telemetry
+UI interaction
+network updates
+state changes
+```
+
+It provides a vocabulary for:
+
+```text
+what happens over time
++
+what happens when another value arrives
++
+what work is cancelled
++
+what work overlaps
++
+what resources remain alive
+```
+
+Those questions are central to real-time systems, browser applications, event-driven backends, observability pipelines, and distributed architectures.
+
+The key engineering discipline is:
+
+> Model time explicitly, then make concurrency, cancellation, ordering, buffering, and ownership explicit.
+
+---
+
+## 29. Completion Criteria
+
+Mark Chapter 40 `[+] Completed` only after the learner can demonstrate all of the following.
+
+### Conceptual Understanding
+
+- [ ] Define reactive programming.
+- [ ] Define Observable.
+- [ ] Compare Observable and Promise.
+- [ ] Compare Observable and async iterator.
+- [ ] Explain push vs pull.
+- [ ] Explain subscription.
+- [ ] Explain teardown.
+- [ ] Explain cold and hot sources.
+- [ ] Explain unicast and multicast.
+- [ ] Explain replay.
+- [ ] Explain backpressure.
+- [ ] Explain buffering.
+- [ ] Explain flattening.
+- [ ] Explain merge/concat/switch/exhaust semantics.
+- [ ] Explain reentrancy.
+- [ ] Explain completion vs cancellation.
+
+### Predictive Mastery
+
+- [ ] Predict synchronous emissions.
+- [ ] Predict teardown after unsubscribe.
+- [ ] Predict cold-source behavior.
+- [ ] Predict multicast behavior.
+- [ ] Predict merge ordering.
+- [ ] Predict concat ordering.
+- [ ] Predict switch cancellation.
+- [ ] Predict exhaust dropping.
+- [ ] Predict queue/buffer growth.
+- [ ] Predict retry amplification.
+
+### Implementation
+
+- [ ] Implement Observable.
+- [ ] Implement Subscription.
+- [ ] Implement terminal-state handling.
+- [ ] Implement teardown composition.
+- [ ] Implement map.
+- [ ] Implement filter.
+- [ ] Implement take.
+- [ ] Implement debounce.
+- [ ] Implement throttle.
+- [ ] Implement flattening.
+- [ ] Implement bounded concurrency.
+- [ ] Implement multicast.
+- [ ] Implement bounded replay.
+- [ ] Implement cancellation-aware production cleanup.
+
+### Debugging
+
+- [ ] Diagnose subscription leaks.
+- [ ] Diagnose duplicate subscriptions.
+- [ ] Diagnose stale-response bugs.
+- [ ] Diagnose event storms.
+- [ ] Diagnose queue growth.
+- [ ] Diagnose replay memory leaks.
+- [ ] Diagnose reentrancy.
+- [ ] Diagnose retry storms.
+- [ ] Diagnose reconnect duplication.
+- [ ] Diagnose missing teardown.
+
+### Production Engineering
+
+- [ ] Define subscription ownership.
+- [ ] Define cancellation policy.
+- [ ] Define completion/error policy.
+- [ ] Define buffering policy.
+- [ ] Define overflow policy.
+- [ ] Define concurrency limits.
+- [ ] Define retry/timeout behavior.
+- [ ] Define replay limits.
+- [ ] Define tenant isolation.
+- [ ] Define lifecycle/shutdown.
+- [ ] Define observability.
+
+### Interview Readiness
+
+- [ ] Explain Observable vs Promise.
+- [ ] Explain push vs pull.
+- [ ] Explain cold vs hot.
+- [ ] Explain subscription and teardown.
+- [ ] Explain flattening strategies.
+- [ ] Implement a minimal Observable.
+- [ ] Design backpressure policy.
+- [ ] Diagnose reactive leaks/races.
+- [ ] Choose reactive vs Promise/async iterator/EventEmitter/Web Streams.
+- [ ] Defend reactive architecture at principal level.
+
+### Track A — Core Theory
+
+- [ ] Understand Observable semantics.
+- [ ] Understand temporal composition.
+- [ ] Understand push/pull.
+- [ ] Understand subscription lifecycle.
+- [ ] Understand concurrency and flattening.
+- [ ] Understand backpressure.
+- [ ] Understand hot/cold/multicast/replay.
+- [ ] Understand reactive failure modes.
+
+### Track B — Implementation
+
+- [ ] Guided implementation completed.
+- [ ] Partially guided implementation completed.
+- [ ] No-reference implementation completed.
+- [ ] Edge-case hardened implementation completed.
+- [ ] Production-oriented reactive pipeline reviewed.
+
+### Track C — Interview / Reasoning
+
+- [ ] Completed output prediction.
+- [ ] Completed reactive debugging.
+- [ ] Completed code review.
+- [ ] Completed reactive architecture comparison.
+- [ ] Completed backpressure design.
+- [ ] Completed subscription-lifecycle design.
+
+### Mastery Status
+
+```text
+[ ] Not Started
+[~] In Progress
+[?] Needs Revision
+[+] Completed
+[*] Mastered
+```
+
+Do not mark `[*] Mastered` until the learner can independently:
+
+> Understand → Explain → Predict → Implement → Debug → Apply → Compare → Defend
+
+---
+
+# Chapter 40 — Revision / Retrieval Record
+
+### Retrieval Prompts
+
+1. What is reactive programming?
+2. What is an Observable?
+3. How is Observable different from Promise?
+4. How is Observable different from async iterator?
+5. What is push vs pull?
+6. What is subscription?
+7. What is teardown?
+8. What is cold vs hot?
+9. What is multicast?
+10. What is replay?
+11. What are next/error/complete?
+12. What is cancellation vs completion?
+13. What is backpressure?
+14. Why can a push system overwhelm a consumer?
+15. What is buffering?
+16. What are debounce/throttle/sample?
+17. What is flattening?
+18. Compare merge, concat, switch, exhaust.
+19. Why does switch-style behavior help search UIs?
+20. When is switch-style behavior wrong?
+21. Why can concat cause queue growth?
+22. What is subscription leakage?
+23. What is reentrancy?
+24. Why is synchronous emission important?
+25. What is a multicast source lifecycle?
+26. What is replay-memory risk?
+27. How should retries be bounded?
+28. How does Chapter 40 connect to Chapter 39?
+29. When should a system prefer async iterators?
+30. When should a system avoid reactive abstraction?
+
+### Weak Areas
+
+```text
+-
+-
+-
+```
+
+### Revision Queue
+
+```text
+- [ ] Revisit Observable vs Promise
+- [ ] Revisit Observable vs async iterator
+- [ ] Revisit push vs pull
+- [ ] Revisit subscription lifecycle
+- [ ] Revisit teardown
+- [ ] Revisit cold/hot/multicast
+- [ ] Revisit replay
+- [ ] Revisit backpressure
+- [ ] Revisit buffering
+- [ ] Revisit debounce/throttle/sample
+- [ ] Revisit flattening strategies
+- [ ] Revisit bounded reactive concurrency
+- [ ] Revisit reentrancy
+- [ ] Revisit reactive memory leaks
+- [ ] Revisit reactive production design
+```
+
+### Assessment History
+
+```text
+Date:
+Score:
+Weak Areas:
+Next Review:
+```
+
+### Chapter Status
+
+```text
+[+] Expanded
+[ ] Reviewed
+[ ] Practiced
+[ ] Assessed
+[ ] Mastered
+```
+
+---
+
+# Chapter 40 — Canonical References and Source Discipline
+
+Use this source hierarchy:
+
+1. ECMAScript specification — Promise, async function, iterator, async iterator, Job, and agent semantics.
+2. WHATWG browser standards — events, streams, Web Workers, scheduling, and browser lifecycle behavior.
+3. Node.js official documentation — event, stream, worker, timer, and runtime APIs.
+4. Observable library specifications/documentation — use the exact semantics of the chosen implementation.
+5. Application architecture documentation — lifecycle, backpressure, retry, ownership, and observability policies.
+
+Always distinguish:
+
+```text
+ECMAScript language semantics
+vs
+host event APIs
+vs
+Observable library semantics
+vs
+application-specific reactive policy
+```
+
+Do not claim that all Observable libraries share identical behavior.
+
+Do not claim that Observable is universally asynchronous.
+
+Do not claim that Observable is a built-in ECMAScript primitive unless the specific environment/specification establishes that.
+
+Do not equate unsubscribe with guaranteed physical cancellation of an underlying network or OS operation.
+
+Do not assume backpressure exists automatically in a push-based Observable implementation.
+
+---
+
+# Chapter 40 — Completion Snapshot
+
+```text
+Chapter: 40
+Title: Observables and Reactive Programming
+Part: VI — Async
+Status: [+] Expanded
+Track A: [ ] Core Theory
+Track B: [ ] Implementation
+Track C: [ ] Interview / Reasoning
+Mastery: [ ] Not Mastered
+```
