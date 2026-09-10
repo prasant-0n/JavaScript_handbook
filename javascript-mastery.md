@@ -318,6 +318,7 @@ isolated into one chapter:
 Chapter Assessment Score Reasoning Level Status --------- ------------
 ------- ----------------- -------- --- --- --- --- ---
 
+
 ## Chapter Completion Record
 
 For each completed chapter, record:
