@@ -1,9 +1,3 @@
-# JavaScript_handbook
-
-
-
-
-
 # JavaScript Mastery — Separate Chapter File Index
 
 > **Purpose:** Keep the existing JavaScript Mastery Claude prompt lightweight by
