@@ -367,4 +367,8 @@ The highest-priority additions are **123–127**, **132–137**, **140–143**, 
 
 **JavaScript Mastery · Principal Engineer → Platform Engineer Track**
 
+<<<<<<< HEAD
 *Depth of understanding over quantity of concepts.*
+=======
+*Depth of understanding over quantity of concepts.*
+>>>>>>> cf779a3 (All chapter completed)

@@ -414,4 +414,8 @@ For each completed chapter, record:
 **This index comes first. No chapter is expanded until requested. When
 `next` or `continue` is given, expand the next numbered chapter only,
 preserve everything already written, and keep this file as the single
+<<<<<<< HEAD
 centralized source of truth.**
+=======
+centralized source of truth.**
+>>>>>>> cf779a3 (All chapter completed)
